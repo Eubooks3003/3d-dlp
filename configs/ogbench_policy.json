@@ -1,0 +1,33 @@
+{
+  "ds": "ogbench",
+  "root": "/data/ogbench/ogbench_ds",
+  "path_to_dlp_hparams": "./checkpoints/ogbench/hparams_ogbench_gddlp_ts30_bkl0.02bobj0.02bdyn0.05_maxgoal70_best.json",
+  "path_to_dlp_ckpt": "./checkpoints/ogbench/ogbench_gddlp_ts30_bkl0.02bobj0.02bdyn0.05_maxgoal70_best.pth",
+  "path_to_policy_ckpt": null,
+  "device": "cuda",
+  "batch_size": 16,
+  "lr": 0.00008,
+  "use_scheduler": false,
+  "scheduler_gamma": 0.99,
+  "adam_betas": [
+    0.9,
+    0.999
+  ],
+  "adam_eps": 1e-06,
+  "weight_decay": 0.0,
+  "start_epoch": 0,
+  "num_epochs": 3000,
+  "eval_epoch_freq": 1,
+  "action_dim": 5,
+  "image_size": 64,
+  "recon_loss_type": "l1",
+  "tanh_on_output": false,
+  "policy_type": "attention_tokens",
+  "n_layers": 2,
+   "n_heads" : 4,
+  "hidden_dim": 512,
+  "n_views": 1,
+  "timestep_horizon": 30,
+   "causal_policy": true,
+  "run_prefix": ""
+}

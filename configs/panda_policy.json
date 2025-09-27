@@ -1,0 +1,33 @@
+{
+  "ds": "panda",
+  "root": "/home/ubuntu/tal-us-south-2/data/panda/panda_ds",
+  "path_to_dlp_hparams": "./120925_175334_panda_gdlppolicy_causal_n2h4/dlp_hparams.json",
+  "path_to_dlp_ckpt": "./checkpoints/panda/panda.pth",
+  "path_to_policy_ckpt": "./120925_175334_panda_gdlppolicy_causal_n2h4/saves/panda_gdlppolicy_causal_n2h4.pth",
+  "device": "cuda:1",
+  "batch_size": 12,
+  "lr": 0.00008,
+  "use_scheduler": false,
+  "scheduler_gamma": 0.99,
+  "adam_betas": [
+    0.9,
+    0.999
+  ],
+  "adam_eps": 1e-06,
+  "weight_decay": 0.0,
+  "start_epoch": 13,
+  "num_epochs": 3000,
+  "eval_epoch_freq": 1,
+  "action_dim": 3,
+  "image_size": 128,
+  "recon_loss_type": "l1",
+  "tanh_on_output": false,
+  "policy_type": "attention_tokens",
+  "n_layers": 2,
+  "n_heads": 4,
+  "hidden_dim": 512,
+  "n_views": 2,
+  "timestep_horizon": 10,
+  "causal_policy": true,
+  "run_prefix": "_causal_n2h4"
+}
