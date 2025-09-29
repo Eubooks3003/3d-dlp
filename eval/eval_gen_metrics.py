@@ -190,7 +190,10 @@ def eval_dlp_im_metric(model, device, config, val_mode='val', eval_dir='./',
             if len(x.shape) == 5:
                 # [bs, T, ch, h, w]
                 x = x.view(-1, *x.shape[2:])
-            results = evaluator(x, generated)
+
+            x_rgb = x[:, :3].clamp(0, 1)                  # drop depth channel
+            gen_rgb = generated[:, :3].clamp(0, 1)  
+            results = evaluator(x_rgb, gen_rgb)
         # [batch_size * T]
         if 'ssim' in metrics:
             ssims.append(results['ssim'])

@@ -99,7 +99,7 @@ def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1):
         dataset = BAIR64Image(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
     elif ds == 'shapes':
         if mode == 'train':
-            dataset = generate_shape_dataset_torch_rgbd(img_size=image_size, num_images=1_000)
+            dataset = generate_shape_dataset_torch_rgbd(img_size=image_size, num_images=40_000)
         else:
             dataset = generate_shape_dataset_torch_rgbd(img_size=image_size, num_images=2_000)
     elif ds == 'langtable':

@@ -487,7 +487,9 @@ class DLP(nn.Module):
                                          init_zero_bias=init_zero_bias,  # zero bias for conv and linear layers
                                          init_conv_layers=init_conv_layers,  # initialize conv layers with normal dist
                                          init_conv_fg_std=init_conv_fg_std,  # std for conv fg normal dist
-                                         init_conv_bg_std=init_conv_bg_std  # std for conv bg normal dist
+                                         init_conv_bg_std=init_conv_bg_std,  # std for conv bg normal dist
+                                         separate_depth_features=separate_depth_features,
+                                         depth_feature_dim=depth_feature_dim,
                                          )
 
         # context (latent actions)
@@ -738,9 +740,14 @@ class DLP(nn.Module):
 
         # CNN Architecture
         sections.append(create_section_header("CNN Architecture"))
+        if self.separate_depth_features:
+            object_cnn_shape = self.encoder_module.particle_enc.particle_features_enc_rgb.cnn_out_shape
+            # TODO: Include separate for depth as well
+        else:
+            object_cnn_shape = self.encoder_module.particle_enc.particle_features_enc.cnn_out_shape
         cnn_info = [
             ("Prior CNN Pre-pool Output Size", self.prior_module.enc.conv_output_size),
-            ("Object CNN Output Shape", self.encoder_module.particle_enc.particle_features_enc.cnn_out_shape),
+            ("Object CNN Output Shape", object),
             ("Background CNN Output Shape", self.encoder_module.bg_encoder.cnn_out_shape),
             ("Decoder Background Upsamples", self.decoder_module.num_bg_upsample),
             ("Decoder Object Upsamples", self.decoder_module.num_obj_upsample)
@@ -754,12 +761,22 @@ class DLP(nn.Module):
                       + self.learned_bg_feature_dim
                       + context_coeff * self.context_dim)
 
-        sections.append(
-            format_row("Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc.info))
+        if self.separate_depth_features:
+            sections.append(
+            format_row("RGB Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc_rgb.info))
+            sections.append(
+            format_row("Depth Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc_depth.info))
+        else:
+            sections.append(
+                format_row("Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc.info))
         sections.append(format_row("Background Encoder", self.encoder_module.bg_encoder.info))
         if self.encoder_module.particle_inter_enc is not None:
             sections.append(format_row("Particle Intermediate Encoder", self.encoder_module.particle_inter_enc.info))
-        sections.append(format_row("Particle Decoder", self.decoder_module.particle_dec.info))
+        if self.separate_depth_features:
+            sections.append(format_row("RGB Particle Decoder", self.decoder_module.particle_dec_rgb.info))
+            sections.append(format_row("Depth Particle Decoder", self.decoder_module.particle_dec_depth.info))
+        else:
+            sections.append(format_row("Particle Decoder", self.decoder_module.particle_dec.info))
         sections.append(format_row("Background Decoder", self.decoder_module.bg_dec.info))
 
         # Add latent dimension with formula

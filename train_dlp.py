@@ -200,7 +200,7 @@ def train_dlp(config_path='./configs/shapes.json'):
     print(model_info)
     # prepare saving location
     run_name = f'{ds}_gdlp' + run_prefix
-    log_dir = prepare_logdir(runname=run_name, src_dir='./')
+    log_dir = prepare_logdir(runname=run_name, src_dir='./logs')
     fig_dir = os.path.join(log_dir, 'figures')
     save_dir = os.path.join(log_dir, 'saves')
     save_config(log_dir, hparams)

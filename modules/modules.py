@@ -4416,7 +4416,7 @@ class ParticleEncoder(nn.Module):
                                                             init_conv_layers=init_conv_layers,
                                                             init_conv_fg_std=init_conv_fg_std
                                                             )
-            self.particle_features_enc_depth = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
+            self.particle_features_enc_depth = ParticleFeaturesEncoder(anchor_s, depth_feature_dim,
                                                             image_size,
                                                             margin=0, ch=1, pad_mode=pad_mode,
                                                             ch_mult=obj_ch_mult, base_ch=obj_base_ch,
@@ -4599,46 +4599,197 @@ class ParticleEncoder(nn.Module):
                     'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score}
         return out_dict
 
-    def encode_appearance(self, x, z, z_scale, deterministic=False, timesteps=None, obj_on=None):
-        # 2. posterior attributes: obj_on, depth and visual features
-        obj_enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
+    def _sample_gauss(mu, logvar):
+        if deterministic or self.interaction_features or (logvar is None):
+            return mu
+        return reparameterize(mu, logvar)
 
-        mu_features = obj_enc_out['mu_features']
+    def _sample_categorical_logits(logits, deterministic, n_cat, n_cls):
+        # logits: [..., n_cat*n_cls]
+        shape = logits.shape
+        probs = logits.view(*shape[:-1], n_cat, n_cls).softmax(dim=-1)
+        if deterministic:
+            idx = torch.argmax(probs.view(-1, n_cls), dim=-1, keepdim=True)    # [M,1]
+            onehot = F.one_hot(idx.squeeze(-1), num_classes=n_cls)
+            onehot = onehot.view(*probs.shape).to(logits.dtype)
+        else:
+            # multinomial over the last dim (classes) per category
+            draws = torch.multinomial(
+                probs.view(-1, n_cls), num_samples=1, replacement=True
+            )  # [M,1]
+            onehot = F.one_hot(draws.squeeze(-1), num_classes=n_cls)
+            onehot = onehot.view(*probs.shape).to(logits.dtype)
+        # straight-through
+        st = onehot.detach() + (probs - probs.detach())
+        return st.view(*shape)  # back to [..., n_cat*n_cls]
+
+    def _gate_with_null(mu, gate, null_embed):
+        # gate: broadcastable zeros/ones
+        if null_embed is None:
+            return mu  # no-op if you didn't set one
+        if null_embed.shape[-1] != mu.shape[-1]:
+            pad = mu.new_zeros(*null_embed.shape[:-1], mu.shape[-1] - null_embed.shape[-1])
+            null_embed = torch.cat([null_embed, pad], dim=-1)
+        return gate * mu + (1.0 - gate) * null_embed
+    def encode_appearance(self, x, z, z_scale, deterministic=False, timesteps=None, obj_on=None):
+        """
+        Unified (original) behavior:
+        - one encoder self.particle_features_enc over x
+        - supports features_dist={'gauss','categorical'}
+        - gating by obj_on -> null_feature_embed
+        - interaction_features toggles sampling vs passthrough
+
+        Split behavior (if self.separate_depth_features=True):
+        - runs self.particle_features_enc_rgb on x[..., :3, :, :]
+        - runs self.particle_features_enc_depth on x[..., 3:4, :, :]
+        - returns separate depth features under '*_depth' keys
+        - keeps original keys pointing to RGB branch for back-compat
+        - also returns concatenated '*_total' (rgb||depth) when both exist & gaussian
+        """
+
+        # -------------------------------------------------------------------------
+        # SPLIT MODE
+        # -------------------------------------------------------------------------
+        if getattr(self, "separate_depth_features", False):
+            C = x.shape[-3]
+            assert C >= 3, f"expected RGBD or RGB, got C={C}"
+            x_rgb = x[..., :3, :, :]
+            x_d   = x[..., 3:4, :, :] if C > 3 else None
+
+            # encode RGB
+            out_rgb = self.particle_features_enc_rgb(x_rgb, z, z_scale=z_scale, timesteps=timesteps)
+            mu_rgb, logvar_rgb = out_rgb['mu_features'], out_rgb['logvar_features']
+            crop_rgb           = out_rgb['cropped_objects']     # [B,N,3,s,s] or [B,T,N,3,s,s] depending on impl
+
+            # encode depth (optional)
+            if x_d is not None:
+                out_d = self.particle_features_enc_depth(x_d, z, z_scale=z_scale, timesteps=timesteps)
+                mu_d, logvar_d = out_d['mu_features'], out_d['logvar_features']
+                crop_d         = out_d['cropped_objects']       # [B,N,1,s,s]
+            else:
+                mu_d = logvar_d = crop_d = None
+
+            # obj_on gating (per-branch), threshold 0.2 as in your original
+            if obj_on is not None:
+                gate = (obj_on > 0.2).to(mu_rgb.dtype)  # broadcast-safe
+                # RGB null
+                null_rgb = getattr(self, "null_feature_embed_rgb", getattr(self, "null_feature_embed", None))
+                mu_rgb = _gate_with_null(mu_rgb, gate, null_rgb)
+                # Depth null
+                if mu_d is not None:
+                    null_d = getattr(self, "null_feature_embed_depth", None)
+                    if null_d is None:
+                        null_d = mu_d.new_zeros(*mu_d.shape[:-1], mu_d.shape[-1])
+                        self.null_feature_embed_depth = null_d
+                    mu_d = _gate_with_null(mu_d, gate, null_d)
+
+            # sampling per-branch according to (possibly) per-branch distributions
+            dist_rgb = getattr(self, "features_dist_rgb", self.features_dist)
+            dist_d   = getattr(self, "features_dist_depth", self.features_dist)
+
+            if not self.interaction_features:
+                # RGB
+                if dist_rgb == 'categorical':
+                    z_rgb = _sample_categorical_logits(mu_rgb, deterministic,
+                                                    self.n_fg_categories, self.n_fg_classes)
+                    mu_rgb_eff, logvar_rgb_eff = mu_rgb, None  # logits carried in mu_rgb
+                else:  # 'gauss'
+                    z_rgb = _sample_gauss(mu_rgb, logvar_rgb)
+                    mu_rgb_eff, logvar_rgb_eff = mu_rgb, logvar_rgb
+
+                # DEPTH
+                if mu_d is not None:
+                    if dist_d == 'categorical':
+                        z_d = _sample_categorical_logits(mu_d, deterministic,
+                                                        getattr(self, "n_fg_categories_depth", self.n_fg_categories),
+                                                        getattr(self, "n_fg_classes_depth", self.n_fg_classes))
+                        mu_d_eff, logvar_d_eff = mu_d, None
+                    else:
+                        z_d = _sample_gauss(mu_d, logvar_d)
+                        mu_d_eff, logvar_d_eff = mu_d, logvar_d
+                else:
+                    z_d = mu_d_eff = logvar_d_eff = None
+            else:
+                # passthrough (interaction_features=True)
+                z_rgb, mu_rgb_eff, logvar_rgb_eff = mu_rgb, mu_rgb, logvar_rgb
+                if mu_d is not None:
+                    z_d, mu_d_eff, logvar_d_eff = mu_d, mu_d, logvar_d
+                else:
+                    z_d = mu_d_eff = logvar_d_eff = None
+
+            # concatenated totals (only if both present and BOTH gaussian -> meaningful logvar_total)
+            if (mu_d_eff is not None) and (logvar_d_eff is not None) and (logvar_rgb_eff is not None):
+                mu_total     = torch.cat([mu_rgb_eff,     mu_d_eff],     dim=-1)
+                logvar_total = torch.cat([logvar_rgb_eff, logvar_d_eff], dim=-1)
+            else:
+                mu_total, logvar_total = None, None
+            z_total = torch.cat([z_rgb, z_d], dim=-1) if (z_d is not None) else z_rgb
+
+            # crops
+            crop_4ch = torch.cat([crop_rgb, crop_d], dim=2) if (crop_d is not None) else crop_rgb
+
+            return {
+                # Back-compat (RGB branch under original names)
+                'mu_features':       mu_rgb_eff,
+                'logvar_features':   logvar_rgb_eff,
+                'z_features':        z_rgb,
+                'cropped_objects':   crop_rgb,
+                # Depth branch explicit
+                'mu_features_depth':     mu_d_eff,
+                'logvar_features_depth': logvar_d_eff,
+                'z_depth_features':      z_d,
+                'cropped_objects_rgb':   crop_rgb,
+                'cropped_objects_d':     crop_d,
+                'cropped_objects_4ch':   crop_4ch,
+                # Totals (useful if downstream expects a single vector)
+                'mu_features_total':     mu_total,
+                'logvar_features_total': logvar_total,
+                'z_features_total':      z_total,
+            }
+
+        # -------------------------------------------------------------------------
+        # UNIFIED MODE (original path)
+        # -------------------------------------------------------------------------
+        obj_enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
+        mu_features     = obj_enc_out['mu_features']
         logvar_features = obj_enc_out['logvar_features']
         cropped_objects = obj_enc_out['cropped_objects']
 
+        # obj_on gating
         if obj_on is not None:
-            z_gate = torch.where(obj_on > 0.2, 1.0, 0.0)
-            mu_features = z_gate * mu_features + (1 - z_gate) * self.null_feature_embed
+            gate = (obj_on > 0.2).to(mu_features.dtype)
+            null = getattr(self, "null_feature_embed", None)
+            mu_features = _gate_with_null(mu_features, gate, null)
 
+        # sampling
         if not self.interaction_features:
-            # reparameterize
             if self.features_dist == 'categorical':
-                logits = mu_features.view(*mu_features.shape[:-1], self.n_fg_categories, self.n_fg_classes)
-                # [bs, T, n_p, n_categories, n_classes]
-                probs = logits.softmax(dim=-1)  # [bs, T, n_p, n_categories, n_classes]
-                if deterministic:
-                    samples = torch.argmax(probs.view(-1, probs.shape[-1]), dim=-1, keepdim=True)
-                    samples = F.one_hot(samples.squeeze(-1), num_classes=self.n_fg_classes)
-                    samples = samples.view(probs.shape)
-                    # straight-through
-                    z_features = samples.detach() + (probs - probs.detach())
-                    z_features = z_features.view(*mu_features.shape)  # [bs, T, n_p, n_categories * n_classes]
-                else:
-                    samples = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1)
-                    samples = F.one_hot(samples.squeeze(-1), num_classes=self.n_fg_classes)
-                    samples = samples.view(probs.shape)
-                    # straight-through
-                    z_features = samples.detach() + (probs - probs.detach())
-                    z_features = z_features.view(*mu_features.shape)  # [bs, T, n_p, n_categories * n_classes]
-            else:
-                z_features = reparameterize(mu_features, logvar_features) if not deterministic else mu_features
+                z_features = _sample_categorical_logits(
+                    mu_features, deterministic, self.n_fg_categories, self.n_fg_classes
+                )
+            else:  # 'gauss'
+                z_features = _sample_gauss(mu_features, logvar_features)
         else:
             z_features = mu_features
 
-        out_dict = {'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
-                    'cropped_objects': cropped_objects}
-        return out_dict
+        return {
+            'mu_features':           mu_features,
+            'logvar_features':       logvar_features,
+            'z_features':            z_features,
+            'cropped_objects':       cropped_objects,
+            # depth-specific keys None for caller uniformity
+            'mu_features_depth':     None,
+            'logvar_features_depth': None,
+            'z_depth_features':      None,
+            'cropped_objects_rgb':   cropped_objects,
+            'cropped_objects_d':     None,
+            'cropped_objects_4ch':   cropped_objects if cropped_objects.shape[2] == 4 else None,
+            # totals equal unified values
+            'mu_features_total':     mu_features,
+            'logvar_features_total': logvar_features,
+            'z_features_total':      z_features,
+        }
+
 
     def encode_all(self, x, deterministic=False, warmup=False):
         # make sure x is [bs, T, ch, h, w]
@@ -5470,6 +5621,9 @@ class DLPDecoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
+                 
+                 separate_depth_features=False,  # separate depth features when using RGBD input
+                 depth_feature_dim=4,  # depth feature dimension (if separate_depth_features)
                  ):
         """
         DLP Decoder Module
@@ -5550,25 +5704,55 @@ class DLPDecoder(nn.Module):
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
         self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
 
+        self.separate_depth_features = separate_depth_features
+        self.depth_feature_dim = depth_feature_dim
         # object decoder
         if self.context_dim > 0 and self.decode_with_ctx:
             particle_dec_net = ObjectDecoderCNNFILM
         else:
             particle_dec_net = ObjectDecoderCNN
-        self.particle_dec = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=cdim + 1,
-                                             bottleneck_size=learned_feature_dim,
-                                             use_resblock=self.use_resblock,
-                                             pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,
-                                             res_from_fc=obj_res_from_fc,
-                                             ch_mult=obj_ch_mult, base_ch=obj_base_ch, final_cnn_ch=obj_final_cnn_ch,
-                                             num_res_blocks=num_res_blocks, cnn_mid_blocks=cnn_mid_blocks,
-                                             mlp_hidden_dim=mlp_hidden_dim,
-                                             init_zero_bias=init_zero_bias,
-                                             init_conv_layers=init_conv_layers,
-                                             init_conv_fg_std=init_conv_fg_std
-                                             )
+        
+        if self.separate_depth_features and cdim == 4:
+            self.particle_dec_rgb = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=cdim,
+                                        bottleneck_size=learned_feature_dim,
+                                        use_resblock=self.use_resblock,
+                                        pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,
+                                        res_from_fc=obj_res_from_fc,
+                                        ch_mult=obj_ch_mult, base_ch=obj_base_ch, final_cnn_ch=obj_final_cnn_ch,
+                                        num_res_blocks=num_res_blocks, cnn_mid_blocks=cnn_mid_blocks,
+                                        mlp_hidden_dim=mlp_hidden_dim,
+                                        init_zero_bias=init_zero_bias,
+                                        init_conv_layers=init_conv_layers,
+                                        init_conv_fg_std=init_conv_fg_std
+                                        )
+            self.particle_dec_depth = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=1,
+                                        bottleneck_size=depth_feature_dim,
+                                        use_resblock=self.use_resblock,
+                                        pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,
+                                        res_from_fc=obj_res_from_fc,
+                                        ch_mult=obj_ch_mult, base_ch=obj_base_ch, final_cnn_ch=obj_final_cnn_ch,
+                                        num_res_blocks=num_res_blocks, cnn_mid_blocks=cnn_mid_blocks,
+                                        mlp_hidden_dim=mlp_hidden_dim,
+                                        init_zero_bias=init_zero_bias,
+                                        init_conv_layers=init_conv_layers,
+                                        init_conv_fg_std=init_conv_fg_std
+                                        )
+            self.num_obj_upsample = self.particle_dec_rgb.num_upsample # TODO:This never gets used
+        else:
+            self.particle_dec = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=cdim + 1,
+                                                bottleneck_size=learned_feature_dim,
+                                                use_resblock=self.use_resblock,
+                                                pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,
+                                                res_from_fc=obj_res_from_fc,
+                                                ch_mult=obj_ch_mult, base_ch=obj_base_ch, final_cnn_ch=obj_final_cnn_ch,
+                                                num_res_blocks=num_res_blocks, cnn_mid_blocks=cnn_mid_blocks,
+                                                mlp_hidden_dim=mlp_hidden_dim,
+                                                init_zero_bias=init_zero_bias,
+                                                init_conv_layers=init_conv_layers,
+                                                init_conv_fg_std=init_conv_fg_std
+                                                )
 
-        self.num_obj_upsample = self.particle_dec.num_upsample
+            self.num_obj_upsample = self.particle_dec.num_upsample # TODO:This never gets used
         # bg decoder
         self.bg_dec = BgDecoder(cdim=cdim, image_size=image_size,
                                 pad_mode='replicate', learned_bg_feature_dim=learned_bg_feature_dim,
@@ -5625,74 +5809,171 @@ class DLPDecoder(nn.Module):
         # [bs, n_kp, ch, img_size, img_size]
         return trans_padded_patches_batch
 
-    def get_objects_alpha_rgb(self, z_kp, z_features, z_scale=None, z_ctx=None, translation=None):
-        # decode the latent particles into RGBA glimpses and place them on the canvas
-        dec_objects = self.particle_dec(z_features, context=z_ctx)  # [bs * n_kp, 4, patch_size, patch_size]
-        dec_objects = dec_objects.view(-1, z_kp.shape[1],
-                                       *dec_objects.shape[1:])  # [bs, n_kp, 4, patch_size, patch_size]
-        # translate patches - place the decoded glimpses on the canvas
-        dec_objects_trans = self.translate_patches(z_kp, dec_objects, z_scale, translation)
-        # dec_objects_trans: [bs, n_kp, 3, im_size, im_size]
-        # multiply by alpha channel
-        a_obj, rgb_obj = torch.split(dec_objects_trans, [1, dec_objects_trans.shape[2] - 1], dim=2)
-        return dec_objects, a_obj, rgb_obj
+    def decode_rgb_unified(self, z_kp, z_features, z_scale=None, z_ctx=None, translation=None):
+        """
+        Unified decoder path: particle_dec outputs 4ch (α+RGB) or 5ch (α+RGB+D).
+        Returns:
+        dec_patches: [B,N,C,ps,ps]
+        a_obj:       [B,N,1,H,W]
+        rgb_obj:     [B,N,3,H,W]
+        d_obj:       [B,N,1,H,W] or None
+        """
+        patches = self.particle_dec(z_features, context=z_ctx)                      # [B*N,C,ps,ps]
+        patches = patches.view(-1, z_kp.shape[1], *patches.shape[1:])              # [B,N,C,ps,ps]
+        patches_t = self.translate_patches(z_kp, patches, z_scale, translation)    # [B,N,C,H,W]
 
-    def get_objects_alpha_rgb_with_depth(self, a_obj, rgb_obj, obj_on, z_depth, eps=1e-5):
-        # stitching the glimpses by factoring the alpha maps and the particle's inferred depth
-        # obj_on: [bs, n_kp, 1]
-        # z_depth: [bs, n_kp, 1]
-        n_kp = a_obj.shape[1]
-        # turn off inactive particles
-        a_obj = obj_on[:, :, None, None, None] * a_obj  # [bs, n_kp, 1, im_size, im_size]
-        rgba_obj = a_obj * rgb_obj
-        # normalize
-        importance_map = a_obj * torch.sigmoid(-z_depth[:, :, :, None, None])
-        importance_map = importance_map / (torch.sum(importance_map, dim=1, keepdim=True) + eps)
-        # this imitates softmax to move objects on the depth axis
-        dec_objects_trans = (rgba_obj * importance_map).sum(dim=1)
-        alpha_mask = 1.0 - (importance_map * a_obj).sum(dim=1)
-        a_obj = importance_map * a_obj
-        return a_obj, alpha_mask, dec_objects_trans
-
-    def decode_objects(self, z_kp, z_features, obj_on, z_scale=None, translation=None, z_depth=None,
-                       z_ctx=None):
-        # stitching the decoded latent particles -> RGB, factoring the alpha maps and depths
-        dec_objects, a_obj, rgb_obj = self.get_objects_alpha_rgb(z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx,
-                                                                 translation=translation)
-        alpha_masks, bg_mask, dec_objects_trans = self.get_objects_alpha_rgb_with_depth(a_obj, rgb_obj, obj_on=obj_on,
-                                                                                        z_depth=z_depth)
-        return dec_objects, dec_objects_trans, alpha_masks, bg_mask
-
-    def decode_all(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, z_ctx=None,
-                   warmup=False):
-        if len(z.shape) == 4:
-            # z: [bs, T, n_kp, 2]
-            batch_size = z.shape[0]
-            timesteps = z.shape[1]
-            z = z.view(-1, *z.shape[2:])  # [bs * T, n_kp, 2]
-            z_scale = z_scale.view(-1, *z_scale.shape[2:])  # [bs * T, n_kp, 2]
-            obj_on = obj_on.view(-1, *obj_on.shape[2:])  # [bs * T, n_kp, 1]
-            z_depth = z_depth.view(-1, *z_depth.shape[2:])  # [bs * T, n_kp, 1]
-            z_features = z_features.view(-1, *z_features.shape[2:])  # [bs * T, n_kp, feature_dim]
-            z_bg_features = z_bg_features.view(-1, *z_bg_features.shape[2:])  # [bs * T, feature_dim]
-            if z_ctx is not None:
-                z_ctx = z_ctx.view(-1, *z_ctx.shape[2:])  # [bs * T, feature_dim]
+        if patches_t.shape[2] == 4:
+            a_obj, rgb_obj = torch.split(patches_t, [1, 3], dim=2)
+            d_obj = None
+        elif patches_t.shape[2] >= 5:
+            a_obj = patches_t[:, :, :1]
+            rgb_obj = patches_t[:, :, 1:4]
+            d_obj = patches_t[:, :, 4:5]
         else:
-            timesteps = 1
-        # z: [bs * T, ...]
-        # squeeze the last dimension of `obj_on`:
-        if len(obj_on.shape) == 3:
-            obj_on = obj_on.squeeze(-1)
-        # a wrapper function to decode latent particles into and RGB image
-        object_dec_out = self.decode_objects(z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale,
-                                             z_ctx=z_ctx)
-        dec_objects, dec_objects_trans, alpha_masks, bg_mask = object_dec_out
-        bg_rec = self.bg_dec(z_bg_features, z_ctx)
-        rec = bg_mask * bg_rec + dec_objects_trans
-        decoder_out = {'rec': rec, 'dec_objects': dec_objects, 'dec_objects_trans': dec_objects_trans,
-                       'bg_mask': bg_mask, 'alpha_masks': alpha_masks, 'bg_rec': bg_rec}
+            raise ValueError(f"Unexpected decoder channels: {patches_t.shape[2]}")
+        return patches, a_obj, rgb_obj, d_obj
 
-        return decoder_out
+
+    def decode_rgb_split(self, z_kp, z_features_rgb, z_scale=None, z_ctx=None, translation=None):
+        """
+        Split decoder path for RGB (α+RGB only).
+        """
+        patches = self.particle_dec_rgb(z_features_rgb, context=z_ctx)             # [B*N,4,ps,ps]
+        patches = patches.view(-1, z_kp.shape[1], *patches.shape[1:])              # [B,N,4,ps,ps]
+        patches_t = self.translate_patches(z_kp, patches, z_scale, translation)    # [B,N,4,H,W]
+        a_obj, rgb_obj = torch.split(patches_t, [1, 3], dim=2)
+        return patches, a_obj, rgb_obj
+
+
+    def decode_depth_split(self, z_kp, z_depth_features, z_scale=None, z_ctx=None, translation=None):
+        """
+        Split decoder path for Depth (expects 1ch depth; if more, takes first).
+        """
+        if z_depth_features is None:
+            return None, None
+        d_patches = self.particle_dec_depth(z_depth_features, context=z_ctx)       # [B*N,Cd,ps,ps]
+        d_patches = d_patches.view(-1, z_kp.shape[1], *d_patches.shape[1:])        # [B,N,Cd,ps,ps]
+        d_patches = d_patches[:, :, :1]                                            # [B,N,1,ps,ps]
+        d_patches_t = self.translate_patches(z_kp, d_patches, z_scale, translation)# [B,N,1,H,W]
+        return d_patches, d_patches_t
+
+
+    def composite_with_depth(self, a_obj, rgb_obj, obj_on, z_depth, d_obj=None, eps=1e-5):
+        """
+        Your compositor (unchanged math), now optionally composites a depth texture if provided.
+        Returns:
+        a_used: [B,N,1,H,W], bg_mask: [B,1,H,W], rgb_comp: [B,3,H,W], depth_comp or None
+        """
+        a_obj = obj_on[:, :, None, None, None] * a_obj                              # [B,N,1,H,W]
+        rgba_obj = a_obj * rgb_obj                                                  # [B,N,3,H,W]
+        importance = a_obj * torch.sigmoid(-z_depth[:, :, :, None, None])           # [B,N,1,H,W]
+        importance = importance / (importance.sum(dim=1, keepdim=True) + eps)
+
+        rgb_comp = (rgba_obj * importance).sum(dim=1)                               # [B,3,H,W]
+        depth_comp = (d_obj * importance).sum(dim=1) if d_obj is not None else None # [B,1,H,W] or None
+        bg_mask = 1.0 - (importance * a_obj).sum(dim=1)                             # [B,1,H,W]
+        a_used = importance * a_obj
+        return a_used, bg_mask, rgb_comp, depth_comp
+
+
+    def decode_objects(
+        self, z_kp, z_features, obj_on, z_scale=None, translation=None, z_depth=None,
+        z_ctx=None, *, z_depth_features=None
+    ):
+        """
+        If self.separate_depth_features:
+            - use particle_dec_rgb on z_features (RGB features)
+            - use particle_dec_depth on z_depth_features (Depth features)
+        Else:
+            - use particle_dec on z_features (unified: α+RGB or α+RGB+D)
+        """
+        if getattr(self, "separate_depth_features", False):
+            # RGB branch
+            dec_rgb_patches, a_obj, rgb_obj = self.decode_rgb_split(
+                z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation
+            )
+            # Depth branch (optional)
+            dec_depth_patches, d_obj = self.decode_depth_split(
+                z_kp, z_depth_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation
+            )
+        else:
+            # Unified branch
+            dec_rgb_patches, a_obj, rgb_obj, d_obj = self.decode_rgb_unified(
+                z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation
+            )
+            dec_depth_patches = None  # unified depth is not per-patch separate object unless you want to expose it
+
+        # Composite (always uses z_depth for ordering)
+        alpha_masks, bg_mask, dec_rgb_comp, dec_depth_comp = self.composite_with_depth(
+            a_obj, rgb_obj, obj_on=obj_on, z_depth=z_depth, d_obj=d_obj
+        )
+
+        return dec_rgb_patches, dec_rgb_comp, alpha_masks, bg_mask, dec_depth_comp, dec_depth_patches
+
+    def decode_all(
+        self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, z_ctx=None,
+        warmup=False, *, z_depth_features=None
+    ):
+        # flatten time exactly like your original
+        if len(z.shape) == 4:
+            B, T = z.shape[0], z.shape[1]
+            z              = z.view(-1, *z.shape[2:])
+            z_scale        = z_scale.view(-1, *z_scale.shape[2:])
+            obj_on         = obj_on.view(-1, *obj_on.shape[2:])
+            z_depth        = z_depth.view(-1, *z_depth.shape[2:])
+            z_features     = z_features.view(-1, *z_features.shape[2:])
+            z_bg_features  = z_bg_features.view(-1, *z_bg_features.shape[2:])
+            if z_ctx is not None:
+                z_ctx = z_ctx.view(-1, *z_ctx.shape[2:])
+            if z_depth_features is not None:
+                z_depth_features = z_depth_features.view(-1, *z_depth_features.shape[2:])
+        else:
+            T = 1
+
+        if obj_on.dim() == 3:
+            obj_on = obj_on.squeeze(-1)
+
+        # decode objects
+        (dec_objects, dec_objects_trans, alpha_masks, bg_mask,
+        dec_depth_trans, dec_depth_patches) = self.decode_objects(
+            z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale, z_ctx=z_ctx,
+            z_depth_features=z_depth_features
+        )
+
+        # background (RGB or RGBD)
+        bg_rec = self.bg_dec(z_bg_features, z_ctx)    # [B*,3,H,W] or [B*,4,H,W]
+
+        # composite RGB
+        rec_rgb = bg_mask * bg_rec[:, :3] + dec_objects_trans
+
+        # composite Depth if available from objects or bg
+        rec_depth = None
+        have_obj_depth = dec_depth_trans is not None
+        have_bg_depth  = (bg_rec.shape[1] > 3)
+        if have_obj_depth or have_bg_depth:
+            bg_depth = bg_rec[:, 3:4] if have_bg_depth else (
+                torch.zeros_like(dec_depth_trans) if dec_depth_trans is not None else None
+            )
+            if bg_depth is None:
+                rec_depth = dec_depth_trans
+            elif dec_depth_trans is None:
+                rec_depth = bg_depth
+            else:
+                rec_depth = bg_mask * bg_depth + dec_depth_trans   # match your RGB compositing scheme
+
+        rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
+
+        return {
+            'rec': rec,
+            'dec_objects': dec_objects,
+            'dec_objects_trans': dec_objects_trans,
+            'alpha_masks': alpha_masks,
+            'bg_mask': bg_mask,
+            'bg_rec': bg_rec,
+            'rec_depth': rec_depth,
+            'dec_depth_trans': dec_depth_trans,
+            'dec_depth_patches': dec_depth_patches,
+        }
 
     def forward(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx=None,
                 warmup=False):
