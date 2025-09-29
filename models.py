@@ -893,18 +893,50 @@ class DLP(nn.Module):
         dec_objects_trans = dec_dict['dec_objects_trans']
         rec = dec_dict['rec']
         bg_rec = dec_dict['bg_rec']
+
+        # Separate RGB Depth 
+        rec_rgb = dec_dict['rec_rgb']
+        rec_depth = dec_dict['rec_depth']
+
+        # TODO: check if rec_depth need to be normalized
+        # TODO: Check if bg_rec needs to be separated into rgb and depth
         if self.normalize_rgb:
-            rec_rgb = minusoneone_to_rgb(rec)
-            bg_rec_rgb = minusoneone_to_rgb(bg_rec)
+            # final RGB
+            if self.cdim == 4:
+                if self.separate_depth_features:
+                    # rec_rgb already 3ch from your pipeline; normalize it
+                    rec_rgb = minusoneone_to_rgb(rec_rgb)
+                else:
+                    rec_rgb = minusoneone_to_rgb(rec[:, :3])
+            else:
+                rec_rgb = minusoneone_to_rgb(rec)
+
+            bg_rec_rgb = minusoneone_to_rgb(bg_rec[:, :3])
             dec_objects_trans = minusoneone_to_rgb(dec_objects_trans)
-            dec_objects_rgb = minusoneone_to_rgb(dec_objects)
+
+            # per-object patches: keep α, normalize only RGB
+            if dec_objects.shape[2] >= 4:
+                a = dec_objects[:, :, :1]
+                rgb = minusoneone_to_rgb(dec_objects[:, :, 1:4])
+                dec_objects_rgb = torch.cat([a, rgb], dim=2)   # RGBA for viz
+            else:
+                # if for some reason patches are only RGB
+                dec_objects_rgb = minusoneone_to_rgb(dec_objects)
         else:
-            rec_rgb = rec
-            bg_rec_rgb = bg_rec
+            # no normalization — just slice correctly
+            if self.cdim == 4:
+                rec_rgb = rec_rgb if self.separate_depth_features else rec[:, :3]
+            else:
+                rec_rgb = rec
+            bg_rec_rgb = bg_rec[:, :3]
             dec_objects_rgb = dec_objects
+
+        bg_depth = bg_rec[:, 3:4] if bg_rec.shape[1] > 3 else None
 
         dec_dict['rec_rgb'] = rec_rgb
         dec_dict['bg_rgb'] = bg_rec_rgb
+        dec_dict['rec_depth'] = rec_depth
+        dec_dict['bg_depth'] = bg_depth   
         dec_dict['dec_objects_trans'] = dec_objects_trans
         dec_dict['dec_objects_original_rgb'] = dec_objects_rgb
         return dec_dict
@@ -946,6 +978,7 @@ class DLP(nn.Module):
         # encoder
         z = enc_dict['z']
         z_features = enc_dict['z_features']
+        z_depth_features = enc_dict['z_depth_features']
         z_bg_features = enc_dict['z_bg_features']
         z_obj_on = enc_dict['obj_on']
         z_depth = enc_dict['z_depth']
@@ -993,7 +1026,7 @@ class DLP(nn.Module):
                 z_ctx = z_context[:, :timestep_horizon - 1].contiguous()
             else:
                 z_ctx = None
-            dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features,
+            dec_dict = self.decode_all(z, z_scale, z_features, z_depth_features, z_obj_on, z_depth, z_bg_features,
                                        z_ctx=z_ctx, filter_key=filter_key)
             rec = dec_dict['rec_rgb']
 
@@ -1142,8 +1175,11 @@ class DLP(nn.Module):
         z_offset = enc_dict['z_offset']
         mu_tot = enc_dict['mu_tot']
         mu_features = enc_dict['mu_features']
+        mu_depth_features = enc_dict['mu_depth_features']
         logvar_features = enc_dict['logvar_features']
+        logvar_depth_features = enc_dict['logvar_depth_features']   
         z_features = enc_dict['z_features']
+        z_depth_features = enc_dict['z_depth_features']
         # cropped_objects = enc_dict['cropped_objects_original']
         obj_on_a = enc_dict['obj_on_a']
         obj_on_b = enc_dict['obj_on_b']
@@ -1152,7 +1188,6 @@ class DLP(nn.Module):
         mu_depth = enc_dict['mu_depth']
         logvar_depth = enc_dict['logvar_depth']
         z_depth = enc_dict['z_depth']
-        z_depth_features = enc_dict['z_depth_features']
         mu_scale = enc_dict['mu_scale']
         logvar_scale = enc_dict['logvar_scale']
         z_scale = enc_dict['z_scale']
@@ -1208,6 +1243,8 @@ class DLP(nn.Module):
         rec_rgb = dec_dict['rec_rgb']
         bg_rec_rgb = dec_dict['bg_rgb']
         dec_objects_rgb = dec_dict['dec_objects_original_rgb']
+        rec_depth = dec_dict['rec_depth']
+        bg_rec_depth = dec_dict['bg_depth']
 
         # dynamics - all but the last timestep
         if self.is_dynamics_model:
@@ -1299,12 +1336,14 @@ class DLP(nn.Module):
             mu_score_dyn = None
             logvar_score_dyn = None
 
-        output_dict = {'kp_p': kp_p, 'rec': rec, 'rec_rgb': rec_rgb, 'mu_anchor': mu_anchor,
+        output_dict = {'kp_p': kp_p, 'rec': rec, 'rec_rgb': rec_rgb, 'rec_depth': rec_depth, 'mu_anchor': mu_anchor,
                        'logvar_anchor': logvar_anchor, 'z_base_var': z_base_var,
                        'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
                        'mu_tot': mu_tot, 'mu_features': mu_features, 'logvar_features': logvar_features,
-                       'z_features': z_features, 'bg': bg_rec, 'bg_rgb': bg_rec_rgb, 'mu_bg_features': mu_bg_features,
+                       'z_features': z_features, 'z_depth_features': z_depth_features, 'mu_depth_features': mu_depth_features,
+                       'logvar_depth_features': logvar_depth_features,
+                       'bg': bg_rec, 'bg_rgb': bg_rec_rgb, 'bg_depth': bg_rec_depth, 'mu_bg_features': mu_bg_features,
                        'logvar_bg_features': logvar_bg_features, 'z_bg_features': z_bg_features,
                        'mu_context': mu_context, 'logvar_context': logvar_context, 'z_context': z_context,
                        'cropped_objects_original': cropped_objects, 'cropped_objects_original_rgb': cropped_objects_rgb,

@@ -542,9 +542,6 @@ def plot_bb_on_image_batch_from_masks(mask_batch_tensor, img_batch_tensor, thick
     return img_with_bb
 
 
-import torch
-import matplotlib.pyplot as plt
-
 def create_segmentation_map(
     x: torch.Tensor,
     masks: torch.Tensor,
@@ -591,6 +588,36 @@ def create_segmentation_map(
     # seg_map now has RGB blended; depth (if any) unchanged
     return seg_map
 
+
+def depth_to_rgb(depth: torch.Tensor, near=None, far=None, cmap_name="viridis"):
+    """
+    depth: [B,1,H,W] in meters or normalized
+    Returns: [B,3,H,W] uint in [0,1] for visualization (does NOT modify input)
+    """
+    assert depth.dim() == 4 and depth.size(1) == 1
+    d = depth.clone()
+
+    # normalize to [0,1]
+    if (near is not None) and (far is not None) and (far > near):
+        d = (d - near) / (far - near)
+    else:
+        # per-sample min-max (viz only)
+        d = d - d.amin(dim=(2,3), keepdim=True)
+        d = d / (d.amax(dim=(2,3), keepdim=True) + 1e-6)
+
+    d = d.clamp_(0, 1)
+
+    # map to RGB via matplotlib colormap
+    cmap = plt.get_cmap(cmap_name)
+    # d: [B,1,H,W] -> [B,H,W]
+    d_np = d.squeeze(1).detach().cpu().numpy()
+    rgb_list = []
+    for i in range(d_np.shape[0]):
+        rgba = cmap(d_np[i])  # [H,W,4]
+        rgb = torch.from_numpy(rgba[..., :3]).permute(2,0,1)  # [3,H,W]
+        rgb_list.append(rgb)
+    rgb = torch.stack(rgb_list, dim=0).to(depth.device, dtype=depth.dtype)
+    return rgb
 
 
 def prepare_logdir(runname, src_dir='./', accelerator=None):

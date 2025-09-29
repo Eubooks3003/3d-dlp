@@ -21,7 +21,7 @@ from datasets.get_dataset import get_image_dataset
 from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save_config, log_line,
                              plot_bb_on_image_batch_from_z_scale_nms, plot_bb_on_image_batch_from_masks_nms,
                              create_segmentation_map, get_config, LinearWithWarmupScheduler, format_epoch_summary,
-                             plot_training_metrics, save_metrics_data, save_code_backup)
+                             plot_training_metrics, save_metrics_data, save_code_backup, depth_to_rgb)
 from utils.rgbd_utils import get_depth_range, normalize_rgbd
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
@@ -463,6 +463,84 @@ def train_dlp(config_path='./configs/shapes.json'):
                                          bg[:max_imgs, -3:]],
                                         dim=0).data.cpu(), '{}/image_{}.jpg'.format(fig_dir, epoch),
                               nrow=8, pad_value=1)
+            
+            # ----- Depth figure (separate panel) -----
+            # 1) Gather depth tensors
+            if ch ==4:
+                depth_gt = x[:, 3:4]
+
+                rec_depth = model_output['rec_depth'] # [B,1,H,W] or None
+                if rec_depth is not None and rec_depth.dim() == 5:
+                    rec_depth = rec_depth.view(-1, *rec_depth.shape[2:])
+
+                dec_depth_trans = model_output.get('dec_depth_trans', None)  # [B,1,H,W] or None
+                bg_depth = model_output['bg_depth']  # [B,1,H,W] or None
+
+                # 2) Make 3-ch visualizations (choose a colormap)
+                depth_viz = []
+                if depth_gt is not None:
+                    depth_viz.append(depth_to_rgb(depth_gt, near=near, far=far, cmap_name="viridis"))
+                if rec_depth is not None:
+                    depth_viz.append(depth_to_rgb(rec_depth, near=near, far=far, cmap_name="viridis"))
+                if dec_depth_trans is not None:
+                    depth_viz.append(depth_to_rgb(dec_depth_trans, near=near, far=far, cmap_name="viridis"))
+                if bg_depth is not None:
+                    depth_viz.append(depth_to_rgb(bg_depth, near=near, far=far, cmap_name="viridis"))
+
+                # pad missing slots to keep concat layout simple
+                while len(depth_viz) < 4:
+                    filler = depth_viz[0] if len(depth_viz) else depth_to_rgb(torch.zeros_like(x[:, :1]), cmap_name="viridis")
+                    depth_viz.append(filler)
+
+                depth_gt_vis, rec_depth_vis, dec_depth_vis, bg_depth_vis = depth_viz[:4]
+
+                # 3) Reuse your KP/BB/mask utilities with depth visualizations
+                max_imgs = 8
+                kp_batch = mu_plot  # same KP used for RGB
+                scale_batch = mu_scale.view(-1, *mu_scale.shape[2:])
+
+                img_depth_with_kp = plot_keypoints_on_image_batch(kp_batch, depth_gt_vis, radius=3, thickness=1,
+                                                                max_imgs=max_imgs, kp_range=kp_range)
+                img_depth_with_kp_rec = plot_keypoints_on_image_batch(kp_batch, rec_depth_vis, radius=3, thickness=1,
+                                                                    max_imgs=max_imgs, kp_range=kp_range)
+
+                # NMS BB over depth viz
+                img_depth_with_masks_nms, _ = plot_bb_on_image_batch_from_z_scale_nms(
+                    kp_batch, scale_batch, depth_gt_vis, scores=bb_scores, iou_thresh=iou_thresh,
+                    thickness=1, max_imgs=max_imgs, hard_thresh=hard_threshold
+                )
+
+                alpha_masks_bin = torch.where(alpha_masks < 0.05, 0.0, 1.0)
+                if alpha_masks_bin.shape[1] != bb_scores.shape[1]:
+                    bb_scores_depth = -1 * torch.topk(logvar_sum, k=alpha_masks_bin.shape[1], dim=-1, largest=False)[0]
+                else:
+                    bb_scores_depth = bb_scores
+
+                img_depth_with_masks_alpha_nms, _ = plot_bb_on_image_batch_from_masks_nms(
+                    alpha_masks_bin, depth_gt_vis, scores=bb_scores_depth, iou_thresh=iou_thresh,
+                    thickness=1, max_imgs=max_imgs, hard_thresh=hard_threshold
+                )
+
+
+                # 4) Save a dedicated depth figure (mirrors your RGB collage order)
+                #    Order suggestion: GT depth, GT+KP, REC depth, REC+KP, DEC depth, BB(NMS) on depth, Alpha NMS on depth, BG depth
+                depth_panel = torch.cat([
+                    depth_gt_vis[:max_imgs],
+                    img_depth_with_kp[:max_imgs].to(device),
+                    rec_depth_vis[:max_imgs],
+                    img_depth_with_kp_rec[:max_imgs].to(device),
+                    dec_depth_vis[:max_imgs],
+                    img_depth_with_masks_nms[:max_imgs].to(device),
+                    img_depth_with_masks_alpha_nms[:max_imgs].to(device),
+                    bg_depth_vis[:max_imgs],
+                ], dim=0)
+
+                vutils.save_image(
+                    depth_panel.data.cpu(),
+                    '{}/image_depth_{}.jpg'.format(fig_dir, epoch),
+                    nrow=8, pad_value=1
+                )
+
             # object plot
 
             # with torch.no_grad():

@@ -5569,7 +5569,7 @@ class DLPEncoder(nn.Module):
         encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
-                       'z_depth_features': z_depth_features, 'mu_features_depth': mu_depth_features, 'logvar_depth_features': logvar_depth_features,
+                       'z_depth_features': z_depth_features, 'mu_depth_features': mu_depth_features, 'logvar_depth_features': logvar_depth_features,
                        'mu_bg_features': mu_bg_features, 'logvar_bg_features': logvar_bg_features,
                        'z_bg_features': z_bg_features, 'mu_context': mu_context, 'logvar_context': logvar_context,
                        'z_context': z_context,
@@ -5959,6 +5959,7 @@ class DLPDecoder(nn.Module):
         )
 
         # background (RGB or RGBD)
+        # TODO: if you want to use separate depth features for bg, add that here
         bg_rec = self.bg_dec(z_bg_features, z_ctx)    # [B*,3,H,W] or [B*,4,H,W]
 
         # composite RGB
@@ -5988,6 +5989,7 @@ class DLPDecoder(nn.Module):
             'alpha_masks': alpha_masks,
             'bg_mask': bg_mask,
             'bg_rec': bg_rec,
+            'rec_rgb': rec_rgb,
             'rec_depth': rec_depth,
             'dec_depth_trans': dec_depth_trans,
             'dec_depth_patches': dec_depth_patches,
