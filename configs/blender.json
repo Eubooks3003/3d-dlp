@@ -1,6 +1,6 @@
 {
-  "ds": "shapes",
-  "root": null,
+  "ds": "blender",
+  "root": "/home/ellina/Desktop/Code/3D-DLP/Blender_Dataset",
   "device": "cuda",
   "batch_size": 32,
   "lr": 0.00008,
