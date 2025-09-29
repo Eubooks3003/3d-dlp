@@ -22,6 +22,7 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
                              plot_bb_on_image_batch_from_z_scale_nms, plot_bb_on_image_batch_from_masks_nms,
                              create_segmentation_map, get_config, LinearWithWarmupScheduler, format_epoch_summary,
                              plot_training_metrics, save_metrics_data, save_code_backup)
+from utils.rgbd_utils import get_depth_range, normalize_rgbd
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
 
@@ -119,10 +120,18 @@ def train_dlp(config_path='./configs/shapes.json'):
     topk = min(config['topk'], config['n_kp_enc'])  # top-k particles to plot
     iou_thresh = config['iou_thresh']  # threshold for NMS for plotting bounding boxes
 
+    #RGBD Stuff
+    separate_depth_features = config["separate_depth_features"]  # use separate depth feature encoding
+    depth_feature_dim = config["depth_feature_dim"]  # depth feature dimension if separate encoding
+    split_loss = config["split_loss"]  # split loss into components for logging
+    depth_loss_ratio = config["depth_loss_ratio"]  # weight of depth loss if split_loss is True
+
     # load data
     dataset = get_image_dataset(ds, root, mode='train', image_size=image_size)
     dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
                             drop_last=True)
+    # dataset-level near/far if available (shapes uses (0.2, 2.0))
+    near, far = get_depth_range(dataloader)
     # model
     model = DLP(
         cdim=ch,  # Number of input image channels
@@ -180,7 +189,13 @@ def train_dlp(config_path='./configs/shapes.json'):
         pint_enc_heads=pint_enc_heads,  # Number of PINT encoder attention heads
 
         # Dynamics configuration
-        timestep_horizon=1).to(device)
+        timestep_horizon=1,
+        
+        #RGBD Stuff
+        separate_depth_features=separate_depth_features, 
+        depth_feature_dim=depth_feature_dim,
+        split_loss=split_loss, 
+        depth_loss_ratio=depth_loss_ratio).to(device)
     model_info = model.info()
     print(model_info)
     # prepare saving location
@@ -267,6 +282,8 @@ def train_dlp(config_path='./configs/shapes.json'):
             if len(x.shape) == 4:
                 # [bs, ch, h, w]
                 x = x.unsqueeze(1)
+            if ch == 4:
+                x = normalize_rgbd(x, near=near, far=far, rgb_mode="unit")   # or "imagenet" if you want standardized RGB
             warmup = (epoch < warmup_epoch)
             # forward pass
             model_output = model(x, warmup=warmup, with_loss=True,

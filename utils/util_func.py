@@ -83,7 +83,6 @@ def plot_keypoints_on_image(k, image_tensor, radius=1, thickness=1, kp_range=(0,
 
     return img
 
-
 def plot_keypoints_on_image_batch(kp_batch_tensor, img_batch_tensor, radius=1, thickness=1, max_imgs=8,
                                   kp_range=(0, 1), plot_numbers=False):
     num_plot = min(max_imgs, img_batch_tensor.shape[0])
@@ -543,66 +542,55 @@ def plot_bb_on_image_batch_from_masks(mask_batch_tensor, img_batch_tensor, thick
     return img_with_bb
 
 
+import torch
+import matplotlib.pyplot as plt
+
 def create_segmentation_map(
-        x: torch.Tensor,
-        masks: torch.Tensor,
-        scores: torch.Tensor,
-        alpha: float = 0.7,
-        score_threshold: float = 1e-2,
-        cmap_name: str = "rainbow"
+    x: torch.Tensor,
+    masks: torch.Tensor,
+    scores: torch.Tensor,
+    alpha: float = 0.7,
+    score_threshold: float = 1e-2,
+    cmap_name: str = "rainbow",
 ) -> torch.Tensor:
     """
-    Create a colored segmentation map for valid masks (scores > threshold)
+    Overlays colored masks onto the RGB channels.
+    If x has 4 channels (RGBD), the depth channel is left unchanged.
 
-    Args:
-        x: Input image tensor of shape [batch_size, 3, h, w]
-        masks: Mask tensor of shape [batch_size, K, h, w]
-        scores: Scores tensor of shape [batch_size, K]
-        alpha: Transparency factor (0.0 to 1.0) for segmentation overlay
-        score_threshold: Threshold for valid masks
-        cmap_name: Matplotlib colormap name
-
-    Returns:
-        seg_map: Segmentation map tensor of shape [batch_size, 3, h, w]
+    x:      [B, C, H, W], C in {3,4}
+    masks:  [B, K, H, W]
+    scores: [B, K]
+    returns seg_map with same shape as x
     """
-    batch_size, _, h, w = x.shape
+    assert x.dim() == 4 and x.size(1) in (3, 4), f"expected [B,3/4,H,W], got {tuple(x.shape)}"
+    B, C, H, W = x.shape
     device = x.device
 
-    # Create empty segmentation map
-    seg_map = x.clone()
+    seg_map = x.clone()  # keep depth if present
+    rgb = seg_map[:, :3]  # operate on RGB only
 
-    # Get colormap
     cmap = plt.get_cmap(cmap_name)
 
-    for b in range(batch_size):
-        # Find valid masks based on score threshold
-        valid_mask_indices = torch.where(scores[b] > score_threshold)[0]
-
-        if len(valid_mask_indices) == 0:
+    for b in range(B):
+        valid = torch.where(scores[b] > score_threshold)[0]
+        if valid.numel() == 0:
             continue
 
-        # Create colored masks overlay
-        overlay = torch.zeros(3, h, w, device=device)
+        overlay = torch.zeros(3, H, W, device=device)
 
-        # Assign a different color to each mask
-        for i, mask_idx in enumerate(valid_mask_indices):
-            # Normalize index to [0, 1] for colormap
-            color_idx = i / max(1.0, len(valid_mask_indices) - 1)
+        # assign distinct colors across valid masks
+        denom = max(1, valid.numel() - 1)
+        for i, mi in enumerate(valid.tolist()):
+            color_idx = i / denom
+            color = torch.tensor(cmap(color_idx)[:3], device=device, dtype=rgb.dtype).view(3, 1, 1)
+            mask = masks[b, mi].unsqueeze(0).to(rgb.dtype)  # [1,H,W]
+            overlay = torch.max(overlay, mask * color)
 
-            # Get RGB color from colormap (returns RGBA, we take RGB)
-            color = torch.tensor(cmap(color_idx)[:3], device=device).view(3, 1, 1)
+        rgb[b] = rgb[b] * (1 - alpha) + overlay * alpha
 
-            # Apply color to mask
-            mask = masks[b, mask_idx].unsqueeze(0)  # [1, h, w]
-            colored_mask = mask * color  # [3, h, w]
-
-            # Add to overlay (areas with multiple masks will have blended colors)
-            overlay = torch.max(overlay, colored_mask)
-
-        # Blend original image with overlay using alpha
-        seg_map[b] = x[b] * (1 - alpha) + overlay * alpha
-
+    # seg_map now has RGB blended; depth (if any) unchanged
     return seg_map
+
 
 
 def prepare_logdir(runname, src_dir='./', accelerator=None):

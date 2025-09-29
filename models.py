@@ -127,6 +127,12 @@ class DLP(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
+                 
+                 #RGBD Stuff
+                 separate_depth_features=False,  # use separate depth feature encoding
+                 depth_feature_dim=16,  # depth feature dimension if separate encoding
+                 split_loss=False,  # split loss into components for logging
+                 depth_loss_ratio=1.0,  # weight of depth loss if split_loss is True
                  ):
         super(DLP, self).__init__()
         """
@@ -380,7 +386,11 @@ class DLP(nn.Module):
         self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
         self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
-
+        # depth
+        self.separate_depth_features = separate_depth_features
+        self.depth_feature_dim = depth_feature_dim 
+        self.split_loss = split_loss
+        self.depth_loss_ratio = depth_loss_ratio
         # encoder
         self.encoder_module = DLPEncoder(cdim=self.cdim,
                                          image_size=self.image_size,
@@ -449,7 +459,9 @@ class DLP(nn.Module):
                                          init_ssm_last_layer=init_ssm_last_layer,  # spatial softmax initialization
                                          init_conv_layers=init_conv_layers,  # initialize conv layers with normal dist
                                          init_conv_fg_std=init_conv_fg_std,  # std for conv fg normal dist
-                                         init_conv_bg_std=init_conv_bg_std  # std for conv bg normal dist
+                                         init_conv_bg_std=init_conv_bg_std,  # std for conv bg normal dist
+                                         separate_depth_features=separate_depth_features,
+                                         depth_feature_dim=depth_feature_dim,
                                          )
 
         # prior

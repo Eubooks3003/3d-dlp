@@ -2127,20 +2127,38 @@ class ObjectDecoderCNN(nn.Module):
 
     def forward(self, x, context=None):
         # x: [bs, n_kp, feat]
-        # context: [bs, feat]
         bs, n_kp = x.shape[0], x.shape[1]
 
         x = self.from_latent_lin(x)
         x = x.view(-1, self.ch_feature_dim, self.fc_res, self.fc_res)
         z = self.from_latent(x)
-        conv_in = z
-        out = self.cnn(conv_in).view(-1, self.num_chans, *self.patch_size)
-        out_a, out_rgb = torch.split(out, [1, out.shape[1] - 1], dim=1)
+        out = self.cnn(z).view(-1, self.num_chans, *self.patch_size)  # [B*n_kp, C, H, W]
 
-        rgb_func = torch.tanh if self.normalize_rgb else torch.sigmoid
-        out = torch.cat([torch.sigmoid(out_a), rgb_func(out_rgb)], dim=1)
+        # Always reserve channel 0 for alpha
+        alpha = torch.sigmoid(out[:, :1])  # [B*n_kp, 1, H, W]
+        rest  = out[:, 1:]                 # [B*n_kp, C-1, H, W]
+
+        if self.num_chans == 4:
+            # 1 (alpha) + 3 (RGB)
+            rgb = rest
+            rgb_func = torch.tanh if self.normalize_rgb else torch.sigmoid
+            rgb = rgb_func(rgb)
+            out = torch.cat([alpha, rgb], dim=1)
+
+        elif self.num_chans == 5:
+            # 1 (alpha) + 3 (RGB) + 1 (Depth)
+            rgb, depth = rest[:, :3], rest[:, 3:]
+            rgb_func = torch.tanh if self.normalize_rgb else torch.sigmoid
+            rgb   = rgb_func(rgb)
+            depth = torch.sigmoid(depth)  # keep depth in [0,1] here; rescale later if needed
+            out = torch.cat([alpha, rgb, depth], dim=1)
+
+        else:
+            # Fallback: apply sigmoid to all non-alpha
+            out = torch.cat([alpha, torch.sigmoid(rest)], dim=1)
 
         return out
+
 
 
 class ObjectDecoderCNNFILM(nn.Module):
@@ -4255,7 +4273,8 @@ class ParticleEncoder(nn.Module):
                  init_ssm_last_layer=True,  # spatial softmax initialization
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
-                 ):
+                 separate_depth_features=False,
+                 depth_feature_dim=16,):
         super(ParticleEncoder, self).__init__()
         """
         DLP Foreground Module – Extracts objects from an image using keypoints and learned features. 
@@ -4340,7 +4359,11 @@ class ParticleEncoder(nn.Module):
         self.init_ssm_last_layer = init_ssm_last_layer  # spatial softmax initialization
         self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
+        
+        self.separate_depth_features = separate_depth_features
+        self.depth_feature_dim = depth_feature_dim
 
+        print("Creating DLP Prior with cdim: ", cdim)
         self.prior_encoder = DLPPrior(cdim=cdim, image_size=image_size, n_kp=self.n_kp_per_patch,
                                       patch_size=patch_size, kp_range=kp_range, pad_mode=pad_mode,
                                       n_kp_prior=n_kp_prior,
@@ -4375,21 +4398,55 @@ class ParticleEncoder(nn.Module):
                                                                init_conv_fg_std=init_conv_fg_std)
         # appearance encoder - visual features encoder (z_f)
         output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
-        self.particle_features_enc = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
-                                                             image_size,
-                                                             margin=0, pad_mode=pad_mode,
-                                                             ch_mult=obj_ch_mult, base_ch=obj_base_ch,
-                                                             final_cnn_ch=obj_final_cnn_ch,
-                                                             num_res_blocks=num_res_blocks,
-                                                             output_logvar=output_logvar,
-                                                             use_resblock=use_resblock, cnn_mid_blocks=cnn_mid_blocks,
-                                                             hidden_dim=mlp_hidden_dim,
-                                                             timestep_horizon=self.timestep_horizon,
-                                                             add_particle_temp_embed=add_particle_temp_embed,
-                                                             init_zero_bias=init_zero_bias,
-                                                             init_conv_layers=init_conv_layers,
-                                                             init_conv_fg_std=init_conv_fg_std
-                                                             )
+
+        # Split RGB and Depth Feature Encoder when RGBD
+        if self.separate_depth_features and cdim == 4:
+            self.particle_features_enc_rgb = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
+                                                            image_size,
+                                                            margin=0, ch=3, pad_mode=pad_mode,
+                                                            ch_mult=obj_ch_mult, base_ch=obj_base_ch,
+                                                            final_cnn_ch=obj_final_cnn_ch,
+                                                            num_res_blocks=num_res_blocks,
+                                                            output_logvar=output_logvar,
+                                                            use_resblock=use_resblock, cnn_mid_blocks=cnn_mid_blocks,
+                                                            hidden_dim=mlp_hidden_dim,
+                                                            timestep_horizon=self.timestep_horizon,
+                                                            add_particle_temp_embed=add_particle_temp_embed,
+                                                            init_zero_bias=init_zero_bias,
+                                                            init_conv_layers=init_conv_layers,
+                                                            init_conv_fg_std=init_conv_fg_std
+                                                            )
+            self.particle_features_enc_depth = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
+                                                            image_size,
+                                                            margin=0, ch=1, pad_mode=pad_mode,
+                                                            ch_mult=obj_ch_mult, base_ch=obj_base_ch,
+                                                            final_cnn_ch=obj_final_cnn_ch,
+                                                            num_res_blocks=num_res_blocks,
+                                                            output_logvar=output_logvar,
+                                                            use_resblock=use_resblock, cnn_mid_blocks=cnn_mid_blocks,
+                                                            hidden_dim=mlp_hidden_dim,
+                                                            timestep_horizon=self.timestep_horizon,
+                                                            add_particle_temp_embed=add_particle_temp_embed,
+                                                            init_zero_bias=init_zero_bias,
+                                                            init_conv_layers=init_conv_layers,
+                                                            init_conv_fg_std=init_conv_fg_std
+                                                            )
+        else:
+            self.particle_features_enc = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
+                                                            image_size,
+                                                            margin=0, ch=cdim, pad_mode=pad_mode,
+                                                            ch_mult=obj_ch_mult, base_ch=obj_base_ch,
+                                                            final_cnn_ch=obj_final_cnn_ch,
+                                                            num_res_blocks=num_res_blocks,
+                                                            output_logvar=output_logvar,
+                                                            use_resblock=use_resblock, cnn_mid_blocks=cnn_mid_blocks,
+                                                            hidden_dim=mlp_hidden_dim,
+                                                            timestep_horizon=self.timestep_horizon,
+                                                            add_particle_temp_embed=add_particle_temp_embed,
+                                                            init_zero_bias=init_zero_bias,
+                                                            init_conv_layers=init_conv_layers,
+                                                            init_conv_fg_std=init_conv_fg_std
+                                                            )
         # embed the source patch of the particles
         if self.embed_prior_patch_pos:
             self.patch_id_embed = nn.Parameter(self.embed_init_std * torch.randn(1, self.n_kp_prior, mlp_hidden_dim))
@@ -4795,6 +4852,9 @@ class DLPEncoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
+                 #RGBD 
+                 separate_depth_features=False, # use separate feature encoder for RGB and Depth channels
+                 depth_feature_dim=16, # feature dimension for depth channel
                  ):
         """
         DLP Encoder Module
@@ -4947,6 +5007,10 @@ class DLPEncoder(nn.Module):
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
         self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
 
+        #RGBD
+        self.separate_depth_features = separate_depth_features
+        self.depth_feature_dim = depth_feature_dim
+
         self.register_buffer('scale_anchor', torch.tensor(np.log(anchor_s / (1 - anchor_s + 1e-5))))
         use_norm_layer = True  # norm layer in the pre-attention projections modules
         self.particle_enc = ParticleEncoder(cdim=cdim,
@@ -4977,7 +5041,9 @@ class DLPEncoder(nn.Module):
                                             init_zero_bias=init_zero_bias,
                                             init_ssm_last_layer=init_ssm_last_layer,
                                             init_conv_layers=init_conv_layers,
-                                            init_conv_fg_std=init_conv_fg_std)
+                                            init_conv_fg_std=init_conv_fg_std,
+                                            separate_depth_features=separate_depth_features,
+                                            depth_feature_dim=depth_feature_dim)
 
         self.prior_encoder = self.particle_enc.prior_encoder
         self.bg_encoder = BgEncoder(cdim=cdim, image_size=image_size, pad_mode=pad_mode,
@@ -5145,7 +5211,7 @@ class DLPEncoder(nn.Module):
                 x_goal = x_goal.unsqueeze(1)  # -> [bs, T=1, ch, h, w]
             x = torch.cat([x, x_goal], dim=1)  # [bs, T+1, ...]
         # x = x.view(bs * timestep_horizon, *x.shape[2:])  # [bs * T, ch, h, w]
-        # encode particles
+        # encode particles +++++++
         particle_dict = self.particle_enc(x, deterministic, warmup)
         # unpack
         kp_p = particle_dict['kp_p']
@@ -5187,7 +5253,7 @@ class DLPEncoder(nn.Module):
             if not self.interaction_features:
                 z_features = torch.cat([z_features[:, :-1], mu_features[:, -1:]], dim=1)
 
-        # encode bg
+        # +++++++ encode bg +++++++
         # x = x.view(bs * timestep_horizon, *x.shape[2:])  # [bs * T, ch, h, w]
         x = x.view(-1, *x.shape[2:])  # [bs * T, ch, h, w]
         z_v = z.view(-1, *z.shape[2:])
@@ -5489,7 +5555,7 @@ class DLPDecoder(nn.Module):
             particle_dec_net = ObjectDecoderCNNFILM
         else:
             particle_dec_net = ObjectDecoderCNN
-        self.particle_dec = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=4,
+        self.particle_dec = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=cdim + 1,
                                              bottleneck_size=learned_feature_dim,
                                              use_resblock=self.use_resblock,
                                              pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,

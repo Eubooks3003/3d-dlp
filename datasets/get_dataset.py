@@ -1,7 +1,7 @@
 # datasets
 from datasets.traffic_ds import TrafficDataset, TrafficDatasetImage
 from datasets.clevrer_ds import CLEVREREpDataset, CLEVREREpDatasetImage
-from datasets.shapes_ds import generate_shape_dataset_torch
+from datasets.shapes_ds import generate_shape_dataset_torch, generate_shape_dataset_torch_rgbd
 from datasets.balls_ds import Balls, BallsImage
 from datasets.obj3d_ds import Obj3D, Obj3DImage
 from datasets.phyre_ds import PhyreDataset, PhyreDatasetImage
@@ -99,9 +99,9 @@ def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1):
         dataset = BAIR64Image(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
     elif ds == 'shapes':
         if mode == 'train':
-            dataset = generate_shape_dataset_torch(img_size=image_size, num_images=40_000)
+            dataset = generate_shape_dataset_torch_rgbd(img_size=image_size, num_images=1_000)
         else:
-            dataset = generate_shape_dataset_torch(img_size=image_size, num_images=2_000)
+            dataset = generate_shape_dataset_torch_rgbd(img_size=image_size, num_images=2_000)
     elif ds == 'langtable':
         dataset = LanguageTableDatasetImage(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
     elif ds == 'bridge':
