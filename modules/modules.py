@@ -5965,6 +5965,8 @@ class DLPDecoder(nn.Module):
         # composite RGB
         rec_rgb = bg_mask * bg_rec[:, :3] + dec_objects_trans
 
+        
+        # TODO: dec_objects_trans and dec_depth_trans should be tied together in some way
         # composite Depth if available from objects or bg
         rec_depth = None
         have_obj_depth = dec_depth_trans is not None

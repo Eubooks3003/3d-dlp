@@ -307,7 +307,11 @@ def train_dlp(config_path='./configs/shapes.json'):
             z_base = model_output['z_base']
             mu_offset = model_output['mu_offset']
             logvar_offset = model_output['logvar_offset']
-            rec_x = model_output['rec_rgb']
+            if ch ==4:
+                # Use normalized RGB in RGBD
+                rec_x = model_output['rec_rgb'].clamp(0, 1) 
+            else:
+                rec_x = model_output['rec_rgb']
             mu_scale = model_output['mu_scale']
             mu_depth = model_output['mu_depth']
             # object stuff
@@ -453,20 +457,21 @@ def train_dlp(config_path='./configs/shapes.json'):
                                                              kp_range=kp_range)
             dec_objects = model_output['dec_objects']
             bg = model_output['bg_rgb']
-            vutils.save_image(torch.cat([x[:max_imgs, -3:], img_with_kp[:max_imgs, -3:].to(device),
-                                         rec_x[:max_imgs, -3:], img_with_kp_p[:max_imgs, -3:].to(device),
-                                         img_with_kp_topk[:max_imgs, -3:].to(device),
-                                         dec_objects[:max_imgs, -3:],
-                                         img_with_masks_nms[:max_imgs, -3:].to(device),
-                                         img_with_masks_alpha_nms[:max_imgs, -3:].to(device),
-                                         img_with_seg_maps[:max_imgs, -3:],
-                                         bg[:max_imgs, -3:]],
+            print("Rec_x", rec_x.shape)
+            vutils.save_image(torch.cat([x[:max_imgs, :3], img_with_kp[:max_imgs, :3].to(device),
+                                         rec_x[:max_imgs, :3], img_with_kp_p[:max_imgs, :3].to(device),
+                                         img_with_kp_topk[:max_imgs, :3].to(device),
+                                         dec_objects[:max_imgs, :3],
+                                         img_with_masks_nms[:max_imgs, :3].to(device),
+                                         img_with_masks_alpha_nms[:max_imgs, :3].to(device),
+                                         img_with_seg_maps[:max_imgs, :3],
+                                         bg[:max_imgs, :3]],
                                         dim=0).data.cpu(), '{}/image_{}.jpg'.format(fig_dir, epoch),
                               nrow=8, pad_value=1)
             
             # ----- Depth figure (separate panel) -----
             # 1) Gather depth tensors
-            if ch ==4:
+            if ch == 4:
                 depth_gt = x[:, 3:4]
 
                 rec_depth = model_output['rec_depth'] # [B,1,H,W] or None
