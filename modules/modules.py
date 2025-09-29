@@ -4458,6 +4458,7 @@ class ParticleEncoder(nn.Module):
         patch_centers = torch.cat([patch_centers, torch.zeros(1, 1, 2)], dim=1)
         if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
             self.null_feature_embed = nn.Parameter(self.embed_init_std * torch.randn(1, 1, self.learned_feature_dim))
+            self.null_depth_feature_embed = nn.Parameter(self.embed_init_std * torch.randn(1, 1, self.depth_feature_dim)) if self.separate_depth_features and cdim == 4 else None
         self.register_buffer('patch_centers', patch_centers)
         self.register_buffer('mu_scale_prior', torch.tensor(np.log(self.anchor_s / (1 - self.anchor_s + 1e-5))))
         self.init_weights()
@@ -4599,12 +4600,12 @@ class ParticleEncoder(nn.Module):
                     'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score}
         return out_dict
 
-    def _sample_gauss(mu, logvar):
-        if deterministic or self.interaction_features or (logvar is None):
+    def sample_gauss(self, mu, logvar, deterministic, interaction_features):
+        if deterministic or interaction_features or (logvar is None):
             return mu
         return reparameterize(mu, logvar)
 
-    def _sample_categorical_logits(logits, deterministic, n_cat, n_cls):
+    def sample_categorical_logits(self, logits, deterministic, n_cat, n_cls):
         # logits: [..., n_cat*n_cls]
         shape = logits.shape
         probs = logits.view(*shape[:-1], n_cat, n_cls).softmax(dim=-1)
@@ -4623,7 +4624,7 @@ class ParticleEncoder(nn.Module):
         st = onehot.detach() + (probs - probs.detach())
         return st.view(*shape)  # back to [..., n_cat*n_cls]
 
-    def _gate_with_null(mu, gate, null_embed):
+    def gate_with_null(self, mu, gate, null_embed):
         # gate: broadcastable zeros/ones
         if null_embed is None:
             return mu  # no-op if you didn't set one
@@ -4673,15 +4674,14 @@ class ParticleEncoder(nn.Module):
             if obj_on is not None:
                 gate = (obj_on > 0.2).to(mu_rgb.dtype)  # broadcast-safe
                 # RGB null
-                null_rgb = getattr(self, "null_feature_embed_rgb", getattr(self, "null_feature_embed", None))
-                mu_rgb = _gate_with_null(mu_rgb, gate, null_rgb)
+                null_rgb = self.null_feature_embed
                 # Depth null
                 if mu_d is not None:
-                    null_d = getattr(self, "null_feature_embed_depth", None)
+                    null_d = self.null_depth_feature_embed
                     if null_d is None:
                         null_d = mu_d.new_zeros(*mu_d.shape[:-1], mu_d.shape[-1])
                         self.null_feature_embed_depth = null_d
-                    mu_d = _gate_with_null(mu_d, gate, null_d)
+                    mu_d = self.gate_with_null(mu_d, gate, null_d)
 
             # sampling per-branch according to (possibly) per-branch distributions
             dist_rgb = getattr(self, "features_dist_rgb", self.features_dist)
@@ -4690,22 +4690,22 @@ class ParticleEncoder(nn.Module):
             if not self.interaction_features:
                 # RGB
                 if dist_rgb == 'categorical':
-                    z_rgb = _sample_categorical_logits(mu_rgb, deterministic,
+                    z_rgb = self.sample_categorical_logits(mu_rgb, deterministic,
                                                     self.n_fg_categories, self.n_fg_classes)
                     mu_rgb_eff, logvar_rgb_eff = mu_rgb, None  # logits carried in mu_rgb
                 else:  # 'gauss'
-                    z_rgb = _sample_gauss(mu_rgb, logvar_rgb)
+                    z_rgb = self.sample_gauss(mu_rgb, logvar_rgb, deterministic, self.interaction_features)
                     mu_rgb_eff, logvar_rgb_eff = mu_rgb, logvar_rgb
 
                 # DEPTH
                 if mu_d is not None:
                     if dist_d == 'categorical':
-                        z_d = _sample_categorical_logits(mu_d, deterministic,
+                        z_d = self.sample_categorical_logits(mu_d, deterministic,
                                                         getattr(self, "n_fg_categories_depth", self.n_fg_categories),
                                                         getattr(self, "n_fg_classes_depth", self.n_fg_classes))
                         mu_d_eff, logvar_d_eff = mu_d, None
                     else:
-                        z_d = _sample_gauss(mu_d, logvar_d)
+                        z_d = self.sample_gauss(mu_d, logvar_d, deterministic, self.interaction_features)
                         mu_d_eff, logvar_d_eff = mu_d, logvar_d
                 else:
                     z_d = mu_d_eff = logvar_d_eff = None
@@ -4758,17 +4758,17 @@ class ParticleEncoder(nn.Module):
         # obj_on gating
         if obj_on is not None:
             gate = (obj_on > 0.2).to(mu_features.dtype)
-            null = getattr(self, "null_feature_embed", None)
-            mu_features = _gate_with_null(mu_features, gate, null)
+            null = self.null_feature_embed
+            mu_features = self.gate_with_null(mu_features, gate, null)
 
         # sampling
         if not self.interaction_features:
             if self.features_dist == 'categorical':
-                z_features = _sample_categorical_logits(
+                z_features = self.sample_categorical_logits(
                     mu_features, deterministic, self.n_fg_categories, self.n_fg_classes
                 )
             else:  # 'gauss'
-                z_features = _sample_gauss(mu_features, logvar_features)
+                z_features = self.sample_gauss(mu_features, logvar_features)
         else:
             z_features = mu_features
 
@@ -4778,8 +4778,8 @@ class ParticleEncoder(nn.Module):
             'z_features':            z_features,
             'cropped_objects':       cropped_objects,
             # depth-specific keys None for caller uniformity
-            'mu_features_depth':     None,
-            'logvar_features_depth': None,
+            'mu_depth_features':     None,
+            'logvar_depth_features': None,
             'z_depth_features':      None,
             'cropped_objects_rgb':   cropped_objects,
             'cropped_objects_d':     None,
@@ -4843,13 +4843,21 @@ class ParticleEncoder(nn.Module):
             # unpack
             cropped_objects = stage2_dict['cropped_objects']
             mu_features_app = stage2_dict['mu_features']
+            mu_depth_features = stage2_dict['mu_depth_features']  # None
             logvar_features = stage2_dict['logvar_features']  # None
+            logvar_depth_features= stage2_dict['logvar_depth_features']  # None
             z_features_app = stage2_dict['z_features']
+            z_depth_features = stage2_dict['z_depth_features']
+
 
             mu_features = self.null_feature_embed.repeat(z.shape[0], self.n_kp_enc, 1)
             mu_features[batch_ind, embed_ind] = mu_features_app
 
+            mu_features_depth = self.null_feature_depth_embed.repeat(z.shape[0], self.n_kp_enc, 1)
+            mu_features_depth[batch_ind, embed_ind] = mu_depth_features
+
             z_features = mu_features
+            z_depth_features = mu_features_depth
 
         else:
             stage2_dict = self.encode_appearance(x, z, z_scale, deterministic=deterministic, timesteps=timestep_horizon,
@@ -4857,8 +4865,11 @@ class ParticleEncoder(nn.Module):
             # unpack
             cropped_objects = stage2_dict['cropped_objects']
             mu_features = stage2_dict['mu_features']
+            mu_depth_features = stage2_dict['mu_features_depth']
             logvar_features = stage2_dict['logvar_features']
+            logvar_depth_features = stage2_dict['logvar_features_depth']
             z_features = stage2_dict['z_features']
+            z_depth_features = stage2_dict['z_depth_features']
 
         # reshape to [bs, T, ...]
         z_base = z_base.view(bs, timestep_horizon, *z_base.shape[1:])
@@ -4878,6 +4889,8 @@ class ParticleEncoder(nn.Module):
             mu_features = mu_features.view(bs, timestep_horizon, *mu_features.shape[1:])
             logvar_features = logvar_features.view(bs, timestep_horizon, *logvar_features.shape[1:])
         z_features = z_features.view(bs, timestep_horizon, *z_features.shape[1:])
+        if z_depth_features is not None:
+            z_depth_features = z_depth_features.view(bs, timestep_horizon, *z_depth_features.shape[1:]) if z_depth_features is not None else None
         cropped_objects = cropped_objects.view(-1, *cropped_objects.shape[2:])
         if not self.interaction_depth:
             mu_depth = mu_depth.view(bs, timestep_horizon, *mu_depth.shape[1:])
@@ -4894,8 +4907,9 @@ class ParticleEncoder(nn.Module):
 
         encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
-                       'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
-                       'cropped_objects': cropped_objects.detach(), 'patch_id_embed': patch_id_embed,
+                       'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features, 
+                       'z_depth_features': z_depth_features, 'mu_depth_features': mu_depth_features, 'logvar_depth_features': logvar_depth_features,
+                        'cropped_objects': cropped_objects.detach(), 'patch_id_embed': patch_id_embed,
                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
                        'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
@@ -5386,8 +5400,11 @@ class DLPEncoder(nn.Module):
         mu_obj_on = particle_dict['mu_obj_on']
         z_obj_on = particle_dict['z_obj_on']
         mu_features = particle_dict['mu_features']
+        mu_depth_features = particle_dict['mu_depth_features']
         logvar_features = particle_dict['logvar_features']
+        logvar_depth_features = particle_dict['logvar_depth_features']
         z_features = particle_dict['z_features']
+        z_depth_features = particle_dict['z_depth_features']
         cropped_objects = particle_dict['cropped_objects']
 
         z_score = particle_dict['z_score']
@@ -5548,10 +5565,11 @@ class DLPEncoder(nn.Module):
             mu_score = mu_score[:, :-1].contiguous()
             logvar_score = logvar_score[:, :-1].contiguous()
             z_score = z_score[:, :-1].contiguous()
-
+        # TODO: Make sure all the necessary information from the depth encoding is returned and USED
         encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
+                       'z_depth_features': z_depth_features, 'mu_features_depth': mu_depth_features, 'logvar_depth_features': logvar_depth_features,
                        'mu_bg_features': mu_bg_features, 'logvar_bg_features': logvar_bg_features,
                        'z_bg_features': z_bg_features, 'mu_context': mu_context, 'logvar_context': logvar_context,
                        'z_context': z_context,
@@ -5911,8 +5929,8 @@ class DLPDecoder(nn.Module):
         return dec_rgb_patches, dec_rgb_comp, alpha_masks, bg_mask, dec_depth_comp, dec_depth_patches
 
     def decode_all(
-        self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, z_ctx=None,
-        warmup=False, *, z_depth_features=None
+        self, z, z_scale, z_features, z_depth_features, obj_on, z_depth, z_bg_features, z_ctx=None,
+        warmup=False
     ):
         # flatten time exactly like your original
         if len(z.shape) == 4:
@@ -5975,9 +5993,9 @@ class DLPDecoder(nn.Module):
             'dec_depth_patches': dec_depth_patches,
         }
 
-    def forward(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx=None,
+    def forward(self, z, z_scale, z_features, z_features_depth, obj_on_sample, z_depth, z_bg_features, z_ctx=None,
                 warmup=False):
-        return self.decode_all(z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup)
+        return self.decode_all(z, z_scale, z_features,z_features_depth, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup)
 
 
 class DLPContext(nn.Module):

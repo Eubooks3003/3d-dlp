@@ -851,7 +851,7 @@ class DLP(nn.Module):
         enc_dict['cropped_objects_rgb'] = cropped_objects_rgb
         return enc_dict
 
-    def decode_all(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx,
+    def decode_all(self, z, z_scale, z_features, z_depth_features, obj_on_sample, z_depth, z_bg_features, z_ctx,
                    warmup=False, filter_key=None):
         if filter_key is not None:
             orig_shape = z.shape
@@ -887,7 +887,7 @@ class DLP(nn.Module):
                 z_features = z_features.reshape(orig_shape[0], orig_shape[1], *z_features.shape[1:])
                 obj_on_sample = obj_on_sample.reshape(orig_shape[0], orig_shape[1], *obj_on_sample.shape[1:])
 
-        dec_dict = self.decoder_module(z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup)
+        dec_dict = self.decoder_module(z, z_scale, z_features, z_depth_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup)
 
         dec_objects = dec_dict['dec_objects']
         dec_objects_trans = dec_dict['dec_objects_trans']
@@ -1152,6 +1152,7 @@ class DLP(nn.Module):
         mu_depth = enc_dict['mu_depth']
         logvar_depth = enc_dict['logvar_depth']
         z_depth = enc_dict['z_depth']
+        z_depth_features = enc_dict['z_depth_features']
         mu_scale = enc_dict['mu_scale']
         logvar_scale = enc_dict['logvar_scale']
         z_scale = enc_dict['z_scale']
@@ -1194,7 +1195,7 @@ class DLP(nn.Module):
 
         filter_key = z_base_var.sum(-1) if (
                 self.filter_particles_in_decoder and self.n_kp_enc != self.n_kp_dec) else None
-        dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features, z_context,
+        dec_dict = self.decode_all(z, z_scale, z_features, z_depth_features, z_obj_on, z_depth, z_bg_features, z_context,
                                    warmup, filter_key=filter_key)
 
         bg_mask = dec_dict['bg_mask']
