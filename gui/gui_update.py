@@ -29,6 +29,7 @@ class GUIUpdate(GUILoad):
         updated_features = [kp.get_features() for kp in self.keypoints]
         updated_features_indices = [kp.get_features_index() for kp in self.keypoints]
         updated_obj_ons = [kp.get_obj_on() for kp in self.keypoints]
+        updated_depth_features = [kp.get_depth_features() for kp in self.keypoints]
 
         # Convert coordinates and scales to NumPy arrays
         updated_coordinates = np.array(updated_coordinates)  # [n_kp * n_frames, 2]
@@ -37,33 +38,12 @@ class GUIUpdate(GUILoad):
         updated_features_indices = np.array(updated_features_indices)
         updated_scale_multipliers = np.array(updated_scale_multipliers)
         updated_obj_ons = np.array(updated_obj_ons)
+        updated_depth_features = np.array(updated_depth_features)
 
-        if self.model_type != 'dlp':
-            # assume (diffuse-)ddlp
-            # copy features to all timesteps, modify coordinates to stay on the line
-            updated_scale_multipliers = updated_scale_multipliers.reshape(-1, self.n_frames, 1)
-            updated_scale_multipliers[:, 1:] = updated_scale_multipliers[:, :1]
-            updated_scales = self.original_scales * (1 / updated_scale_multipliers)
-            updated_scale_multipliers = updated_scale_multipliers.reshape(-1, )
-
-            updated_obj_ons = updated_obj_ons.reshape(-1, self.n_frames)
-            updated_obj_ons[:, 1:] = updated_obj_ons[:, :1]
-            updated_obj_ons = updated_obj_ons.reshape(-1)
-
-            updated_features_indices = updated_features_indices.reshape(-1, self.n_frames)
-            updated_features = self.original_features[updated_features_indices[:, 0]]
-            updated_features_indices = updated_features_indices.reshape(-1, )
-            updated_features = updated_features.reshape(-1, updated_features.shape[-1])
-
-            updated_coordinates = updated_coordinates.reshape(-1, self.n_frames, updated_coordinates.shape[-1])
-            updated_coordinates = self.transform_coordinates(self.coordinates, updated_coordinates)
-            # updated_coordinates = new_coor.reshape(-1, new_coor.shape[-1])
-
-        print(updated_coordinates)
         # decode particles
         # TODO: Change Keypoint class to allow to use updated_depth_features and context
         decoder_dict = self.decode_particles(updated_coordinates, updated_scales, self.original_depths, updated_obj_ons,
-                                             updated_features, self.original_depth_features, self.original_context, self.original_bg)
+                                             updated_features, updated_depth_features, self.original_context, self.original_bg)
         rec = decoder_dict['rec'][0]                 # usually [C,H,W]
         x  = rec.unsqueeze(0) if rec.dim() == 3 else rec  # -> [1,C,H,W]
 
@@ -110,6 +90,9 @@ class GUIUpdate(GUILoad):
             if kp.scroller is not None:
                 kp.scroller.destroy()
                 kp.scroller_label.destroy()
+            if kp.depth_slider is not None:
+                kp.depth_slider.destroy()
+                kp.depth_slider_label.destroy()
             if kp.gcanvas is not None:
                 kp.gcanvas.destroy()
                 kp.img_tk = None
@@ -150,7 +133,7 @@ class GUIUpdate(GUILoad):
                 scale_multipliers=updated_scale_multipliers,
                 obj_ons=updated_obj_ons,
                 features=self.original_features,
-                features_depth=self.original_depth_features,
+                features_depth=updated_depth_features,
                 feature_indices=updated_features_indices,
                 contexts=None,
                 glimpses=glimpse_imgs_rgb,
@@ -177,62 +160,97 @@ class GUIUpdate(GUILoad):
         self.scales = updated_scales
         self.features = updated_features
         self.obj_ons = updated_obj_ons
+        self.depth_features = updated_depth_features
 
         if self.hide_particles.get():
             self.load_image()
     
-    def decode_particles(self, kp=None, scales=None, depths=None, obj_ons=None, features=None, features_depth = None, context = None, bg=None):
-        if kp is None:
-            kp = self.original_keypoints
-        if scales is None:
-            scales = self.original_scales
-        if depths is None:
-            depths = self.original_depths
-        if obj_ons is None:
-            obj_ons = self.original_obj_ons
-        if features is None:
-            features = self.original_features
-        if bg is None:
-            bg = self.original_bg
-        z_kp = self.normalize_kp(kp, normalize=True).reshape(-1, self.n_frames, 2)  # [n_kp, T, 2]
-        z_kp = z_kp.permute(1, 0, 2).contiguous()  # [T, n_kp, 2]
-        z_scales = torch.tensor(scales, device=torch.device(self.device_name), dtype=torch.float).reshape(-1,
-                                                                                                          self.n_frames,
-                                                                                                          2)
-        z_scales = z_scales.permute(1, 0, 2).contiguous()  # # [T, n_kp, 2]
-        z_depths = torch.tensor(depths, device=torch.device(self.device_name), dtype=torch.float).reshape(-1,
-                                                                                                          self.n_frames,
-                                                                                                          1)
-        # [n_kp, T, 1]
-        z_depths = z_depths.permute(1, 0, 2).contiguous()  # [T, n_kp, 1]
-        z_obj_ons = torch.tensor(obj_ons, device=torch.device(self.device_name), dtype=torch.float).reshape(-1,
-                                                                                                            self.n_frames)  # [n_kp, T]
-        z_obj_ons = z_obj_ons.permute(1, 0).contiguous()  # [T, n_kp]
-        z_features = torch.tensor(features,
-                                  device=torch.device(self.device_name), dtype=torch.float).reshape(-1, self.n_frames,
-                                                                                                    self.original_features.shape[
-                                                                                                        -1])
-        z_features = z_features.permute(1, 0, 2).contiguous()  # [T, n_kp, F]
-        z_bg = torch.tensor(bg, device=torch.device(self.device_name), dtype=torch.float).reshape(self.n_frames,
-                                                                                                  self.original_bg.shape[
-                                                                                                      -1])  # [T, F]
-        z_depth_features = torch.tensor(features_depth,
-                                  device=torch.device(self.device_name), dtype=torch.float).reshape(-1, self.n_frames,
-                                                                                                    self.original_depth_features.shape[
-                                                                                                        -1])
-        z_depth_features = z_depth_features.permute(1, 0, 2).contiguous()
+    def decode_particles(self, kp=None, scales=None, depths=None, obj_ons=None,
+                        features=None, features_depth=None, context=None, bg=None):
+        import numpy as np
+        import torch
+
+        T = self.n_frames
+        dev = torch.device(self.device_name)
+
+        # Defaults
+        if kp is None:               kp = self.original_keypoints
+        if scales is None:           scales = self.original_scales
+        if depths is None:           depths = self.original_depths
+        if obj_ons is None:          obj_ons = self.original_obj_ons
+        if features is None:         features = self.original_features
+        if features_depth is None:   features_depth = self.original_depth_features
+        if bg is None:               bg = self.original_bg
+
+        # ---- Keypoints -> [1, T, num_kp, 2]
+        z_kp = self.normalize_kp(kp, normalize=True).reshape(-1, T, 2)      # [num_kp, T, 2]
+        z_kp = torch.tensor(z_kp, device=dev, dtype=torch.float).permute(1, 0, 2).unsqueeze(0).contiguous()
+
+        # ---- Scales -> [1, T, num_kp, 2]
+        z_scales_np = np.asarray(scales, dtype=float).reshape(-1, T, 2)      # [num_kp, T, 2]
+        z_scales = torch.tensor(z_scales_np, device=dev, dtype=torch.float).permute(1, 0, 2).unsqueeze(0).contiguous()
+
+        # ---- Depths (scalar) -> [1, T, num_kp, 1]
+        z_depths_np = np.asarray(depths, dtype=float).reshape(-1, T, 1)      # [num_kp, T, 1]
+        z_depths = torch.tensor(z_depths_np, device=dev, dtype=torch.float).permute(1, 0, 2).unsqueeze(0).contiguous()
+
+        # ---- Obj_ons (scalar) -> [1, T, num_kp, 1]  (add channel dim)
+        z_obj_ons_np = np.asarray(obj_ons, dtype=float).reshape(-1, T)       # [num_kp, T]
+        z_obj_ons = torch.tensor(z_obj_ons_np, device=dev, dtype=torch.float).permute(1, 0).unsqueeze(0).unsqueeze(-1).contiguous()
+
+        # ---- RGB Features -> [1, T, num_kp, F]
+        # Infer F robustly
+        feats_np = np.asarray(features)
+        feat_dim = feats_np.shape[-1] if feats_np.ndim >= 2 else int(self.original_features.shape[-1])
+        z_features_np = feats_np.reshape(-1, T, feat_dim)                    # [num_kp, T, F]
+        z_features = torch.tensor(z_features_np, device=dev, dtype=torch.float).permute(1, 0, 2).unsqueeze(0).contiguous()
+
+        # ---- BG features per-frame -> [1, T, F_bg]
+        bg_np = np.asarray(bg, dtype=float)
+        if bg_np.ndim == 1:
+            # tile per frame if only a single vector was provided
+            bg_np = np.repeat(bg_np[None, :], T, axis=0)                     # [T, F_bg]
+        else:
+            bg_np = bg_np.reshape(T, -1)
+        z_bg = torch.tensor(bg_np, device=dev, dtype=torch.float).unsqueeze(0).contiguous()
+
+        # ---- Depth features (scalar per particle) -> [1, T, num_kp, 1]
+        dfeats_np = np.asarray(features_depth, dtype=float).reshape(-1, T, 1)  # [num_kp, T, 1]
+        z_depth_features = torch.tensor(dfeats_np, device=dev, dtype=torch.float).permute(1, 0, 2).unsqueeze(0).contiguous()
+
+        # ---- Optional context per-frame -> [1, T, C]
         if context is not None:
-            z_context = torch.tensor(context,
-                                    device=torch.device(self.device_name), dtype=torch.float).reshape(self.n_frames,
-                                                                                                        self.original_context.shape[
-                                                                                                            -1])
+            ctx_np = np.asarray(context, dtype=float)
+            if ctx_np.ndim == 1:
+                ctx_np = np.repeat(ctx_np[None, :], T, axis=0)               # [T, C]
+            else:
+                ctx_np = ctx_np.reshape(T, -1)
+            z_context = torch.tensor(ctx_np, device=dev, dtype=torch.float).unsqueeze(0).contiguous()
         else:
             z_context = None
-        # z_context = z_context.permute(1, 0, 2).contiguous()  # [T, n_kp, F]   
-        # decoder_dict = self.model.decode_all(z_kp, z_features, z_bg, z_obj_ons, z_depth=z_depths, z_scale=z_scales, z_depth_features=z_depth_features)
-        decoder_dict = self.model.decode_all(z_kp, z_scale=z_scales, z_features=z_features, z_depth_features=z_depth_features, 
-        z_bg_features=z_bg, obj_on_sample=z_obj_ons, z_depth=z_depths, z_ctx=z_context)
+
+        # Diagnostics
+        print("z_kp shape:", z_kp.shape)                         # [1, T, num_kp, 2]
+        print("z_scales shape:", z_scales.shape)                 # [1, T, num_kp, 2]
+        print("z_depths shape:", z_depths.shape)                 # [1, T, num_kp, 1]
+        print("z_obj_ons shape:", z_obj_ons.shape)               # [1, T, num_kp, 1]
+        print("z_features shape:", z_features.shape)             # [1, T, num_kp, F]
+        print("z_depth_features shape:", z_depth_features.shape) # [1, T, num_kp, 1]
+        print("z_bg_features shape:", z_bg.shape)                # [1, T, F_bg]
+        print("z_context shape:", None if z_context is None else z_context.shape)
+
+        decoder_dict = self.model.decode_all(
+            z_kp,
+            z_scale=z_scales,
+            z_features=z_features,
+            z_depth_features=z_depth_features,
+            z_bg_features=z_bg,
+            obj_on_sample=z_obj_ons,
+            z_depth=z_depths,
+            z_ctx=z_context
+        )
         return decoder_dict
+
     
     def update_image_t(self):
         # Get updated keypoints coordinates and scales

@@ -127,7 +127,7 @@ class GUI(GUIUpdate, GUISelect, GUIReset):
         self.coordinates = self.original_keypoints = None
         self.scales = self.original_scales = None
         self.depths = self.original_depths = None
-        self.original_scale_multiplires = None
+        self.original_scale_multipliers = None
         self.features = self.original_features = None
         self.features_depth = self.original_features_depth = None
         self.original_feature_indices = None
@@ -383,7 +383,7 @@ class GUI(GUIUpdate, GUISelect, GUIReset):
         self.selected_keypoints = []
         self.coordinates = self.original_keypoints = kp
         self.scales = self.original_scales = scales
-        self.original_scale_multiplires = np.ones_like(obj_ons)
+        self.original_scale_multipliers = np.ones_like(obj_ons)
         self.features = self.original_features = features
         self.obj_ons = self.original_obj_ons = obj_ons
         self.depths = self.original_depths = depths
@@ -391,14 +391,14 @@ class GUI(GUIUpdate, GUISelect, GUIReset):
         # Add keypoints
         if self.model_type == 'dlp':
             self.original_feature_indices = list(range(len(kp)))
-            self.add_keypoints(keypoints=kp, scales=scales, scale_multipliers=self.original_scale_multiplires,
+            self.add_keypoints(keypoints=kp, scales=scales, scale_multipliers=self.original_scale_multipliers,
                                obj_ons=self.original_obj_ons,
                                features=self.original_features, feature_indices=self.original_feature_indices,
                                glimpses=glimpses)
         else:
             self.original_feature_indices = np.array(list(range(len(kp))))[:, None].repeat(self.n_frames, axis=1)
             self.add_keypoints_trajectory(keypoints=kp, scales=scales,
-                                          scale_multipliers=self.original_scale_multiplires,
+                                          scale_multipliers=self.original_scale_multipliers,
                                           obj_ons=self.original_obj_ons,
                                           features=self.original_features,
                                           feature_indices=self.original_feature_indices,
@@ -452,14 +452,15 @@ class GUI(GUIUpdate, GUISelect, GUIReset):
 
     def add_keypoints(self, keypoints, scales, scale_multipliers, obj_ons, features, features_depth, feature_indices, contexts, glimpses):
         for i, kp in enumerate(keypoints):
-            print("Keypoint ", i, " at ", kp)
             x, y = kp
             scale = scales[i]
             if contexts is not None:
                 context = contexts[i]
             else:
                 context = None
-            keypoint = KeyPoint(self.canvas, x, y, scale, i, feature_indices[i], features=features, features_depth=features_depth,
+
+            # TODO: Make the 0th index less sketchy
+            keypoint = KeyPoint(self.canvas, x, y, scale, i, feature_indices[i], features=features, features_depth=features_depth[i],
                                 scale_multiplier=scale_multipliers[i], obj_on=obj_ons[i], glimpse=glimpses[i], context=context,
                                 gui=self)
             self.keypoints.append(keypoint)

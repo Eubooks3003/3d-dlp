@@ -30,14 +30,18 @@ class KeyPoint:
         self.feature_index = feature_index
         self.features = features[feature_index]
         self.features_dict = {f'{i}': features[i] for i in range(len(features))}
-        self.features_depth = features_depth[feature_index]
-        self.depth_features_dict = {f'{i}': features_depth[i] for i in range(len(features_depth))}
+        self.features_depth = features_depth 
+
+
         self.context = context
         self.timestep = timestep
         self.to_kp = to_kp  # (x, y)
         self.gui = gui
         self.radius = 5 if (timestep == 0 or timestep == self.gui.n_frames - 1) else 2
+
+
         self.scale_multiplier = scale_multiplier
+
         self.obj_on = obj_on
         self.glimpse = glimpse
         self.glimpse_size = 100
@@ -73,6 +77,7 @@ class KeyPoint:
         self.slider, self.slider_label = None, None
         self.scroller, self.scroller_label = None, None
         self.slider_obj, self.slider_obj_label = None, None
+        self.depth_slider, self.depth_slider_label = None, None
         self.gcanvas = None
         self.img_tk = None
         self.selected = False
@@ -190,24 +195,20 @@ class KeyPoint:
 
 
                 # Depth Features 
-                self.scroller_label = ttk.Label(
-                    self.gui.root,
-                    text='Depth Features:', font=('Arial', 10), background='#818485', foreground='black'
+                self.depth_slider_label = ttk.Label(
+                    self.gui.root, text='depth (0–1):',
+                    font=('Arial', 10), background='#818485', foreground='black'
                 )
-                # self.scroller_label.pack(side=tk.TOP)
-                self.scroller_label.grid(row=11, column=1)
+                self.depth_slider_label.grid(row=13, column=1)
 
-                feat_var = tk.StringVar()
-                feat_var.set(f'{self.feature_index}')  # Set the default value
-                self.scroller = ttk.OptionMenu(
+                self.depth_slider = TickScale(
                     self.gui.root,
-                    feat_var,
-                    f'{self.feature_index}',  # Set the default values
-                    *list(self.depth_features_dict.keys()), command=self.on_depth_features_change, style='my.TMenubutton'
+                    from_=0.0, to=1.0,
+                    orient=tk.HORIZONTAL, length=150,
+                    command=self.on_depth_value_change  # new callback
                 )
-                self.scroller['menu'].configure(font=('Arial', 10))
-                # self.scroller.pack(side=tk.TOP, pady=10)
-                self.scroller.grid(row=12, column=1)
+                self.depth_slider.set(self.features_depth)
+                self.depth_slider.grid(row=14, column=1)
 
     def on_drag(self, event):
         if self.kp_label is not None:
@@ -258,6 +259,7 @@ class KeyPoint:
         self.scale_multiplier = float(scale)
         # self.canvas.itemconfigure(self.text, text=f"{self.index}[t={self.timestep}]")
         for kp in self.gui.selected_keypoints:
+            print("Changing scale multiplier to: ", scale, " from: ", kp.scale_multiplier)
             kp.scale_multiplier = float(scale)
             # self.canvas.itemconfigure(kp.text, text=f"{kp.index}[t={self.timestep}]")
             print(f'{kp.index}: scale-multiplier: {kp.scale_multiplier}')
@@ -276,13 +278,16 @@ class KeyPoint:
             kp.features = kp.features_dict[f'{index}']
             print(f'{kp.index}: features: {kp.features}')
     
-    def on_depth_features_change(self, index):
-        self.feature_index = int(index)
-        self.depth_features = self.depth_features_dict[f'{index}']
+    def on_depth_value_change(self, val_str):
+        v = float(val_str)
+        # clamp
+        v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+        self.features_depth = v
         for kp in self.gui.selected_keypoints:
-            kp.feature_index = int(index)
-            kp.depth_features = kp.depth_features_dict[f'{index}']
-            print(f'{kp.index}: features: {kp.depth_features_dict}')
+            print("Setting depth feature to: ", v, " from: ", kp.features_depth)
+            kp.features_depth = v
+            # print(f'{kp.index}: depth -> {v:.3f}')
+
 
 
     def get_scale(self):
@@ -299,3 +304,5 @@ class KeyPoint:
 
     def get_features_index(self):
         return self.feature_index
+    def get_depth_features(self):
+        return self.features_depth  # scalar depth for this particle

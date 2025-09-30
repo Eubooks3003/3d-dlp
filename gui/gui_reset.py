@@ -82,12 +82,12 @@ class GUIReset:
         # Add keypoints again if needed
         if self.model_type == 'dlp':
             self.add_keypoints(keypoints=self.original_keypoints, scales=self.original_scales,
-                               scale_multipliers=self.original_scale_multiplires, obj_ons=self.original_obj_ons,
+                               scale_multipliers=self.original_scale_multipliers, obj_ons=self.original_obj_ons,
                                features=self.original_features, features_depth=self.original_depth_features, feature_indices=self.original_feature_indices,
                                glimpses=self.original_glimpses)
         else:
             self.add_keypoints_trajectory(keypoints=self.original_keypoints, scales=self.original_scales,
-                                          scale_multipliers=self.original_scale_multiplires,
+                                          scale_multipliers=self.original_scale_multipliers,
                                           obj_ons=self.original_obj_ons,
                                           features=self.original_features,
                                           feature_indices=self.original_feature_indices,
@@ -96,7 +96,7 @@ class GUIReset:
         self.scales = self.original_scales
         self.features = self.original_features
         self.obj_ons = self.original_obj_ons
-        self.original_scale_multiplires = np.ones_like(self.obj_ons)
+        self.original_scale_multipliers = np.ones_like(self.obj_ons)
         self.depths = self.original_depths
         self.canvas.bind('<ButtonPress-1>', self.on_canvas_press)
         self.canvas.bind('<B1-Motion>', self.on_canvas_drag)

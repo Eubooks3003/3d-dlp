@@ -169,6 +169,16 @@ class GUISelect(GUILoad):
             bg       = particle_dict['z_bg_features'][0].cpu().numpy()
             depth_features = particle_dict['z_depth_features'][0].cpu().numpy()
             context = particle_dict['z_context']
+
+            # print the size of all the particle_dict entries above without 0 indexing
+            print("Particle Dict z_scale shape:", particle_dict['z_scale'].shape)
+            print("Particle Dict z_depth shape:", particle_dict['z_depth'].shape)
+            print("Particle Dict z_features shape:", particle_dict['z_features'].shape)
+            print("Particle Dict obj_on shape:", particle_dict['obj_on'].shape)
+            print("Particle Dict z_bg_features shape:", particle_dict['z_bg_features'].shape)
+            print("Particle Dict z_depth_features shape:", particle_dict['z_depth_features'].shape)
+            print("Particle Dict z_context shape:", None if context is None else context.shape)
+
             if context is not None:
                 context = context[0].cpu().numpy()
             # depth_features = None if depth_features is None else depth_features.cpu().numpy()
@@ -224,19 +234,28 @@ class GUISelect(GUILoad):
         self.scales     = self.original_scales    = state['scales'][0]
         self.depths     = self.original_depths    = state['depths']
         self.features   = self.original_features  = state['features'][0]
-        self.features_depth = self.original_depth_features = state['depth_features'][0]
-        self.obj_ons    = self.original_obj_ons   = state['obj_ons'][0]
+        self.obj_ons  = self.original_obj_ons  = np.asarray(state['obj_ons'][0]).squeeze().reshape(-1).astype(float)
+        self.features_depth = self.original_depth_features = np.asarray(state['depth_features'][0]).squeeze().reshape(-1).astype(float)
         self.original_bg = state['bg']
         self.context = self.original_context = state['context']
         if self.context is not None:
             self.context = self.original_context = state['context'][0]
-        self.original_scale_multiplires = np.ones_like(self.obj_ons)
+        N = self.obj_ons.shape[0]
+        self.original_scale_multipliers = np.ones(N, dtype=float)
+
+
 
         # Print coordinates shape
         print("Coordinates shape:", self.coordinates.shape)
         print("Shapes :", self.coordinates.shape, self.scales.shape, self.obj_ons.shape, self.features.shape)
         # Print shape for everything
         # TODO: make the squeezing better
+
+        print("Features shape:", self.features.shape)
+        print("Depth Features shape:", self.features_depth.shape)
+        print("Scales shape:", self.scales.shape)
+        print("Obj_ons shape:", self.obj_ons.shape)
+        print("Scale multipliers shape:", self.original_scale_multipliers.shape)
         if self.model_type == 'dlp':
             self.original_feature_indices = state['feature_indices']
             print("Feature indices shape:", self.original_feature_indices)
@@ -244,7 +263,7 @@ class GUISelect(GUILoad):
             self.add_keypoints(
                 keypoints=self.coordinates,
                 scales=self.scales,
-                scale_multipliers=self.original_scale_multiplires,
+                scale_multipliers=self.original_scale_multipliers,
                 obj_ons=self.obj_ons,
                 features=self.features,
                 features_depth=self.features_depth,
@@ -257,7 +276,7 @@ class GUISelect(GUILoad):
             self.add_keypoints_trajectory(
                 keypoints=self.coordinates,
                 scales=self.scales,
-                scale_multipliers=self.original_scale_multiplires,
+                scale_multipliers=self.original_scale_multipliers,
                 obj_ons=self.obj_ons,
                 features=self.features,
                 feature_indices=self.original_feature_indices,
