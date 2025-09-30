@@ -12,14 +12,14 @@ from tqdm import tqdm
 import torch
 from torchvision.transforms import ToTensor, ToPILImage
 from modules.diffusion_modules import PINTDenoiser, GaussianDiffusionPINT, TrainerDiffuseDDLP
-from train_diffuse_ddlp import ParticleNormalization
+# from train_diffuse_ddlp import ParticleNormalization
 
 # keypoint
 from .keypoint import KeyPoint
 
 # models (lives at project root next to gui/)
-from models import ObjectDynamicsDLP, ObjectDLP
-from datasets.blender import BlenderRGBD
+from models import DLP
+from datasets.blender_ds import BlenderRGBD
 
 from .gui_load import GUILoad
 from .gui_select import GUISelect
@@ -450,12 +450,17 @@ class GUI(GUIUpdate, GUISelect, GUIReset):
             kp_n = kp_n.flip(dims=(-1,))
         return kp_n
 
-    def add_keypoints(self, keypoints, scales, scale_multipliers, obj_ons, features, features_depth, feature_indices, glimpses):
+    def add_keypoints(self, keypoints, scales, scale_multipliers, obj_ons, features, features_depth, feature_indices, contexts, glimpses):
         for i, kp in enumerate(keypoints):
+            print("Keypoint ", i, " at ", kp)
             x, y = kp
             scale = scales[i]
+            if contexts is not None:
+                context = contexts[i]
+            else:
+                context = None
             keypoint = KeyPoint(self.canvas, x, y, scale, i, feature_indices[i], features=features, features_depth=features_depth,
-                                scale_multiplier=scale_multipliers[i], obj_on=obj_ons[i], glimpse=glimpses[i],
+                                scale_multiplier=scale_multipliers[i], obj_on=obj_ons[i], glimpse=glimpses[i], context=context,
                                 gui=self)
             self.keypoints.append(keypoint)
 

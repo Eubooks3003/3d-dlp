@@ -12,7 +12,7 @@ from tqdm import tqdm
 import torch
 from torchvision.transforms import ToTensor, ToPILImage
 from modules.diffusion_modules import PINTDenoiser, GaussianDiffusionPINT, TrainerDiffuseDDLP
-from train_diffuse_ddlp import ParticleNormalization
+# from train_diffuse_ddlp import ParticleNormalization
 
 from .keypoint import KeyPoint
 from gui.gui_load import GUILoad
@@ -61,9 +61,9 @@ class GUIUpdate(GUILoad):
 
         print(updated_coordinates)
         # decode particles
-        # TODO: Change Keypoint class to allow to use updated_depth_features
+        # TODO: Change Keypoint class to allow to use updated_depth_features and context
         decoder_dict = self.decode_particles(updated_coordinates, updated_scales, self.original_depths, updated_obj_ons,
-                                             updated_features, self.original_depth_features, self.original_bg)
+                                             updated_features, self.original_depth_features, self.original_context, self.original_bg)
         rec = decoder_dict['rec'][0]                 # usually [C,H,W]
         x  = rec.unsqueeze(0) if rec.dim() == 3 else rec  # -> [1,C,H,W]
 
@@ -143,6 +143,7 @@ class GUIUpdate(GUILoad):
                 depth_imgs = [to_pil(d[i].cpu()) for i in range(N)]
 
             # Use RGB PILs for the GUI
+            # TODO: Fix depth features and context
             self.add_keypoints(
                 keypoints=updated_coordinates,
                 scales=self.original_scales,
@@ -151,6 +152,7 @@ class GUIUpdate(GUILoad):
                 features=self.original_features,
                 features_depth=self.original_depth_features,
                 feature_indices=updated_features_indices,
+                contexts=None,
                 glimpses=glimpse_imgs_rgb,
             )
         else:
@@ -176,71 +178,10 @@ class GUIUpdate(GUILoad):
         self.features = updated_features
         self.obj_ons = updated_obj_ons
 
-        # NEW - re-encode
-        # get particles
-        # particle_dict = self.get_particles()
-        # if self.model_type == 'dlp':
-        #     kp = particle_dict['z'][0]  # [n_kp, 2], [-1, 1]
-        #     kp = self.normalize_kp(kp, normalize=False)
-        #     kp = kp.cpu().numpy()
-        #
-        #     scales = particle_dict['z_scale'][0].cpu().numpy()
-        #     depths = particle_dict['z_depth'][0].cpu().numpy()
-        #     features = particle_dict['z_features'][0].cpu().numpy()
-        #     obj_ons = particle_dict['obj_on'][0].cpu().numpy()
-        #     bg = particle_dict['z_bg'][0].cpu().numpy()
-        #
-        #     glimpses = particle_dict['dec_objects_original']
-        #     alpha, rgb = torch.split(glimpses, [1, 3], dim=2)
-        #     rgba = alpha * rgb  # [1, n_particles, 3, h, w]
-        #     rgba = rgba[0].clamp(0, 1).cpu()
-        #     glimpses = [ToPILImage()(rgba[i]) for i in range(rgba.shape[0])]
-        # else:
-        #     # ddlp: [T, n_kp, features]
-        #     kp = particle_dict['z']  # [T, n_kp, 2], [-1, 1]
-        #     kp = self.normalize_kp(kp, normalize=False)
-        #     kp = kp.permute(1, 0, 2).cpu().numpy()  # [n_kp, T, features]
-        #
-        #     scales = particle_dict['z_scale'].permute(1, 0, 2).cpu().numpy()
-        #     depths = particle_dict['z_depth'].permute(1, 0, 2).cpu().numpy()
-        #     features = particle_dict['z_features'].permute(1, 0, 2).cpu().numpy()
-        #     obj_ons = particle_dict['obj_on'].permute(1, 0).cpu().numpy()
-        #     bg = particle_dict['z_bg'].cpu().numpy()  # [T, f]
-        #
-        #     glimpses = particle_dict['dec_objects_original']
-        #     alpha, rgb = torch.split(glimpses, [1, 3], dim=2)
-        #     rgba = alpha * rgb  # [T, n_particles, 3, h, w]
-        #     rgba = rgba.clamp(0, 1).permute(1, 0, 2, 3, 4).cpu()  # [n_particles, T, 3, h, w]
-        #     glimpses = []
-        #     for i in range(rgba.shape[0]):
-        #         kp_glimpses = [ToPILImage()(rgba[i, j]) for j in range(rgba.shape[1])]
-        #         glimpses.append(kp_glimpses)
-        #
-        # self.coordinates = kp
-        # self.scales = scales
-        # self.features = features
-        # self.obj_ons = obj_ons
-        # self.depths = self.original_depths = depths
-        # self.original_bg = bg
-        # # Add keypoints
-        # if self.model_type == 'dlp':
-        #     self.add_keypoints(keypoints=kp, scales=scales, scale_multipliers=updated_scale_multipliers,
-        #                        obj_ons=obj_ons,
-        #                        features=features, feature_indices=updated_features_indices,
-        #                        glimpses=glimpses)
-        # else:
-        #     feature_indices = np.array(list(range(len(kp))))[:, None].repeat(self.n_frames, axis=1)
-        #     self.add_keypoints_trajectory(keypoints=kp, scales=scales,
-        #                                   scale_multipliers=self.original_scale_multiplires,
-        #                                   obj_ons=obj_ons,
-        #                                   features=features,
-        #                                   feature_indices=feature_indices,
-        #                                   glimpses=glimpses)
-
         if self.hide_particles.get():
             self.load_image()
     
-    def decode_particles(self, kp=None, scales=None, depths=None, obj_ons=None, features=None, features_depth = None, bg=None):
+    def decode_particles(self, kp=None, scales=None, depths=None, obj_ons=None, features=None, features_depth = None, context = None, bg=None):
         if kp is None:
             kp = self.original_keypoints
         if scales is None:
@@ -275,12 +216,22 @@ class GUIUpdate(GUILoad):
         z_bg = torch.tensor(bg, device=torch.device(self.device_name), dtype=torch.float).reshape(self.n_frames,
                                                                                                   self.original_bg.shape[
                                                                                                       -1])  # [T, F]
-        z_features_depth = torch.tensor(features_depth,
+        z_depth_features = torch.tensor(features_depth,
                                   device=torch.device(self.device_name), dtype=torch.float).reshape(-1, self.n_frames,
                                                                                                     self.original_depth_features.shape[
                                                                                                         -1])
-        z_features_depth = z_features_depth.permute(1, 0, 2).contiguous()
-        decoder_dict = self.model.decode_all(z_kp, z_features, z_bg, z_obj_ons, z_depth=z_depths, z_scale=z_scales, z_features_depth=z_features_depth)
+        z_depth_features = z_depth_features.permute(1, 0, 2).contiguous()
+        if context is not None:
+            z_context = torch.tensor(context,
+                                    device=torch.device(self.device_name), dtype=torch.float).reshape(self.n_frames,
+                                                                                                        self.original_context.shape[
+                                                                                                            -1])
+        else:
+            z_context = None
+        # z_context = z_context.permute(1, 0, 2).contiguous()  # [T, n_kp, F]   
+        # decoder_dict = self.model.decode_all(z_kp, z_features, z_bg, z_obj_ons, z_depth=z_depths, z_scale=z_scales, z_depth_features=z_depth_features)
+        decoder_dict = self.model.decode_all(z_kp, z_scale=z_scales, z_features=z_features, z_depth_features=z_depth_features, 
+        z_bg_features=z_bg, obj_on_sample=z_obj_ons, z_depth=z_depths, z_ctx=z_context)
         return decoder_dict
     
     def update_image_t(self):

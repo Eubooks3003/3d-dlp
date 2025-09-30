@@ -12,10 +12,10 @@ from tqdm import tqdm
 import torch
 from torchvision.transforms import ToTensor, ToPILImage
 from modules.diffusion_modules import PINTDenoiser, GaussianDiffusionPINT, TrainerDiffuseDDLP
-from train_diffuse_ddlp import ParticleNormalization
+# from train_diffuse_ddlp import ParticleNormalization
 
-from models import ObjectDynamicsDLP, ObjectDLP
-from datasets.blender import BlenderRGBD
+from models import DLP
+from datasets.blender_ds import BlenderRGBD
 
 from .keypoint import KeyPoint
 from gui.gui_load import GUILoad
@@ -45,20 +45,20 @@ class GUISelect(GUILoad):
 
             if self.model_type != 'diffuse_ddlp':
                 # locate example
-                self.example_dir = f'./assets/{self.ds_name}'
-                # self.example_dir = f'/media/newhd/data/obj3d/train'
-                if not os.path.exists(self.example_dir):
-                    raise SystemExit(f'Examples for dataset {self.ds_name} not found.'
-                                     f' Please make sure to put each example in its own dir under {self.example_dir}.'
-                                     f' For example: root -> assets > {self.example_dir} -> 1 -> *.png'
-                                     f' The directory should include image files.')
-                self.available_examples = os.listdir(self.example_dir)
-                if len(self.available_examples) == 0:
-                    raise SystemExit(f'Examples for dataset {self.ds_name} not found.'
-                                     f' Please make sure to put each example in its own dir under {self.example_dir}.'
-                                     f' For example: root -> assets > {self.example_dir} -> 1 -> *.png'
-                                     f' The directory should include image files.')
-                print(f'available examples: {self.available_examples}')
+                # self.example_dir = f'./assets/{self.ds_name}'
+                # # self.example_dir = f'/media/newhd/data/obj3d/train'
+                # if not os.path.exists(self.example_dir):
+                #     raise SystemExit(f'Examples for dataset {self.ds_name} not found.'
+                #                      f' Please make sure to put each example in its own dir under {self.example_dir}.'
+                #                      f' For example: root -> assets > {self.example_dir} -> 1 -> *.png'
+                #                      f' The directory should include image files.')
+                # self.available_examples = os.listdir(self.example_dir)
+                # if len(self.available_examples) == 0:
+                #     raise SystemExit(f'Examples for dataset {self.ds_name} not found.'
+                #                      f' Please make sure to put each example in its own dir under {self.example_dir}.'
+                #                      f' For example: root -> assets > {self.example_dir} -> 1 -> *.png'
+                #                      f' The directory should include image files.')
+                # print(f'available examples: {self.available_examples}')
 
                 if not self.use_depth:
                     # example scroller
@@ -161,13 +161,16 @@ class GUISelect(GUILoad):
     # --- 2) shared particle unpack + glimpse building ---
     def _unpack_particles_and_glimpses(self, particle_dict):
         if self.model_type == 'dlp':
-            kp = self.normalize_kp(particle_dict['z'][0], normalize=False).cpu().numpy()
+            kp = self.normalize_kp(particle_dict['z'][0], normalize=False).cpu().numpy().squeeze(0)  # [N,2]
             scales   = particle_dict['z_scale'][0].cpu().numpy()
             depths   = particle_dict['z_depth'][0].cpu().numpy()
             features = particle_dict['z_features'][0].cpu().numpy()
             obj_ons  = particle_dict['obj_on'][0].cpu().numpy()
-            bg       = particle_dict['z_bg'][0].cpu().numpy()
-            depth_features = particle_dict['z_features_depth'][0].cpu().numpy()
+            bg       = particle_dict['z_bg_features'][0].cpu().numpy()
+            depth_features = particle_dict['z_depth_features'][0].cpu().numpy()
+            context = particle_dict['z_context']
+            if context is not None:
+                context = context[0].cpu().numpy()
             # depth_features = None if depth_features is None else depth_features.cpu().numpy()
 
             gl = particle_dict['dec_objects_original']       # [B=1,N,C,H,W]
@@ -186,7 +189,7 @@ class GUISelect(GUILoad):
             return dict(
                 kp=kp, scales=scales, depths=depths, features=features, depth_features=depth_features,
                 obj_ons=obj_ons, bg=bg, rgb_glimpses=rgb_glimpses, depth_glimpses=depth_glimpses,
-                feature_indices=list(range(len(kp)))
+                feature_indices=list(range(len(kp))), context=context
             )
         else:
             # DDLP temporal
@@ -194,7 +197,7 @@ class GUISelect(GUILoad):
             scales   = particle_dict['z_scale'].permute(1,0,2).cpu().numpy()
             depths   = particle_dict['z_depth'].permute(1,0,2).cpu().numpy()
             features = particle_dict['z_features'].permute(1,0,2).cpu().numpy()
-            depth_features = particle_dict.get('z_features_depth')
+            depth_features = particle_dict.get('z_depth_features')
             depth_features = None if depth_features is None else depth_features.permute(1,0,2).cpu().numpy()
             obj_ons  = particle_dict['obj_on'].permute(1,0).cpu().numpy()
             bg       = particle_dict['z_bg'].cpu().numpy()
@@ -216,17 +219,28 @@ class GUISelect(GUILoad):
     def _apply_particle_state(self, state):
         self.keypoints = []
         self.selected_keypoints = []
+        # Squeeze out batch dim
         self.coordinates = self.original_keypoints = state['kp']
-        self.scales     = self.original_scales    = state['scales']
+        self.scales     = self.original_scales    = state['scales'][0]
         self.depths     = self.original_depths    = state['depths']
-        self.features   = self.original_features  = state['features']
-        self.features_depth = self.original_depth_features = state['depth_features']
-        self.obj_ons    = self.original_obj_ons   = state['obj_ons']
+        self.features   = self.original_features  = state['features'][0]
+        self.features_depth = self.original_depth_features = state['depth_features'][0]
+        self.obj_ons    = self.original_obj_ons   = state['obj_ons'][0]
         self.original_bg = state['bg']
+        self.context = self.original_context = state['context']
+        if self.context is not None:
+            self.context = self.original_context = state['context'][0]
         self.original_scale_multiplires = np.ones_like(self.obj_ons)
 
+        # Print coordinates shape
+        print("Coordinates shape:", self.coordinates.shape)
+        print("Shapes :", self.coordinates.shape, self.scales.shape, self.obj_ons.shape, self.features.shape)
+        # Print shape for everything
+        # TODO: make the squeezing better
         if self.model_type == 'dlp':
             self.original_feature_indices = state['feature_indices']
+            print("Feature indices shape:", self.original_feature_indices)
+            print("Glimpses length:", len(state['rgb_glimpses']))
             self.add_keypoints(
                 keypoints=self.coordinates,
                 scales=self.scales,
@@ -234,6 +248,7 @@ class GUISelect(GUILoad):
                 obj_ons=self.obj_ons,
                 features=self.features,
                 features_depth=self.features_depth,
+                contexts=self.context,
                 feature_indices=self.original_feature_indices,
                 glimpses=state['rgb_glimpses'],   # single PIL per kp
             )

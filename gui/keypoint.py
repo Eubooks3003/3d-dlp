@@ -20,7 +20,7 @@ COLORS = ['#FF0000', '#0000FF', '#FFFF00', '#00FF00', '#800080', '#FFA500',
 
 
 class KeyPoint:
-    def __init__(self, canvas, x, y, scale, index, feature_index, features=(None,), features_depth = (None, ), scale_multiplier=1.0, obj_on=1.0,
+    def __init__(self, canvas, x, y, scale, index, feature_index, features=(None,), features_depth = (None, ), context=None, scale_multiplier=1.0, obj_on=1.0,
                  glimpse=None, timestep=0, to_kp=None, gui=None):
         self.canvas = canvas
         self.x = x
@@ -32,6 +32,7 @@ class KeyPoint:
         self.features_dict = {f'{i}': features[i] for i in range(len(features))}
         self.features_depth = features_depth[feature_index]
         self.depth_features_dict = {f'{i}': features_depth[i] for i in range(len(features_depth))}
+        self.context = context
         self.timestep = timestep
         self.to_kp = to_kp  # (x, y)
         self.gui = gui
