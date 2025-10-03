@@ -132,6 +132,7 @@ def train_dlp(config_path='./configs/shapes.json'):
                             drop_last=True)
     # dataset-level near/far if available (shapes uses (0.2, 2.0))
     near, far = get_depth_range(dataloader)
+    print(f"Depth range near: {near}, far: {far}")
     # model
     model = DLP(
         cdim=ch,  # Number of input image channels
@@ -286,6 +287,7 @@ def train_dlp(config_path='./configs/shapes.json'):
                 x = normalize_rgbd(x, near=near, far=far, rgb_mode="unit")   # or "imagenet" if you want standardized RGB
             warmup = (epoch < warmup_epoch)
             # forward pass
+            print("x shape:", x.shape)
             model_output = model(x, warmup=warmup, with_loss=True,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
@@ -474,7 +476,10 @@ def train_dlp(config_path='./configs/shapes.json'):
             if ch == 4:
                 depth_gt = x[:, 3:4]
 
+
                 rec_depth = model_output['rec_depth'] # [B,1,H,W] or None
+
+
                 if rec_depth is not None and rec_depth.dim() == 5:
                     rec_depth = rec_depth.view(-1, *rec_depth.shape[2:])
 
@@ -484,13 +489,13 @@ def train_dlp(config_path='./configs/shapes.json'):
                 # 2) Make 3-ch visualizations (choose a colormap)
                 depth_viz = []
                 if depth_gt is not None:
-                    depth_viz.append(depth_to_rgb(depth_gt, near=near, far=far, cmap_name="viridis"))
+                    depth_viz.append(depth_to_rgb(depth_gt,  cmap_name="viridis"))
                 if rec_depth is not None:
-                    depth_viz.append(depth_to_rgb(rec_depth, near=near, far=far, cmap_name="viridis"))
+                    depth_viz.append(depth_to_rgb(rec_depth,  cmap_name="viridis"))
                 if dec_depth_trans is not None:
-                    depth_viz.append(depth_to_rgb(dec_depth_trans, near=near, far=far, cmap_name="viridis"))
+                    depth_viz.append(depth_to_rgb(dec_depth_trans, cmap_name="viridis"))
                 if bg_depth is not None:
-                    depth_viz.append(depth_to_rgb(bg_depth, near=near, far=far, cmap_name="viridis"))
+                    depth_viz.append(depth_to_rgb(bg_depth,  cmap_name="viridis"))
 
                 # pad missing slots to keep concat layout simple
                 while len(depth_viz) < 4:
@@ -500,7 +505,6 @@ def train_dlp(config_path='./configs/shapes.json'):
                 depth_gt_vis, rec_depth_vis, dec_depth_vis, bg_depth_vis = depth_viz[:4]
 
                 # 3) Reuse your KP/BB/mask utilities with depth visualizations
-                max_imgs = 8
                 kp_batch = mu_plot  # same KP used for RGB
                 scale_batch = mu_scale.view(-1, *mu_scale.shape[2:])
 
@@ -578,7 +582,8 @@ def train_dlp(config_path='./configs/shapes.json'):
                                                   save_image=True, fig_dir=fig_dir, topk=topk,
                                                   recon_loss_func=recon_loss_func, beta_rec=beta_rec,
                                                   iou_thresh=iou_thresh,
-                                                  beta_kl=beta_kl, kl_balance=kl_balance, beta_obj=beta_obj)
+                                                  beta_kl=beta_kl, kl_balance=kl_balance, beta_obj=beta_obj,
+                                                  near=near, far=far)
             log_str = f'validation loss: {valid_loss:.3f}\n'
             print(log_str)
             log_line(log_dir, log_str)

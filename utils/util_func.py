@@ -589,21 +589,13 @@ def create_segmentation_map(
     return seg_map
 
 
-def depth_to_rgb(depth: torch.Tensor, near=None, far=None, cmap_name="viridis"):
+def depth_to_rgb(depth: torch.Tensor, cmap_name="viridis"):
     """
     depth: [B,1,H,W] in meters or normalized
     Returns: [B,3,H,W] uint in [0,1] for visualization (does NOT modify input)
     """
     assert depth.dim() == 4 and depth.size(1) == 1
     d = depth.clone()
-
-    # normalize to [0,1]
-    if (near is not None) and (far is not None) and (far > near):
-        d = (d - near) / (far - near)
-    else:
-        # per-sample min-max (viz only)
-        d = d - d.amin(dim=(2,3), keepdim=True)
-        d = d / (d.amax(dim=(2,3), keepdim=True) + 1e-6)
 
     d = d.clamp_(0, 1)
 

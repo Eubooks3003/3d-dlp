@@ -15,7 +15,7 @@
   "load_model": false,
   "pretrained_path": null,
   "start_epoch": 0,
-  "num_epochs": 1500,
+  "num_epochs": 500,
   "eval_epoch_freq": 1,
   "warmup_epoch": 1,
   "patch_size": 8,

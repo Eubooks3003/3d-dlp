@@ -15,11 +15,11 @@ from datasets.get_dataset import get_video_dataset, get_image_dataset
 # util functions
 from utils.util_func import plot_keypoints_on_image_batch, animate_trajectories, \
     plot_bb_on_image_batch_from_z_scale_nms, plot_bb_on_image_batch_from_masks_nms, create_segmentation_map
-
+from utils.rgbd_utils import get_depth_range, normalize_rgbd
 
 def evaluate_validation_elbo(model, config, epoch, batch_size=100, recon_loss_type="vgg", device=torch.device('cpu'),
                              save_image=False, fig_dir='./', topk=5, recon_loss_func=None, beta_rec=1.0, beta_kl=1.0,
-                             kl_balance=0.001, accelerator=None, iou_thresh=0.2, beta_obj=0.0):
+                             kl_balance=0.001, accelerator=None, iou_thresh=0.2, beta_obj=0.0, near=0.9, far=1.1):
     model.eval()
     kp_range = model.kp_range
     ds = config['ds']
@@ -40,6 +40,9 @@ def evaluate_validation_elbo(model, config, epoch, batch_size=100, recon_loss_ty
         if len(x.shape) == 4:
             # [bs, ch, h, w]
             x = x.unsqueeze(1)
+        if ch == 4:
+                x = normalize_rgbd(x, near=near, far=far, rgb_mode="unit")
+        # print("Val x shape:", x.shape)
         # forward pass
         with torch.no_grad():
             model_output = model(x, with_loss=True, beta_kl=beta_kl,
@@ -54,7 +57,11 @@ def evaluate_validation_elbo(model, config, epoch, batch_size=100, recon_loss_ty
         z_base = model_output['z_base']
         mu_offset = model_output['mu_offset']
         logvar_offset = model_output['logvar_offset']
-        rec_x = model_output['rec_rgb']
+        if ch ==4:
+            # Use normalized RGB in RGBD
+            rec_x = model_output['rec_rgb'].clamp(0, 1) 
+        else:
+            rec_x = model_output['rec_rgb']
         mu_scale = model_output['mu_scale']
         # object stuff
         dec_objects_original = model_output['dec_objects_original']
@@ -113,27 +120,32 @@ def evaluate_validation_elbo(model, config, epoch, batch_size=100, recon_loss_ty
         bg = model_output['bg_rgb']
         if accelerator is not None:
             if accelerator.is_main_process:
-                vutils.save_image(torch.cat([x[:max_imgs, -3:], img_with_kp[:max_imgs, -3:].to(accelerator.device),
-                                             rec_x[:max_imgs, -3:],
-                                             img_with_kp_p[:max_imgs, -3:].to(accelerator.device),
-                                             img_with_kp_topk[:max_imgs, -3:].to(accelerator.device),
-                                             dec_objects[:max_imgs, -3:],
-                                             img_with_masks_nms[:max_imgs, -3:].to(accelerator.device),
-                                             img_with_masks_alpha_nms[:max_imgs, -3:].to(accelerator.device),
-                                             img_with_seg_maps[:max_imgs, -3:],
-                                             bg[:max_imgs, -3:]],
+                vutils.save_image(torch.cat([x[:max_imgs, 3:], img_with_kp[:max_imgs, 3:].to(accelerator.device),
+                                             rec_x[:max_imgs, 3:],
+                                             img_with_kp_p[:max_imgs, 3:].to(accelerator.device),
+                                             img_with_kp_topk[:max_imgs, 3:].to(accelerator.device),
+                                             dec_objects[:max_imgs, 3:],
+                                             img_with_masks_nms[:max_imgs, 3:].to(accelerator.device),
+                                             img_with_masks_alpha_nms[:max_imgs, 3:].to(accelerator.device),
+                                             img_with_seg_maps[:max_imgs, 3:],
+                                             bg[:max_imgs, 3:]],
                                             dim=0).data.cpu(), '{}/image_valid_{}.jpg'.format(fig_dir, epoch),
                                   nrow=8, pad_value=1)
         else:
-            vutils.save_image(torch.cat([x[:max_imgs, -3:], img_with_kp[:max_imgs, -3:].to(device),
-                                         rec_x[:max_imgs, -3:],
-                                         img_with_kp_p[:max_imgs, -3:].to(device),
-                                         img_with_kp_topk[:max_imgs, -3:].to(device),
-                                         dec_objects[:max_imgs, -3:],
-                                         img_with_masks_nms[:max_imgs, -3:].to(device),
-                                         img_with_masks_alpha_nms[:max_imgs, -3:].to(device),
-                                         img_with_seg_maps[:max_imgs, -3:],
-                                         bg[:max_imgs, -3:]],
+            # Print shape of each tensor for debugging
+            print("x shape:", x[:max_imgs, 3:].shape)
+            print("img_with_kp shape:", img_with_kp[:max_imgs, 3:].shape)
+            print("rec_x shape:", rec_x[:max_imgs, 3:].shape)
+            print("img_with_kp_p shape:", img_with_kp_p[:max_imgs, 3:].shape)
+            vutils.save_image(torch.cat([x[:max_imgs, :3], img_with_kp[:max_imgs, :3].to(device),
+                                          rec_x[:max_imgs, :3],
+                                          img_with_kp_p[:max_imgs, :3].to(device),
+                                          img_with_kp_topk[:max_imgs, :3].to(device),
+                                          dec_objects[:max_imgs, :3],
+                                          img_with_masks_nms[:max_imgs, :3].to(device),
+                                          img_with_masks_alpha_nms[:max_imgs, :3].to(device),
+                                          img_with_seg_maps[:max_imgs, :3],
+                                          bg[:max_imgs, :3]],
                                         dim=0).data.cpu(), '{}/image_valid_{}.jpg'.format(fig_dir, epoch),
                               nrow=8, pad_value=1)
     return np.mean(elbos)
