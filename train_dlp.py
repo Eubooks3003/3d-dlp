@@ -127,7 +127,10 @@ def train_dlp(config_path='./configs/shapes.json'):
     depth_loss_ratio = config["depth_loss_ratio"]  # weight of depth loss if split_loss is True
 
     # load data
-    dataset = get_image_dataset(ds, root, mode='train', image_size=image_size)
+    cams = None
+    if ds == "mimicgen":
+        cams = config.get("cams", "robot0_eye_in_hand")  # which camera to use
+    dataset = get_image_dataset(ds, root, mode='train', image_size=image_size, cams=cams)
     dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
                             drop_last=True)
     # dataset-level near/far if available (shapes uses (0.2, 2.0))

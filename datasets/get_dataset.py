@@ -73,7 +73,7 @@ def get_video_dataset(ds, root, seq_len=1, mode='train', image_size=128):
     return dataset
 
 
-def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1):
+def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1, cams=None):
     # set seq_len > 1 when training with use_tracking
     # load data
     if ds == "traffic":
@@ -127,7 +127,7 @@ def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1):
     elif ds == "blender":
         dataset = BlenderRGBD(root=root,mode=mode,sample_length=seq_len, image_size=image_size, pct=(1.0, 99.0),cache_meta=True)
     elif ds == "mimicgen":
-        dataset = MimicGenRGBD(h5_path=root,cam="agentview", mode=mode, image_size=image_size, pct=(1.0, 99.0), verbose=True)
+        dataset = MimicGenRGBD(root=root, cams=cams, image_size=image_size, mode="train")
     else:
         raise NotImplementedError
     return dataset
