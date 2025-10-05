@@ -20,6 +20,7 @@ from datasets.ogbench_ds import OGBenchDataset, OGBenchDatasetImage
 from datasets.kubric_ds import KubricDataset, KubricDatasetImage
 from datasets.taichi_ds import TaiChiDataset, TaiChiDatasetImage
 from datasets.blender_ds import BlenderRGBD
+from datasets.mimicgen_ds import MimicGenRGBD
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import ToTensor
 
@@ -125,6 +126,8 @@ def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1):
         dataset = KubricDatasetImage(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
     elif ds == "blender":
         dataset = BlenderRGBD(root=root,mode=mode,sample_length=seq_len, image_size=image_size, pct=(1.0, 99.0),cache_meta=True)
+    elif ds == "mimicgen":
+        dataset = MimicGenRGBD(h5_path=root,cam="agentview", mode=mode, image_size=image_size, pct=(1.0, 99.0), verbose=True)
     else:
         raise NotImplementedError
     return dataset

@@ -133,10 +133,6 @@ def evaluate_validation_elbo(model, config, epoch, batch_size=100, recon_loss_ty
                                   nrow=8, pad_value=1)
         else:
             # Print shape of each tensor for debugging
-            print("x shape:", x[:max_imgs, 3:].shape)
-            print("img_with_kp shape:", img_with_kp[:max_imgs, 3:].shape)
-            print("rec_x shape:", rec_x[:max_imgs, 3:].shape)
-            print("img_with_kp_p shape:", img_with_kp_p[:max_imgs, 3:].shape)
             vutils.save_image(torch.cat([x[:max_imgs, :3], img_with_kp[:max_imgs, :3].to(device),
                                           rec_x[:max_imgs, :3],
                                           img_with_kp_p[:max_imgs, :3].to(device),

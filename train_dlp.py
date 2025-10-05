@@ -287,7 +287,6 @@ def train_dlp(config_path='./configs/shapes.json'):
                 x = normalize_rgbd(x, near=near, far=far, rgb_mode="unit")   # or "imagenet" if you want standardized RGB
             warmup = (epoch < warmup_epoch)
             # forward pass
-            print("x shape:", x.shape)
             model_output = model(x, warmup=warmup, with_loss=True,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
@@ -459,7 +458,6 @@ def train_dlp(config_path='./configs/shapes.json'):
                                                              kp_range=kp_range)
             dec_objects = model_output['dec_objects']
             bg = model_output['bg_rgb']
-            print("Rec_x", rec_x.shape)
             vutils.save_image(torch.cat([x[:max_imgs, :3], img_with_kp[:max_imgs, :3].to(device),
                                          rec_x[:max_imgs, :3], img_with_kp_p[:max_imgs, :3].to(device),
                                          img_with_kp_topk[:max_imgs, :3].to(device),
