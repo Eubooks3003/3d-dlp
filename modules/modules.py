@@ -5278,32 +5278,6 @@ class DLPEncoder(nn.Module):
 
         self.ctx_enc = ctx_enc
 
-        # if self.use_ctx_enc:
-        #     self.ctx_enc = ParticleContextSharedEncoder(n_kp_enc=n_kp_enc, dropout=dropout,
-        #                                                 learned_feature_dim=learned_feature_dim,
-        #                                                 learned_bg_feature_dim=learned_bg_feature_dim,
-        #                                                 embed_init_std=embed_init_std, projection_dim=pte_inner_dim,
-        #                                                 timestep_horizon=timestep_horizon, pte_layers=pte_ctx_layers,
-        #                                                 pte_heads=pte_ctx_heads,
-        #                                                 attn_norm_type=attn_norm_type,
-        #                                                 context_dim=context_dim,
-        #                                                 hidden_dim=pte_inner_dim,
-        #                                                 ctx_pool_mode=self.ctx_pool_mode,
-        #                                                 bg=True,
-        #                                                 particle_positional_embed=particle_positional_embed,
-        #                                                 particle_score=self.particle_score,
-        #                                                 causal=self.causal_ctx, norm_layer=use_norm_layer,
-        #                                                 shared_logvar=False, ctx_dist=ctx_dist,
-        #                                                 n_ctx_categories=n_ctx_categories, n_ctx_classes=n_ctx_classes,
-        #                                                 particle_anchors=particle_anchors, use_z_orig=self.use_z_orig,
-        #                                                 global_ctx_pool=self.global_ctx_pool,
-        #                                                 ctx_pool_dim=self.pool_ctx_dim,
-        #                                                 n_pool_ctx_categories=self.n_pool_ctx_categories,
-        #                                                 n_pool_ctx_classes=self.n_pool_ctx_classes,
-        #                                                 global_local_fuse_mode=global_local_fuse_mode,
-        #                                                 condition_local_on_global=condition_local_on_global)
-        # else:
-        #     self.ctx_enc = None
 
         self.init_weights()
 

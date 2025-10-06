@@ -33,12 +33,15 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
 
-def train_dlp(config_path='./configs/shapes.json'):
+def train_dlp_pc(config_path='./configs/shapes.json'):
     # load config
     try:
         config = get_config(config_path)
     except FileNotFoundError:
         raise SystemExit("config file not found")
+    modality = config.get('modality', 'image')
+    if modality != "point_cloud":
+        raise NotImplementedError("This is the training code for point-cloud DLP only. For image DLP, use train_dlp.py")
     hparams = config  # to save a copy of the hyper-parameters
     # data and general
     ds = config['ds']
@@ -129,153 +132,75 @@ def train_dlp(config_path='./configs/shapes.json'):
     depth_loss_ratio = config["depth_loss_ratio"]  # weight of depth loss if split_loss is True
 
     # Point Cloud Stuff
-    modality = config.get('modality', 'image')
 
-    # load data
-    if modality == 'image':
-        cams = None
-        if ds == "mimicgen":
-            cams = config.get("cams", "robot0_eye_in_hand")  # which camera to use
-        dataset = get_image_dataset(ds, root, mode='train', image_size=image_size, cams=cams)
-        dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
-                                drop_last=True)
-        
-        # dataset-level near/far if available (shapes uses (0.2, 2.0))
-        if ch == 4:
-            near, far = get_depth_range(dataloader)
-            print(f"Depth range near: {near}, far: {far}")
-    elif modality == 'point_cloud':
-        dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
-        dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=pc_collate)
+
+    dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=pc_collate)
     # model
-    if modality == 'image':
-        model = DLP(
-            cdim=ch,  # Number of input image channels
-            image_size=image_size,  # Input image size (assumed square)
-            normalize_rgb=normalize_rgb,  # If True, normalize RGB to [-1, 1], else keep [0, 1]
 
-            # Keypoint and patch configuration
-            n_kp_per_patch=n_kp_per_patch,  # Number of proposal/prior keypoints to extract per patch
-            patch_size=patch_size,  # Size of patches for keypoint proposal network
-            anchor_s=anchor_s,  # Glimpse size ratio relative to image size
-            n_kp_enc=n_kp_enc,  # Number of posterior keypoints to learn
-            n_kp_prior=n_kp_prior,  # Number of keypoints to filter from prior proposals
+    model = VoxelDLP(
+        cdim=ch,  # Number of input image channels
+        image_size=image_size,  # Input image size (assumed square)
+        normalize_rgb=normalize_rgb,  # If True, normalize RGB to [-1, 1], else keep [0, 1]
 
-            # Network configuration
-            pad_mode=pad_mode,  # Padding mode for CNNs ('zeros' or 'replicate')
-            dropout=dropout,  # Dropout rate for transformers
+        # Keypoint and patch configuration
+        n_kp_per_patch=n_kp_per_patch,  # Number of proposal/prior keypoints to extract per patch
+        patch_size=patch_size,  # Size of patches for keypoint proposal network
+        anchor_s=anchor_s,  # Glimpse size ratio relative to image size
+        n_kp_enc=n_kp_enc,  # Number of posterior keypoints to learn
+        n_kp_prior=n_kp_prior,  # Number of keypoints to filter from prior proposals
 
-            # Feature representation
-            features_dist=features_dist,  # Distribution type for features ('gauss' or 'categorical')
-            learned_feature_dim=learned_feature_dim,  # Dimension of learned visual features
-            learned_bg_feature_dim=learned_bg_feature_dim,
-            # Background feature dimension (if None, equals learned_feature_dim)
-            n_fg_categories=n_fg_categories,  # Number of foreground feature categories (if categorical)
-            n_fg_classes=n_fg_classes,  # Number of foreground feature classes per category
-            n_bg_categories=n_bg_categories,  # Number of background feature categories
-            n_bg_classes=n_bg_classes,  # Number of background feature classes per category
+        # Network configuration
+        pad_mode=pad_mode,  # Padding mode for CNNs ('zeros' or 'replicate')
+        dropout=dropout,  # Dropout rate for transformers
 
-            # Prior distributions parameters
-            scale_std=scale_std,  # Prior standard deviation for scale
-            offset_std=offset_std,  # Prior standard deviation for offset
-            obj_on_alpha=obj_on_alpha,  # Alpha parameter for transparency Beta distribution
-            obj_on_beta=obj_on_beta,  # Beta parameter for transparency Beta distribution
+        # Feature representation
+        features_dist=features_dist,  # Distribution type for features ('gauss' or 'categorical')
+        learned_feature_dim=learned_feature_dim,  # Dimension of learned visual features
+        learned_bg_feature_dim=learned_bg_feature_dim,
+        # Background feature dimension (if None, equals learned_feature_dim)
+        n_fg_categories=n_fg_categories,  # Number of foreground feature categories (if categorical)
+        n_fg_classes=n_fg_classes,  # Number of foreground feature classes per category
+        n_bg_categories=n_bg_categories,  # Number of background feature categories
+        n_bg_classes=n_bg_classes,  # Number of background feature classes per category
 
-            # Object decoder architecture
-            obj_res_from_fc=obj_res_from_fc,  # Initial resolution for object encoder-decoder
-            obj_ch_mult_prior=obj_ch_mult_prior,  # Channel multipliers for prior patch encoder (kp proposals)
-            obj_ch_mult=obj_ch_mult,  # Channel multipliers for object encoder-decoder
-            obj_base_ch=obj_base_ch,  # Base channels for object encoder-decoder
-            obj_final_cnn_ch=obj_final_cnn_ch,  # Final CNN channels for object encoder-decoder
+        # Prior distributions parameters
+        scale_std=scale_std,  # Prior standard deviation for scale
+        offset_std=offset_std,  # Prior standard deviation for offset
+        obj_on_alpha=obj_on_alpha,  # Alpha parameter for transparency Beta distribution
+        obj_on_beta=obj_on_beta,  # Beta parameter for transparency Beta distribution
 
-            # Background decoder architecture
-            bg_res_from_fc=bg_res_from_fc,  # Initial resolution for background encoder-decoder
-            bg_ch_mult=bg_ch_mult,  # Channel multipliers for background encoder-decoder
-            bg_base_ch=bg_base_ch,  # Base channels for background encoder-decoder
-            bg_final_cnn_ch=bg_final_cnn_ch,  # Final CNN channels for background encoder-decoder
+        # Object decoder architecture
+        obj_res_from_fc=obj_res_from_fc,  # Initial resolution for object encoder-decoder
+        obj_ch_mult_prior=obj_ch_mult_prior,  # Channel multipliers for prior patch encoder (kp proposals)
+        obj_ch_mult=obj_ch_mult,  # Channel multipliers for object encoder-decoder
+        obj_base_ch=obj_base_ch,  # Base channels for object encoder-decoder
+        obj_final_cnn_ch=obj_final_cnn_ch,  # Final CNN channels for object encoder-decoder
 
-            # Network architecture options
-            use_resblock=use_resblock,  # Use residual blocks in encoders-decoders
-            num_res_blocks=num_res_blocks,  # Number of residual blocks per resolution
-            cnn_mid_blocks=cnn_mid_blocks,  # Use middle blocks in CNN
-            mlp_hidden_dim=mlp_hidden_dim,  # Hidden dimension for MLPs
+        # Background decoder architecture
+        bg_res_from_fc=bg_res_from_fc,  # Initial resolution for background encoder-decoder
+        bg_ch_mult=bg_ch_mult,  # Channel multipliers for background encoder-decoder
+        bg_base_ch=bg_base_ch,  # Base channels for background encoder-decoder
+        bg_final_cnn_ch=bg_final_cnn_ch,  # Final CNN channels for background encoder-decoder
 
-            # Particle interaction transformer (PINT) configuration
-            pint_enc_layers=pint_enc_layers,  # Number of PINT encoder layers
-            pint_enc_heads=pint_enc_heads,  # Number of PINT encoder attention heads
+        # Network architecture options
+        use_resblock=use_resblock,  # Use residual blocks in encoders-decoders
+        num_res_blocks=num_res_blocks,  # Number of residual blocks per resolution
+        cnn_mid_blocks=cnn_mid_blocks,  # Use middle blocks in CNN
+        mlp_hidden_dim=mlp_hidden_dim,  # Hidden dimension for MLPs
 
-            # Dynamics configuration
-            timestep_horizon=1,
-            
-            #RGBD Stuff
-            separate_depth_features=separate_depth_features, 
-            depth_feature_dim=depth_feature_dim,
-            split_loss=split_loss, 
-            depth_loss_ratio=depth_loss_ratio).to(device)
-    else:
-        model = VoxelDLP(
-            cdim=ch,  # Number of input image channels
-            image_size=image_size,  # Input image size (assumed square)
-            normalize_rgb=normalize_rgb,  # If True, normalize RGB to [-1, 1], else keep [0, 1]
+        # Particle interaction transformer (PINT) configuration
+        pint_enc_layers=pint_enc_layers,  # Number of PINT encoder layers
+        pint_enc_heads=pint_enc_heads,  # Number of PINT encoder attention heads
 
-            # Keypoint and patch configuration
-            n_kp_per_patch=n_kp_per_patch,  # Number of proposal/prior keypoints to extract per patch
-            patch_size=patch_size,  # Size of patches for keypoint proposal network
-            anchor_s=anchor_s,  # Glimpse size ratio relative to image size
-            n_kp_enc=n_kp_enc,  # Number of posterior keypoints to learn
-            n_kp_prior=n_kp_prior,  # Number of keypoints to filter from prior proposals
-
-            # Network configuration
-            pad_mode=pad_mode,  # Padding mode for CNNs ('zeros' or 'replicate')
-            dropout=dropout,  # Dropout rate for transformers
-
-            # Feature representation
-            features_dist=features_dist,  # Distribution type for features ('gauss' or 'categorical')
-            learned_feature_dim=learned_feature_dim,  # Dimension of learned visual features
-            learned_bg_feature_dim=learned_bg_feature_dim,
-            # Background feature dimension (if None, equals learned_feature_dim)
-            n_fg_categories=n_fg_categories,  # Number of foreground feature categories (if categorical)
-            n_fg_classes=n_fg_classes,  # Number of foreground feature classes per category
-            n_bg_categories=n_bg_categories,  # Number of background feature categories
-            n_bg_classes=n_bg_classes,  # Number of background feature classes per category
-
-            # Prior distributions parameters
-            scale_std=scale_std,  # Prior standard deviation for scale
-            offset_std=offset_std,  # Prior standard deviation for offset
-            obj_on_alpha=obj_on_alpha,  # Alpha parameter for transparency Beta distribution
-            obj_on_beta=obj_on_beta,  # Beta parameter for transparency Beta distribution
-
-            # Object decoder architecture
-            obj_res_from_fc=obj_res_from_fc,  # Initial resolution for object encoder-decoder
-            obj_ch_mult_prior=obj_ch_mult_prior,  # Channel multipliers for prior patch encoder (kp proposals)
-            obj_ch_mult=obj_ch_mult,  # Channel multipliers for object encoder-decoder
-            obj_base_ch=obj_base_ch,  # Base channels for object encoder-decoder
-            obj_final_cnn_ch=obj_final_cnn_ch,  # Final CNN channels for object encoder-decoder
-
-            # Background decoder architecture
-            bg_res_from_fc=bg_res_from_fc,  # Initial resolution for background encoder-decoder
-            bg_ch_mult=bg_ch_mult,  # Channel multipliers for background encoder-decoder
-            bg_base_ch=bg_base_ch,  # Base channels for background encoder-decoder
-            bg_final_cnn_ch=bg_final_cnn_ch,  # Final CNN channels for background encoder-decoder
-
-            # Network architecture options
-            use_resblock=use_resblock,  # Use residual blocks in encoders-decoders
-            num_res_blocks=num_res_blocks,  # Number of residual blocks per resolution
-            cnn_mid_blocks=cnn_mid_blocks,  # Use middle blocks in CNN
-            mlp_hidden_dim=mlp_hidden_dim,  # Hidden dimension for MLPs
-
-            # Particle interaction transformer (PINT) configuration
-            pint_enc_layers=pint_enc_layers,  # Number of PINT encoder layers
-            pint_enc_heads=pint_enc_heads,  # Number of PINT encoder attention heads
-
-            # Dynamics configuration
-            timestep_horizon=1,
-            
-            #RGBD Stuff
-            separate_depth_features=separate_depth_features, 
-            depth_feature_dim=depth_feature_dim,
-            split_loss=split_loss, 
-            depth_loss_ratio=depth_loss_ratio).to(device)
+        # Dynamics configuration
+        timestep_horizon=1,
+        
+        #RGBD Stuff
+        separate_depth_features=separate_depth_features, 
+        depth_feature_dim=depth_feature_dim,
+        split_loss=split_loss, 
+        depth_loss_ratio=depth_loss_ratio).to(device)
         
     model_info = model.info()
     print(model_info)
@@ -359,15 +284,17 @@ def train_dlp(config_path='./configs/shapes.json'):
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
-            x = batch[0].to(device)
-            if len(x.shape) == 4:
-                # [bs, ch, h, w]
-                x = x.unsqueeze(1)
-            if ch == 4:
-                x = normalize_rgbd(x, near=near, far=far, rgb_mode="unit")   # or "imagenet" if you want standardized RGB
+            pts   = batch["points"].to(device)   # [B, N_max, C]
+            mask  = batch["mask"].to(device)     # [B, N_max]
+
+            # 2) add a time dim (T=1) so the model sees [B, T, ...]
+            #    If your PC encoder expects [B,T,N,C]:
+            x_pc = pts.unsqueeze(1)              # [B, 1, N_max, C]
+            m_pc = mask.unsqueeze(1)             # [B, 1, N_max]
+
             warmup = (epoch < warmup_epoch)
             # forward pass
-            model_output = model(x, warmup=warmup, with_loss=True,
+            model_output = model(x_pc, m_pc, warmup=warmup, with_loss=True,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
@@ -721,4 +648,4 @@ if __name__ == "__main__":
     else:
         conf_path = os.path.join('./configs', f'{ds}.json')
 
-    train_dlp(conf_path)
+    train_dlp_pc(conf_path)

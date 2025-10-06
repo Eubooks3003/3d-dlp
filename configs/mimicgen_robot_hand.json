@@ -1,6 +1,7 @@
 {
   "ds": "mimicgen",
-  "root": "/home/ellina/Desktop/Code/articubot-on-mimicgen/stack_d1_rgbd_pcd.hdf5",
+  "root": "/home/ellina/Desktop/Code/lpwm-dev/mimicgen_data/stack",
+  "cams": "robot0_eye_in_hand",
   "device": "cuda",
   "batch_size": 32,
   "lr": 0.00008,
