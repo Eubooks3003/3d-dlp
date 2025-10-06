@@ -744,7 +744,7 @@ class VoxelDLP(nn.Module):
         cnn_info = [
             ("Prior CNN Pre-pool Output Size", self.prior_module.enc3d.out_channels),
             ("Object CNN Output Shape", object),
-            ("Background CNN Output Shape", self.encoder_module.bg_encoder.cnn_out_shape),
+            # ("Background CNN Output Shape", self.encoder_module.bg_encoder.cnn_out_shape),
             ("Decoder Background Upsamples", self.decoder_module.num_bg_upsample),
             ("Decoder Object Upsamples", self.decoder_module.num_obj_upsample)
         ]

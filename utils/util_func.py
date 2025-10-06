@@ -231,6 +231,7 @@ def create_masks_with_scale(kp_batch, anchor_s, image_size, scale=None, scale_no
     return trans_padded_patches_batch
 
 
+
 def get_bb_from_masks(masks, width, height):
     # extracts bounding boxes (bb) from masks.
     # batch version

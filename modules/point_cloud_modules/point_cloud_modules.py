@@ -14,9 +14,8 @@ from utils.util_func import reparameterize, spatial_transform, create_masks_fast
 from modules.vision_modules import Encoder, Decoder
 
 # Prior
-from modules.point_cloud_modules.DLPEncoder.prior_encoder.dlp_prior import DLPPrior
-from modules.point_cloud_modules.DLPEncoder.particle_features_encoder import ParticleFeaturesEncoderPoint
-from modules.point_cloud_modules.DLPEncoder.particle_attribute_encoder import ParticleAttributeEncoderPoint
+from modules.point_cloud_modules.DLPEncoder.particle_encoder import ParticleEncoder
+from modules.point_cloud_modules.DLPEncoder.bg_encoder import BgEncoderPC
 """
 Basic Modules
 """
@@ -2579,197 +2578,6 @@ class BgDecoder(nn.Module):
         return self.decode_all(z_bg_features, z_ctx, warmup)
 
 
-class BgEncoder(nn.Module):
-    def __init__(self, cdim=3, image_size=64, pad_mode='replicate', dropout=0.0,
-                 learned_feature_dim=16, use_resblock=False, activation='gelu', cnn_mid_blocks=False,
-                 ch_mult=(1, 2, 3), base_ch=32, final_cnn_ch=32, num_res_blocks=2, interaction_features=False,
-                 mlp_hidden_dim=256, timestep_horizon=1, add_particle_temp_embed=False, init_std=0.2,
-                 features_dist='gauss', n_bg_categories=4, n_bg_classes=4,
-                 # initialization
-                 init_zero_bias=True,  # zero bias for conv and linear layers
-                 init_conv_layers=True,  # initialize conv layers with normal dist
-                 init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
-                 ):
-        super(BgEncoder, self).__init__()
-        """
-        DLP Background Module -- encode a latent for the (masked) background, z_bg
-        Basically, just a convolutional-based encoder used in standard VAEs
-        cdim: channels of the input image (3...)
-        enc_channels: channels for the posterior CNN (takes in the whole image)
-        pad_mode: padding for the CNNs, 'zeros' or  'replicate' (default)
-        learned_feature_dim: the latent visual features dimensions extracted from glimpses.
-        """
-        self.image_size = image_size
-        self.dropout = dropout
-        self.output_feat_map_size = int(image_size // (2 ** (len(ch_mult) - 1)))
-        self.features_dim = learned_feature_dim
-        self.features_dist = features_dist
-        self.n_bg_categories = n_bg_categories
-        self.n_bg_classes = n_bg_classes
-        assert learned_feature_dim > 0, "learned_feature_dim must be greater than 0"
-        self.cdim = cdim
-        self.n_kp_enc = final_cnn_ch
-        self.interaction_features = interaction_features
-        self.use_resblock = use_resblock
-        self.activation = activation
-        self.cnn_mid_blocks = cnn_mid_blocks
-        self.mlp_hidden_dim = mlp_hidden_dim
-        self.timestep_horizon = (timestep_horizon + 1) if timestep_horizon > 1 else 1
-        self.add_particle_temp_embed = add_particle_temp_embed
-
-        # initialization
-        self.init_zero_bias = init_zero_bias  # zero bias for conv and linear layers
-        self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
-        self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
-
-        attn_res = [max(self.image_size // 16, 1)]
-        self.bg_cnn_enc = Encoder(ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
-                                  attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
-                                  in_channels=self.cdim,
-                                  resolution=self.image_size, z_channels=final_cnn_ch, double_z=False,
-                                  padding_mode=pad_mode, residual=self.use_resblock, in_conv_kernel_size=3,
-                                  mid_blocks=cnn_mid_blocks)
-        self.cnn_out_shape = self.get_cnn_shape()
-
-        # new cnn
-        feature_map_size = self.output_feat_map_size ** 2
-        output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
-        self.output_logvar = output_logvar
-
-        # new - FCN
-        if self.features_dim % feature_map_size == 0:
-            self.ch_learned_feature_dim = math.ceil(max(self.features_dim / feature_map_size, 1))
-            out_ch = 2 * self.ch_learned_feature_dim if output_logvar else self.ch_learned_feature_dim
-            self.to_latent = nn.Conv2d(in_channels=final_cnn_ch,
-                                       out_channels=out_ch, kernel_size=1)
-            output_z_cnn = (self.ch_learned_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
-            flattened_z_cnn = np.prod(output_z_cnn)
-            if self.timestep_horizon > 1 and self.add_particle_temp_embed:
-                self.temp_embed = nn.Parameter(
-                    init_std * torch.randn(1, self.timestep_horizon, final_cnn_ch, self.cnn_out_shape[-1],
-                                           self.cnn_out_shape[-1]))
-            else:
-                self.temp_embed = None
-
-            self.projection_mode = 'fcn'
-            self.to_mu = nn.Identity()
-            self.to_logvar = nn.Identity()
-        else:
-            self.ch_learned_feature_dim = final_cnn_ch
-            self.to_latent = nn.Identity()
-            output_z_cnn = (self.ch_learned_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
-            flattened_z_cnn = np.prod(output_z_cnn)
-
-            if self.timestep_horizon > 1 and self.add_particle_temp_embed:
-                self.temp_embed = nn.Parameter(init_std * torch.randn(1, self.timestep_horizon, flattened_z_cnn))
-            else:
-                self.temp_embed = None
-
-            self.projection_mode = 'fc'
-            self.to_mu = self.get_mlp(flattened_z_cnn, self.features_dim)
-            self.to_logvar = self.get_mlp(flattened_z_cnn,
-                                          self.features_dim) if output_logvar else nn.Identity()
-
-        self.info = (f'BgEncoder: requested latent size: {self.features_dim}, '
-                     f'cnn output (h*w): {feature_map_size}, (latent_size / h*w)={self.features_dim / feature_map_size} ->'
-                     f' latent projection mode: {self.projection_mode},'
-                     f' project {output_z_cnn} ({flattened_z_cnn}) -> {self.features_dim}')
-
-        self.init_weights()
-
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                # pass
-                if self.init_conv_layers:
-                    nn.init.normal_(m.weight, 0, self.init_conv_bg_std)
-                if self.init_zero_bias and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                # use pytorch's default
-                pass
-        # pass
-
-    def get_mlp(self, in_dim, out_dim, linear=False):
-        if linear:
-            return nn.Linear(in_dim, out_dim)
-        else:
-            activation_f = nn.GELU if self.activation == 'gelu' else nn.ReLU
-            hidden_dim = self.mlp_hidden_dim
-            mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim),
-                                activation_f(),
-                                nn.Linear(hidden_dim, out_dim))
-
-            return mlp
-
-    def get_cnn_shape(self):
-        dummy_input = torch.rand(1, self.cdim, self.image_size, self.image_size)
-        out = self.bg_cnn_enc(dummy_input)
-        if isinstance(out, tuple):
-            out = out[1]
-        return out.shape[1:]
-
-    def encode_bg_features(self, x, masks=None, timesteps=None):
-        # x: [bs, ch, image_size, image_size]
-        # masks: [bs, 1, image_size, image_size]
-        batch_size, _, features_dim, _ = x.shape
-        # bg features
-        if masks is not None:
-            x_in = x * masks
-        else:
-            x_in = x
-        enc_out = self.bg_cnn_enc(x_in)
-        if isinstance(enc_out, tuple):
-            cnn_features = enc_out[1]
-        else:
-            cnn_features = enc_out
-
-        # new cnn
-        if self.projection_mode == 'fcn' and self.temp_embed is not None:
-            orig_shape = cnn_features.shape  # [batch_size * n_kp, ch, patch_size, patch_size]
-            new_feat = cnn_features.view(-1, timesteps, *cnn_features.shape[1:])
-            new_feat = new_feat + self.temp_embed[:, :timesteps]
-            cnn_features = new_feat.view(orig_shape)
-        features = self.to_latent(cnn_features)
-        features = features.view(features.shape[0], -1)
-        if self.projection_mode == 'fc' and self.temp_embed is not None:
-            orig_shape = features.shape  # [batch_size * n_kp, ch, patch_size, patch_size]
-            new_feat = features.view(-1, timesteps, *features.shape[1:])
-            new_feat = new_feat + self.temp_embed[:, :timesteps]
-            features = new_feat.view(orig_shape)
-        if self.interaction_features:
-            mu_bg = features
-            logvar_bg = None
-            mu_bg = self.to_mu(mu_bg)
-        else:
-            mu_bg = self.to_mu(features)
-            logvar_bg = self.to_logvar(features)
-
-        return mu_bg, logvar_bg
-
-    def encode_all(self, x, masks=None, deterministic=False, timesteps=None):
-        # encode background
-        mu_bg, logvar_bg = self.encode_bg_features(x, masks, timesteps)
-        if self.interaction_features:
-            z_bg = mu_bg
-        else:
-            z_bg = reparameterize(mu_bg, logvar_bg) if not deterministic else mu_bg
-        z_kp = torch.zeros(mu_bg.shape[0], 1, 2, device=x.device, dtype=torch.float)
-        encode_dict = {'mu_bg': mu_bg, 'logvar_bg': logvar_bg, 'z_bg': z_bg, 'z_kp': z_kp}
-        return encode_dict
-
-    def forward(self, x, masks=None, deterministic=False, timesteps=None):
-        encoder_out = self.encode_all(x, masks, deterministic, timesteps)
-        mu_bg = encoder_out['mu_bg']
-        logvar_bg = encoder_out['logvar_bg']
-        z_bg = encoder_out['z_bg']
-        z_kp = encoder_out['z_kp']
-        output_dict = {'mu_bg': mu_bg, 'logvar_bg': logvar_bg, 'z_bg': z_bg, 'z_kp': z_kp}
-        return output_dict
-
 """
 DLP components
 """
@@ -3574,568 +3382,6 @@ class ParticleContextDecoder(nn.Module):
 
         return decoder_out
 
-
-class ParticleEncoder(nn.Module):
-    def __init__(self, cdim=3, image_size=64,
-                 pad_mode='replicate', dropout=0.0, n_kp_per_patch=1, n_kp_prior=20,
-                 patch_size=16, n_kp_enc=20, n_kp_dec=None, learned_feature_dim=16,
-                 kp_range=(-1, 1), kp_activation="tanh", anchor_s=0.25,
-                 use_resblock=True, embed_init_std=0.2, projection_dim=128, timestep_horizon=1,
-                 filtering_heuristic='none', obj_ch_mult_prior=(1, 2),
-                 obj_ch_mult=(1, 2, 3), obj_base_ch=32, obj_final_cnn_ch=32, num_res_blocks=2,
-                 interaction_features=False, interaction_obj_on=False, interaction_depth=True,
-                 temporal_interaction=True, cnn_mid_blocks=False, mlp_hidden_dim=256,
-                 embed_prior_patch_pos=False, add_particle_temp_embed=False,
-                 features_dist='gauss', n_fg_categories=8, n_fg_classes=4,
-                 use_null_features_embed=True, obj_on_min=1e-4, obj_on_max=100.0, warmup_n_kp_ratio=0.35,
-                 # initialization
-                 init_zero_bias=True,  # zero bias for conv and linear layers
-                 init_ssm_last_layer=True,  # spatial softmax initialization
-                 init_conv_layers=True,  # initialize conv layers with normal dist
-                 init_conv_fg_std=0.02,  # std for conv fg normal dist
-                 separate_depth_features=False,
-                 depth_feature_dim=16,):
-        super(ParticleEncoder, self).__init__()
-        """
-        DLP Foreground Module – Extracts objects from an image using keypoints and learned features. 
-        Combines posterior CNN for full image processing and prior CNN for patch-based keypoint proposals.
-        
-        Args:
-        cdim (int, default=3): Number of channels in the input image.
-        image_size (int, default=64): Resolution of the input image (assumes square images).
-        pad_mode (str, default='replicate'): Padding mode for CNNs, options are 'zeros' or 'replicate'.
-        dropout (float, default=0.0): Dropout rate for CNNs (not used in practice).
-        n_kp_per_patch (int, default=1): Number of keypoints proposed per patch.
-        n_kp_prior (int, default=20): Number of keypoints filtered from prior proposals.
-        patch_size (int, default=16): Size of patches for the prior keypoint proposal network.
-        n_kp_enc (int, default=20): Number of posterior keypoints to learn.
-        n_kp_dec (int, optional): Number of keypoints for decoder (if different from encoder).
-        learned_feature_dim (int, default=16): Dimensionality of latent visual features for glimpses.
-        kp_range (tuple, default=(-1, 1)): Range for keypoints; options are (-1, 1) or (0, 1).
-        kp_activation (str, default='tanh'): Activation function for keypoints; 'tanh' for range (-1, 1), 'sigmoid' for range (0, 1).
-        anchor_s (float, default=0.25): Glimpse size as a ratio of image size (e.g., 0.25 → glimpse size is 0.25 * image_size).
-        use_resblock (bool, default=True): Whether to use residual blocks in CNNs.
-        embed_init_std (float, default=0.2): Standard deviation for initializing learned tokens.
-        projection_dim (int, default=128): Dimensionality of embeddings for transformer input.
-        timestep_horizon (int, default=1): Maximum timesteps the model processes at once.
-        filtering_heuristic (str, default='none'): Method for filtering prior keypoints. Options: 'distance', 'variance', 'random', 'none'.
-        obj_ch_mult (tuple, default=(1, 2, 3)): Multiplicative factors for object feature channels at each CNN stage.
-        obj_base_ch (int, default=32): Base number of channels in object feature extractor.
-        obj_final_cnn_ch (int, default=32): Number of channels in the final object CNN layer.
-        num_res_blocks (int, default=2): Number of residual blocks in object feature extractor.
-        interaction_features (bool, default=False): Whether to compute interaction-based features.
-        interaction_obj_on (bool, default=False): Whether to include "object-on" features for interactions.
-        interaction_depth (bool, default=True): Whether to compute depth information for interactions.
-        temporal_interaction (bool, default=True): Whether to model temporal interactions between features.
-        cnn_mid_blocks (bool, default=False): Whether to include intermediate blocks in the CNN.
-        mlp_hidden_dim (int, default=256): Hidden dimensionality for MLP layers.
-        embed_prior_patch_pos (bool, default=False): Whether to embed positional information for prior patches.
-        add_particle_temp_embed (bool, default=False): Whether to add temporal embeddings to particles.
-        features_dist (str, default='gauss'): Distribution type for keypoint features. Options: 'gauss'.
-        n_fg_categories (int, default=8): Number of foreground categories for classification.
-        n_fg_classes (int, default=4): Number of foreground classes for classification.
-        use_null_features_embed (bool, default=True): Whether to use a learned embedding for filtered-out particles.
-        obj_on_min (float, default=1e-4): Minimum concentration value in Beta dist for transparency" probabilities.
-        obj_on_max (float, default=100.0): Maximum concentration value in Beta dist for transparency" probabilities.
-        """
-        self.image_size = image_size
-        self.dropout = dropout
-        self.kp_range = kp_range
-        self.n_kp_per_patch = n_kp_per_patch
-        self.n_kp_enc = n_kp_enc
-        self.n_kp_dec = self.n_kp_enc if n_kp_dec is None else n_kp_dec
-        self.n_kp_prior = n_kp_prior
-        self.kp_activation = kp_activation
-        self.patch_size = patch_size
-        self.anchor_patch_s = patch_size / image_size
-        self.features_dim = int(image_size // (2 ** (len(obj_ch_mult) - 1)))
-        self.learned_feature_dim = learned_feature_dim
-        self.features_dist = features_dist
-        self.n_fg_categories = n_fg_categories
-        self.n_fg_classes = n_fg_classes
-        assert learned_feature_dim > 0, "learned_feature_dim must be greater than 0"
-        self.anchor_s = anchor_s
-        self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
-        self.cdim = cdim
-        self.use_resblock = use_resblock
-        self.embed_init_std = embed_init_std
-        self.projection_dim = projection_dim
-        self.timestep_horizon = (timestep_horizon + 1) if timestep_horizon > 1 else 1
-        self.num_patches = int((image_size // self.patch_size) ** 2)
-        self.interaction_features = interaction_features
-        self.interaction_depth = interaction_depth
-        self.interaction_obj_on = interaction_obj_on
-        self.temporal_interaction = temporal_interaction
-        self.add_particle_temp_embed = add_particle_temp_embed
-        self.cnn_mid_blocks = cnn_mid_blocks
-        self.mlp_hidden_dim = mlp_hidden_dim
-        self.embed_prior_patch_pos = embed_prior_patch_pos
-        self.obj_on_min = obj_on_min
-        self.obj_on_max = obj_on_max
-        self.use_null_features_embed = use_null_features_embed
-        self.warmup_n_kp_ratio = warmup_n_kp_ratio
-        # initialization
-        self.init_zero_bias = init_zero_bias  # zero bias for conv and linear layers
-        self.init_ssm_last_layer = init_ssm_last_layer  # spatial softmax initialization
-        self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
-        self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
-        
-        self.separate_depth_features = separate_depth_features
-        self.depth_feature_dim = depth_feature_dim
-
-        print("Creating DLP Prior with cdim: ", cdim)
-        # TODO: Make all parameters configurable if necessary
-        self.prior_encoder = DLPPrior(
-            grid=(48, 48, 48),          # (D,H,W) of the voxel volume
-            out_feat=4,                 # voxelizer output channels (e.g., density, rgb bins, etc.)
-            base_ch=32,                 # 3D encoder base width
-            ch_mult=(1, 2, 3),          # per-level multipliers
-            num_res_blocks=2,
-            use_resblock=True,
-            use_attention=False,
-            cnn_mid_blocks=False,       # False -> keep mid blocks in Encoder3D
-            n_kp_prior=n_kp_prior,      # total K keypoint channels/proposals
-            kp_range=(-1., 1.),         # coordinate range for SSM3D
-            temperature=1.0,            # softmax temperature for SSM3D
-            filtering_heuristic='none', # 'none' | 'variance' | 'distance' | 'random'
-            init_zero_bias=True,
-            init_conv_layers=True,
-            init_conv_std=0.02
-        )
-
-
-        # attribute encoder - anchor (z_a), offset (z_o), scale (z_s)
-        anchor_s_att = patch_size / image_size
-        k_neighbors_attr = 128
-        k_neighbors_feat = 128
-
-        extra_feats = 0   # per-point features beyond xyz from the dataset
-        # TODO: Make this gettable via the dataloader 
-
-        # --- Particle attributes (offset/scale/obj_on/depth) ---
-        self.particle_attribute_enc_pc = ParticleAttributeEncoderPoint(
-            n_particles=self.n_kp_prior,
-            in_feat=extra_feats,
-            k_neighbors=k_neighbors_attr,
-            hidden=mlp_hidden_dim,
-            kp_activation=kp_activation,                 # 'tanh' or 'sigmoid'
-            max_offset=1.0,
-            with_scale=True,
-            with_obj_on=(not self.interaction_obj_on),
-            with_depth=(not self.interaction_depth),
-            base_radius=anchor_s,                        # canonical crop radius in [-1,1] units
-            clamp_after_st=True,
-            obj_on_min=self.obj_on_min,
-            obj_on_max=self.obj_on_max,
-            init_zero_bias=init_zero_bias,
-        )
-
-        # --- Particle appearance/features (PointNet-like) ---
-        output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
-
-        self.particle_features_enc = ParticleFeaturesEncoderPoint(
-            anchor_size=anchor_s,                        # used to set canonical crop scale
-            features_dim=learned_feature_dim,
-            in_feat=extra_feats,
-            k_neighbors=k_neighbors_feat,
-            output_logvar=output_logvar,
-            features_dist=self.features_dist,            # usually 'gauss' here
-            hidden=mlp_hidden_dim,
-            interaction_features=self.interaction_features,
-            use_null_features_embed=self.use_null_features_embed,
-            embed_init_std=embed_init_std,
-            base_radius=anchor_s,
-            clamp_after_st=True,
-        )
-        # embed the source patch of the particles
-        # if self.embed_prior_patch_pos:
-        #     self.patch_id_embed = nn.Parameter(self.embed_init_std * torch.randn(1, self.n_kp_prior, mlp_hidden_dim))
-        # else:
-        #     self.patch_id_embed = None
-        # patch_centers = self.prior_encoder.get_patch_centers().unsqueeze(0) * (
-        #         self.kp_range[1] - self.kp_range[0]) + self.kp_range[0]
-        # # append null particle
-        # patch_centers = torch.cat([patch_centers, torch.zeros(1, 1, 2)], dim=1)
-        # if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
-        #     self.null_feature_embed = nn.Parameter(self.embed_init_std * torch.randn(1, 1, self.learned_feature_dim))
-        #     self.null_depth_feature_embed = nn.Parameter(self.embed_init_std * torch.randn(1, 1, self.depth_feature_dim)) if self.separate_depth_features and cdim == 4 else None
-        # self.register_buffer('patch_centers', patch_centers)
-        # self.register_buffer('mu_scale_prior', torch.tensor(np.log(self.anchor_s / (1 - self.anchor_s + 1e-5))))
-        self.init_weights()
-
-    def init_weights(self):
-        self.prior_encoder.init_weights()
-        # initialize ssm and other conv ins the same
-        # conv1 = self.prior_encoder.enc.conv_in
-        # conv2 = self.particle_attribute_enc.cnn.conv_in
-        # conv3 = self.particle_features_enc.cnn.conv_in
-        # if conv1.weight.shape == conv2.weight.shape:
-        #     with torch.no_grad():
-        #         conv2.weight.copy_(conv1.weight)
-        #         if conv1.bias is not None and conv2.bias is not None:
-        #             conv2.bias.copy_(conv1.bias)
-        # if conv1.weight.shape == conv3.weight.shape:
-        #     with torch.no_grad():
-        #         conv3.weight.copy_(conv1.weight)
-        #         if conv1.bias is not None and conv3.bias is not None:
-        #             conv3.bias.copy_(conv1.bias)
-
-    def encode_prior(self, x, mask):
-        return self.prior_encoder(x, mask)
-
-    def encode_pos_scale_with_prior(self, x, mask=None, deterministic=False, warmup=False, timesteps=None):
-        """
-        Point-cloud version.
-        x:     [B, N, 3]
-        mask:  [B, N] or None
-        Returns the same dict keys as the 2D version, but positions are 3D.
-        """
-        assert x.dim() == 3 and x.size(-1) == 3, f"expected points [B,N,3], got {tuple(x.shape)}"
-        B = x.shape[0]
-
-        # ---- 1) Prior proposals from point cloud ----
-        # kp_p:   [B, K, 3] in [-1,1]^3 (global normalized coords)
-        # var_kp: [B, K, 3, 3] covariance per proposal
-        kp_p, var_kp = self.encode_prior(x, mask)       # this calls self.prior_encoder(points, mask)
-
-        # Base (deterministic) proposal position: z_base == mu (like 2D code)
-        mu      = kp_p                                  # [B, K, 3]
-        logvar  = torch.zeros_like(mu)                  # [B, K, 3] (deterministic chamfer KL)
-        z_base  = mu                                    # [B, K, 3]
-
-        # ---- 2) Particle attribute encoder (offset/scale/obj_on/depth) ----
-        # If you already implemented a PC attribute encoder, call it.
-        attr = self.particle_attribute_enc_pc(
-            x, z_base, mask=mask,
-            timesteps=timesteps, deterministic=deterministic
-        )
-        mu_offset     = attr['mu']                  # [B, K, 3]
-        logvar_offset = attr['logvar']              # [B, K, 3]
-        mu_scale      = attr['mu_scale']            # [B, K, 3] (3D scales)
-        logvar_scale  = attr['logvar_scale']        # [B, K, 3]
-        # optional heads
-        if not self.interaction_obj_on:
-            lobj_on_a   = attr['lobj_on_a']
-            lobj_on_b   = attr['lobj_on_b']
-            obj_on_a    = attr['obj_on_a']
-            obj_on_b    = attr['obj_on_b']
-            mu_obj_on   = attr['mu_obj_on']
-            z_obj_on    = attr['z_obj_on']
-        else:
-            obj_on_a = obj_on_b = z_obj_on = mu_obj_on = None
-
-        if not self.interaction_depth:
-            mu_depth      = attr['mu_depth']        # you can define this as radial depth or leave None
-            logvar_depth  = attr['logvar_depth']
-            z_depth       = mu_depth if deterministic else reparameterize(mu_depth, logvar_depth)
-        else:
-            mu_depth = logvar_depth = z_depth = None
-
-        # ---- 3) Combine base + offsets, reparameterize if stochastic ----
-        mu_tot    = z_base + mu_offset                  # [B, K, 3]
-        logvar_tot= logvar_offset
-        # Optional prior on scale; keep as-is if you don’t have a 3D prior for scale yet.
-        # Example if you keep the same API: mu_scale = self.mu_scale_prior + mu_scale  # (make mu_scale_prior 3D if used)
-
-        if deterministic:
-            z_offset = mu_offset
-            z_scale  = mu_scale
-        else:
-            z_offset = reparameterize(mu_offset, logvar_offset)
-            z_scale  = reparameterize(mu_scale,  logvar_scale)
-
-        z = z_base + z_offset                           # [B, K, 3]
-
-        # ---- 4) Variance-based utilities / filtering (3D) ----
-        # total_var: use trace of covariance as scalar uncertainty
-        # var_kp: [B,K,3,3] -> [B,K]
-        total_var = var_kp.diagonal(dim1=-2, dim2=-1).sum(-1)
-
-        # z_base_var: keep the full covariance flattened (like 2D had extra stats)
-        z_base_var = var_kp.view(B, var_kp.shape[1], 9) # [B,K,9]
-        # simple "confidence" proxy from attribute logvar (if you have it), else zeros
-        confidence_score = logvar_offset.norm(dim=-1, keepdim=True) if logvar_offset is not None else torch.zeros(B, kp_p.shape[1], 1, device=x.device)
-        z_base_var = torch.cat([z_base_var, confidence_score], dim=-1)  # [B,K,10]
-
-        # Optional: stable channel id (replaces old patch id)
-        z_base_id = torch.arange(kp_p.shape[1], device=x.device)[None, :, None].expand(B, -1, 1)  # [B,K,1]
-
-        # Optionally keep a null patch embedding out for now
-        patch_id_embed = None
-
-        # A tiny score head (kept for API parity)
-        mu_score     = (z_base_var.mean(-1, keepdim=True) / 30.0) * 2 - 1   # shape [B,K,1]
-        logvar_score = math.log(0.2 ** 2) * torch.ones_like(mu_score)
-        z_score      = mu_score
-
-        # ---- 5) (Optional) Select top-K by variance if encoder budget < prior proposals ----
-        if self.n_kp_enc < self.n_kp_prior:
-            n_filter = self.n_kp_enc if not warmup else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior))
-            _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
-            b_idx = torch.arange(B, device=x.device)[:, None]
-
-            # index everything consistently
-            mu_tot        = mu_tot[b_idx, embed_ind]
-            z_base        = z_base[b_idx, embed_ind]
-            z_base_var    = z_base_var[b_idx, embed_ind]
-            z_base_id     = z_base_id[b_idx, embed_ind]
-            mu_offset     = mu_offset[b_idx, embed_ind]
-            logvar_offset = logvar_offset[b_idx, embed_ind]
-            z             = z[b_idx, embed_ind]
-            z_offset      = z_offset[b_idx, embed_ind]
-            z_scale       = z_scale[b_idx, embed_ind]
-            mu_scale      = mu_scale[b_idx, embed_ind]
-            mu_score      = mu_score[b_idx, embed_ind]
-            logvar_score  = logvar_score[b_idx, embed_ind]
-
-            if logvar_scale is not None:
-                logvar_scale = logvar_scale[b_idx, embed_ind]
-            if not self.interaction_obj_on and obj_on_a is not None:
-                obj_on_a   = obj_on_a[b_idx, embed_ind]
-                obj_on_b   = obj_on_b[b_idx, embed_ind]
-                mu_obj_on  = mu_obj_on[b_idx, embed_ind]
-                z_obj_on   = z_obj_on[b_idx, embed_ind]
-            if not self.interaction_depth and mu_depth is not None:
-                z_depth      = z_depth[b_idx, embed_ind]
-                mu_depth     = mu_depth[b_idx, embed_ind]
-                logvar_depth = logvar_depth[b_idx, embed_ind]
-
-        out_dict = {
-            'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'mu_tot': mu_tot,
-            'patch_id_embed': patch_id_embed,
-            'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
-            'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
-            'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
-            'kp_p': kp_p, 'var_kp': var_kp,
-            'z_base_var': z_base_var, 'total_var': total_var,
-            'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
-            'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score
-        }
-        return out_dict
-
-
-    def sample_gauss(self, mu, logvar, deterministic, interaction_features):
-        if deterministic or interaction_features or (logvar is None):
-            return mu
-        return reparameterize(mu, logvar)
-
-    def sample_categorical_logits(self, logits, deterministic, n_cat, n_cls):
-        # logits: [..., n_cat*n_cls]
-        shape = logits.shape
-        probs = logits.view(*shape[:-1], n_cat, n_cls).softmax(dim=-1)
-        if deterministic:
-            idx = torch.argmax(probs.view(-1, n_cls), dim=-1, keepdim=True)    # [M,1]
-            onehot = F.one_hot(idx.squeeze(-1), num_classes=n_cls)
-            onehot = onehot.view(*probs.shape).to(logits.dtype)
-        else:
-            # multinomial over the last dim (classes) per category
-            draws = torch.multinomial(
-                probs.view(-1, n_cls), num_samples=1, replacement=True
-            )  # [M,1]
-            onehot = F.one_hot(draws.squeeze(-1), num_classes=n_cls)
-            onehot = onehot.view(*probs.shape).to(logits.dtype)
-        # straight-through
-        st = onehot.detach() + (probs - probs.detach())
-        return st.view(*shape)  # back to [..., n_cat*n_cls]
-
-    def gate_with_null(self, mu, gate, null_embed):
-        # gate: broadcastable zeros/ones
-        if null_embed is None:
-            return mu  # no-op if you didn't set one
-        if null_embed.shape[-1] != mu.shape[-1]:
-            pad = mu.new_zeros(*null_embed.shape[:-1], mu.shape[-1] - null_embed.shape[-1])
-            null_embed = torch.cat([null_embed, pad], dim=-1)
-        return gate * mu + (1.0 - gate) * null_embed
-    def encode_appearance(self,
-                        points,                # [B, N, 3(+F)]
-                        z,                     # [B, K, 3]  (keypoint centers)
-                        z_scale,               # [B, K, 3]  (logits; optional – can pass None)
-                        deterministic=False,
-                        obj_on=None,           # [B, K] or [B, K, 1]
-                        mask_pc=None):         # [B, N] (bool) True=valid
-
-        """
-        Point-cloud wrapper for appearance encoding.
-
-        - Delegates to self.particle_features_enc (your ParticleFeaturesEncoderPoint).
-        - That module already handles:
-            * KNN neighborhood gathering
-            * 3D "spatial transform" via translate+scale into canonical cube
-            * PointNet-like encoding + pooling
-            * optional obj_on gating (using its own null_feature_embed)
-            * sampling (unless interaction_features=True)
-        - We simply standardize the returned dict to mirror the 2D contract.
-        """
-
-        enc_out = self.particle_features_enc(
-            points=points,
-            kp=z,
-            z_scale=z_scale,
-            deterministic=deterministic,
-            obj_on=obj_on,
-            mask=mask_pc
-        )
-
-        mu_features     = enc_out['mu_features']            # [B,K,F]
-        logvar_features = enc_out['logvar_features']        # [B,K,F] or None
-        z_features      = enc_out['z_features']             # [B,K,F]
-
-
-        return {
-            'mu_features':           mu_features,
-            'logvar_features':       logvar_features,
-            'z_features':            z_features,
-            'mu_features_total':     mu_features,
-            'logvar_features_total': logvar_features,
-            'z_features_total':      z_features,
-        }
-
-
-    def encode_all(self,
-                points: torch.Tensor,           # [B, N, 3(+F)]
-                mask_pc: torch.Tensor = None,   # [B, N] (bool) True=valid
-                deterministic: bool = False,
-                warmup: bool = False):
-        """
-        Single-frame point-cloud pipeline:
-        1) use prior to propose object centers (and scale logits) from points
-        2) optionally variance-filter down to n_kp_dec when interaction_features+null_embed is on
-        3) encode per-object appearance with the point-based encoder
-        4) return a simple, self-contained dict (no time dims, no 2D crop artifacts)
-
-        Expected keys from encode_pos_scale_with_prior():
-        'kp_p'         : [B, Kp, 3]        prior keypoint proposals (in [-1,1]^3)
-        'var_kp'       : [B, Kp, 3 or 6]   per-kp uncertainty (shape is whatever your SSM3D returns)
-        'z_base'       : [B, Kp, 3]        anchor positions (same as kp_p if you set it that way)
-        'mu_offset'    : [B, Kp, 3]
-        'logvar_offset': [B, Kp, 3]
-        'z_offset'     : [B, Kp, 3]
-        'mu_tot'       : [B, Kp, 3]        (anchor + offset)
-        'z'            : [B, Kp, 3]        sampled positions
-        'mu_scale'     : [B, Kp, 3]        scale logits (or params)
-        'logvar_scale' : [B, Kp, 3] or None
-        'z_scale'      : [B, Kp, 3]        sampled scale logits (or params)
-        'z_base_var'   : [B, Kp, Dv]       variance features used for filtering
-        ... (any extras are passed through)
-        """
-        assert points.dim() == 3 and points.size(-1) >= 3, \
-            f"expected [B,N,3(+F)], got {tuple(points.shape)}"
-        if mask_pc is not None:
-            assert mask_pc.shape[:2] == points.shape[:2], \
-                f"mask_pc must be [B,N], got {tuple(mask_pc.shape)}"
-
-        B = points.size(0)
-
-        # 1) stage-1: positions & scales from prior
-        s1 = self.encode_pos_scale_with_prior(points,
-                                            mask=mask_pc,
-                                            deterministic=deterministic,
-                                            warmup=warmup)
-
-        # unpack what we actually use downstream
-        kp_p        = s1['kp_p']          # [B,Kp,3]
-        var_kp      = s1['var_kp']        # [B,Kp,*]
-        z_base      = s1['z_base']        # [B,Kp,3]
-        z           = s1['z']             # [B,Kp,3]
-        mu_tot      = s1['mu_tot']        # [B,Kp,3]
-        z_base_var  = s1['z_base_var']    # [B,Kp,Dv]
-        mu_scale    = s1['mu_scale']      # [B,Kp,3]
-        logvar_scale= s1.get('logvar_scale', None)
-        z_scale     = s1['z_scale']       # [B,Kp,3]
-
-        # 2) optional variance-based filtering when you plan to encode fewer particles later
-        #    (keeps the API you had: only when interaction_features && null_embed)
-        if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
-            total_var = z_base_var.sum(-1)                      # [B,Kp]
-            n_filter  = self.n_kp_dec if not warmup else min(self.n_kp_dec,
-                                                            int(self.warmup_n_kp_ratio * self.n_kp_enc))
-            _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)  # [B,n_filter]
-            batch_idx = torch.arange(B, device=points.device)[:, None]              # [B,1]
-
-            # select the subset for the appearance stage
-            z_app       = z[batch_idx, keep_idx].contiguous()         # [B,n_filter,3]
-            z_scale_app = z_scale[batch_idx, keep_idx].contiguous()   # [B,n_filter,3]
-
-            # 3) stage-2: appearance on selected subset
-            s2 = self.encode_appearance(points, z_app, z_scale_app,
-                                        deterministic=deterministic,
-                                        obj_on=None,
-                                        mask_pc=mask_pc)
-
-            # scatter back into full Kp slots using nulls
-            Fdim = s2['mu_features'].size(-1)
-            mu_features_full     = self.null_feature_embed.repeat(B, self.n_kp_enc, 1) \
-                                if self.use_null_features_embed else \
-                                torch.zeros(B, self.n_kp_enc, Fdim, device=points.device)
-            z_features_full      = mu_features_full.clone()
-            logvar_features_full = None if s2['logvar_features'] is None else \
-                                torch.zeros(B, self.n_kp_enc, Fdim, device=points.device)
-
-            mu_features_full[batch_idx, keep_idx] = s2['mu_features']
-            z_features_full[batch_idx, keep_idx]  = s2['z_features']
-            if logvar_features_full is not None:
-                logvar_features_full[batch_idx, keep_idx] = s2['logvar_features']
-
-            # also trim all stage-1 arrays to n_kp_enc for consistency
-            take = keep_idx
-            z           = z[batch_idx, take]
-            z_scale     = z_scale[batch_idx, take]
-            z_base      = z_base[batch_idx, take]
-            mu_tot      = mu_tot[batch_idx, take]
-            kp_p        = kp_p[batch_idx, take]
-            var_kp      = var_kp[batch_idx, take]
-            z_base_var  = z_base_var[batch_idx, take]
-            mu_scale    = mu_scale[batch_idx, take]
-            if logvar_scale is not None:
-                logvar_scale = logvar_scale[batch_idx, take]
-
-            mu_features     = mu_features_full
-            z_features      = z_features_full
-            logvar_features = logvar_features_full
-
-        else:
-            # 3) stage-2: appearance for all particles chosen by stage-1
-            s2 = self.encode_appearance(points, z, z_scale,
-                                        deterministic=deterministic,
-                                        obj_on=None,
-                                        mask_pc=mask_pc)
-            mu_features     = s2['mu_features']           # [B,Kp,F]
-            logvar_features = s2['logvar_features']       # [B,Kp,F] or None
-            z_features      = s2['z_features']            # [B,Kp,F]
-
-        # final, compact, point-cloud-first dict
-        return {
-            # positions
-            'pos_anchor':   z_base,           # [B,K,3]   (anchor from prior)
-            'pos':          z,                # [B,K,3]   (sampled / refined)
-            'pos_mu':       mu_tot,           # [B,K,3]   (mean after offset)
-            'pos_logvar':   s1['logvar_offset'],  # [B,K,3]  (if you keep it)
-
-            # scales
-            'scale_mu':     mu_scale,         # [B,K,3]
-            'scale_logvar': logvar_scale,     # [B,K,3] or None
-            'scale':        z_scale,          # [B,K,3]
-
-            # features
-            'feat_mu':      mu_features,      # [B,K,F]
-            'feat_logvar':  logvar_features,  # [B,K,F] or None
-            'feat':         z_features,       # [B,K,F]
-
-            # prior proposal info
-            'kp_prior':     kp_p,             # [B,K,3]
-            'kp_var':       var_kp,           # [B,K,*]
-            'kp_score':     z_base_var.sum(-1, keepdim=True),  # [B,K,1] simple confidence proxy
-
-            # anything else you want to pass through from stage-1:
-            # e.g., 'obj_on_*', 'mu_depth', etc., if your 3D stack produces them.
-        }
-
-
-    def forward(self, x, mask, deterministic=False, warmup=False):
-        output_dict = self.encode_all(x, mask, deterministic, warmup)
-        return output_dict
-
-
 class DLPEncoder(nn.Module):
     def __init__(self,
                  # Input configuration
@@ -4423,20 +3669,19 @@ class DLPEncoder(nn.Module):
                                             init_conv_fg_std=init_conv_fg_std,
                                             separate_depth_features=separate_depth_features,
                                             depth_feature_dim=depth_feature_dim)
-
+        extra_point_feats = 0 # TODO: link this up with the verison in particle Encoder and make them all come form the same config
         self.prior_encoder = self.particle_enc.prior_encoder
-        self.bg_encoder = BgEncoder(cdim=cdim, image_size=image_size, pad_mode=pad_mode,
-                                    learned_feature_dim=learned_bg_feature_dim, use_resblock=use_resblock,
-                                    ch_mult=bg_ch_mult, base_ch=bg_base_ch, final_cnn_ch=bg_final_cnn_ch,
-                                    num_res_blocks=num_res_blocks, interaction_features=interaction_features,
-                                    cnn_mid_blocks=cnn_mid_blocks, mlp_hidden_dim=mlp_hidden_dim,
-                                    timestep_horizon=timestep_horizon,
-                                    add_particle_temp_embed=self.add_particle_temp_embed,
-                                    features_dist=self.features_dist, n_bg_categories=n_bg_categories,
-                                    n_bg_classes=n_bg_classes,
-                                    init_zero_bias=init_zero_bias,
-                                    init_conv_layers=init_conv_layers,
-                                    init_conv_bg_std=init_conv_bg_std)
+        self.bg_encoder = BgEncoderPC(
+            feature_dim=learned_bg_feature_dim,
+            in_feat=extra_point_feats,           # 0 if only xyz
+            hidden=128,
+            pool="max",
+            features_dist="gauss",
+            interaction_features=False,
+            timestep_horizon=self.timestep_horizon,
+            add_particle_temp_embed=False,       # set True if you actually use timesteps>1
+            output_logvar=True,
+        )
 
         # patch_centers = self.prior_encoder.get_patch_centers().unsqueeze(0) * (
         #         self.kp_range[1] - self.kp_range[0]) + self.kp_range[0]
@@ -4545,261 +3790,190 @@ class DLPEncoder(nn.Module):
                 # use pytorch's default
                 pass
 
-    def get_bg_mask_from_particle_glimpses(self, z, z_obj_on, mask_size, z_scale=None, detach_grad=True):
+    @torch.no_grad()
+    def make_bg_mask_from_anchors(
+        self,
+        points: torch.Tensor,        # [B, N, 3]
+        anchors: torch.Tensor,       # [B, K, 3]
+        scales: torch.Tensor = None, # [B, K, 3] logits or None
+        mask_pc: torch.Tensor = None,# [B, N] or None (True=valid)
+        r_base: float = 0.25,        # base sphere radius in normalized coords
+        r_mult: float = 1.5,         # widen factor
+        gate: torch.Tensor = None,   # [B, K] or [B, K, 1] optional obj_on gate in [0,1]
+        clamp_min_points: bool = True
+    ) -> torch.Tensor:
         """
-        generates a mask based on particles position and the scale. Masks are squares.
-        """
-        if detach_grad:
-            with torch.no_grad():
-                if z_scale is None:
-                    obj_fmap_masks = create_masks_fast(z.detach(), anchor_s=self.anchor_s, feature_dim=mask_size)
-                else:
-                    obj_fmap_masks = create_masks_with_scale(z.detach(), anchor_s=self.anchor_s, image_size=mask_size,
-                                                             scale=z_scale.detach())
-                z_gate = torch.where(z_obj_on.detach() > 0.2, 1.0, 0.0)[:, :, None, None, None]
-                obj_fmap_masks = obj_fmap_masks.clamp(0, 1) * z_gate
-                # obj_fmap_masks = obj_fmap_masks.clamp(0, 1) * z_obj_on[:, :, None, None, None].detach()
-                bg_mask = 1 - obj_fmap_masks.squeeze(2).sum(1, keepdim=True).clamp(0, 1)
-        else:
-            with torch.no_grad():
-                if z_scale is None:
-                    obj_fmap_masks = create_masks_fast(z, anchor_s=self.anchor_s, feature_dim=mask_size)
-                else:
-                    obj_fmap_masks = create_masks_with_scale(z, anchor_s=self.anchor_s, image_size=mask_size,
-                                                             scale=z_scale)
-            obj_fmap_masks = obj_fmap_masks.clamp(0, 1) * z_obj_on[:, :, None, None, None]
-            bg_mask = 1 - obj_fmap_masks.squeeze(2).sum(1, keepdim=True).clamp(0, 1)
-        return bg_mask
+        Build a per-point background mask: True means background (not inside any particle sphere).
+        Sphere radius per particle: r = r_base * r_mult * s,
+        where s = mean(sigmoid(scales), dim=-1) if scales is provided, else 1.0.
 
-    def encode_all(self, x, mask_pc, deterministic=False, warmup=False, actions=None, actions_mask=None, lang_embed=None,
-                   x_goal=None, deterministic_goal=True):
+        If gate is provided (e.g., obj_on), we scale the effective radius by gate∈[0,1]
+        so "off" particles don't carve out background.
         """
-        encoding steps:
-        1. encode bg: x -> bg_enc -> [bs * T, projection_dim]
-        2. encode patches: x -> patch_enc -> [bs * T, n_patches, projection_dim ]
-        3. encode particles: [patches, bg, particle_tokens, bg_token, ctx_token] -> pte -> [bs, T, n_particles + 2, dim]
+        assert points.dim() == 3 and points.size(-1) == 3, f"points must be [B,N,3], got {tuple(points.shape)}"
+        assert anchors.dim() == 3 and anchors.size(-1) == 3, f"anchors must be [B,K,3], got {tuple(anchors.shape)}"
+        B, N, _ = points.shape
+        K = anchors.size(1)
+        device = points.device
+
+        if mask_pc is None:
+            mask_pc = torch.ones(B, N, dtype=torch.bool, device=device)
+
+        # scale -> radius per particle
+        if scales is not None:
+            s = torch.sigmoid(scales).mean(dim=-1, keepdim=False)  # [B,K]
+        else:
+            s = torch.ones(B, K, device=device)
+
+        r = r_base * r_mult * s  # [B,K]
+
+        # optional obj_on gate
+        if gate is not None:
+            if gate.dim() == 3: gate = gate.squeeze(-1)
+            # shrink radius when gate is small
+            r = r * gate.clamp(0, 1)
+
+        # pairwise distances points↔anchors
+        # d2: [B, N, K]
+        d2 = torch.cdist(points, anchors) ** 2
+
+        # inside any sphere?
+        r2 = (r ** 2).unsqueeze(1)             # [B, 1, K]
+        inside_any = (d2 <= r2).any(dim=-1)    # [B, N]
+
+        # background = valid points AND not inside any fg sphere
+        bg_mask = (~inside_any) & mask_pc
+
+        if clamp_min_points:
+            # corner case: if a batch has 0 background points (very crowded),
+            # keep at least something valid so downstream code doesn't explode.
+            no_bg = (bg_mask.sum(dim=1) == 0)  # [B]
+            if no_bg.any():
+                # flip the farthest point from all anchors to background
+                # heuristic: use min distance to anchors and pick argmax
+                min_d2 = d2.min(dim=-1).values  # [B,N]
+                idx = min_d2.argmax(dim=-1)     # [B]
+                for b in torch.nonzero(no_bg, as_tuple=False).flatten():
+                    bg_mask[b, idx[b]] = True
+
+        return bg_mask  # [B,N] boolean
+
+
+    def encode_all(self,
+                x: torch.Tensor,                  # [B,N,3(+F)]
+                mask_pc: torch.Tensor = None,     # [B,N] (bool) True=valid
+                deterministic: bool = False,
+                warmup: bool = False,
+                actions=None, actions_mask=None, lang_embed=None,
+                x_goal=None, deterministic_goal=True):
         """
-        # make sure x is [bs, T, ch, h, w]
-        assert x.dim() == 3 and x.size(-1) == 3, f"expected points [B,N,3], got {tuple(x.shape)}"
+        Point-cloud, single-frame DLPEncoder:
+        1) particle encoding (prior -> attributes -> appearance)
+        2) optional BG encoding (with PC mask derived from particle anchors/scales)
+        3) pack a flat dict; no time dims
+        """
+        assert x.dim() == 3 and x.size(-1) >= 3, f"expected points [B,N,>=3], got {tuple(x.shape)}"
         if mask_pc is not None:
-            assert mask_pc.dim() == 2 and mask_pc.shape == x.shape[:2], \
+            assert mask_pc.dim() == 2 and mask_pc.shape[:2] == x.shape[:2], \
                 f"mask_pc must be [B,N], got {tuple(mask_pc.shape)}"
+        B = x.size(0)
 
-        # x = x.view(bs * timestep_horizon, *x.shape[2:])  # [bs * T, ch, h, w]
-        # encode particles +++++++
-        particle_dict = self.particle_enc(x, mask_pc, deterministic, warmup)
-        # unpack
-        kp_p = particle_dict['kp_p']
-        var_kp = particle_dict['var_kp']
-        patch_id_embed = particle_dict['patch_id_embed']
-        z_base = particle_dict['z_base']
-        z = particle_dict['z']
-        mu_offset = particle_dict['mu_offset']
-        logvar_offset = particle_dict['logvar_offset']
-        z_offset = particle_dict['z_offset']
-        mu_tot = particle_dict['mu_tot']
-        z_base_var = particle_dict['z_base_var']
-        mu_scale = particle_dict['mu_scale']
-        logvar_scale = particle_dict['logvar_scale']
-        z_scale = particle_dict['z_scale']
-        mu_depth = particle_dict['mu_depth']
-        logvar_depth = particle_dict['logvar_depth']
-        z_depth = particle_dict['z_depth']
-        obj_on_a = particle_dict['obj_on_a']
-        obj_on_b = particle_dict['obj_on_b']
-        mu_obj_on = particle_dict['mu_obj_on']
-        z_obj_on = particle_dict['z_obj_on']
-        mu_features = particle_dict['mu_features']
-        mu_depth_features = particle_dict['mu_depth_features']
-        logvar_features = particle_dict['logvar_features']
-        logvar_depth_features = particle_dict['logvar_depth_features']
-        z_features = particle_dict['z_features']
-        z_depth_features = particle_dict['z_depth_features']
-        cropped_objects = particle_dict['cropped_objects']
+        # ---- 1) particles ----
+        # your ParticleEncoder(PC) returns the compact PC dict we agreed on
+        p = self.particle_enc(x, mask_pc, deterministic=deterministic, warmup=warmup)
 
-        z_score = particle_dict['z_score']
-        mu_score = particle_dict['mu_score']
-        logvar_score = particle_dict['logvar_score']
+        # unify mandatory bits
+        z_base       = p.get('pos_anchor', p.get('z_base'))        # [B,K,3]
+        z            = p.get('pos',        p.get('z'))             # [B,K,3]
+        mu_tot       = p.get('pos_mu',     p.get('mu_tot', z))     # [B,K,3]
+        pos_logvar   = p.get('pos_logvar', p.get('logvar_offset',
+                        torch.zeros_like(z)))                    # [B,K,3]
 
-        if x_goal is not None and deterministic_goal:
-            z = torch.cat([z[:, :-1], mu_tot[:, -1:]], dim=1)
-            if z_obj_on is not None:
-                z_obj_on = torch.cat([z_obj_on[:, :-1], Beta(obj_on_a[:, -1:], obj_on_b[:, -1:]).mean], dim=1)
-            z_scale = torch.cat([z_scale[:, :-1], mu_scale[:, -1:]], dim=1)
-            if z_depth is not None:
-                z_depth = torch.cat([z_depth[:, :-1], mu_depth[:, -1:]], dim=1)
-            if not self.interaction_features:
-                z_features = torch.cat([z_features[:, :-1], mu_features[:, -1:]], dim=1)
+        z_scale      = p.get('scale',      p.get('z_scale'))       # [B,K,3]
+        mu_scale     = p.get('scale_mu',   p.get('mu_scale', z_scale))
+        logvar_scale = p.get('scale_logvar', p.get('logvar_scale', None))
 
-        # +++++++ encode bg +++++++
-        # x = x.view(bs * timestep_horizon, *x.shape[2:])  # [bs * T, ch, h, w]
-        x = x.view(-1, *x.shape[2:])  # [bs * T, ch, h, w]
-        z_v = z.view(-1, *z.shape[2:])
-        if self.n_kp_dec != self.n_kp_enc:
-            # variance filtering
-            total_var = z_base_var.view(-1, *z_base_var.shape[2:]).sum(-1)
-            n_filter = self.n_kp_dec if not warmup else min(self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc))
-            _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
-            # make selection
-            batch_ind = torch.arange(z_v.shape[0], device=z_v.device)[:, None]
-            z_v = z_v[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+        z_features      = p.get('feat',       p.get('z_features', None))   # [B,K,F]
+        mu_features     = p.get('feat_mu',    p.get('mu_features', z_features))
+        logvar_features = p.get('feat_logvar', p.get('logvar_features', None))
 
-        if self.interaction_obj_on:
-            z_obj_on_v = torch.ones(-1, z_v.shape[1], device=x.device, dtype=torch.float)
-        else:
-            z_obj_on_v = z_obj_on.view(-1, *z_obj_on.shape[2:]).squeeze(-1)
-            if self.n_kp_dec != self.n_kp_enc:
-                z_obj_on_v = z_obj_on_v[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+        # prior metadata
+        kp_p        = p.get('kp_p',        p.get('kp_prior', None))        # [B,K,3]
+        var_kp      = p.get('kp_var',      p.get('var_kp',   None))        # [B,K,*]
+        z_base_var  = p.get('z_base_var',  None)                           # [B,K,?]
+        patch_id_embed = p.get('patch_id_embed', None)
 
+        # optional extras (pass-through)
+        z_obj_on    = p.get('z_obj_on', None)     # [B,K] or [B,K,1]
+        obj_on_a    = p.get('obj_on_a', None)
+        obj_on_b    = p.get('obj_on_b', None)
+        mu_obj_on   = p.get('mu_obj_on', None)
+
+        mu_depth     = p.get('mu_depth', None)
+        logvar_depth = p.get('logvar_depth', None)
+        z_depth      = p.get('z_depth', None)
+
+        # ---- 2) background (optional) ----
+        mu_bg_features = logvar_bg_features = z_bg_features = None
+        
+        # build a PC bg mask from anchors/scales if helper exists on this class
         if self.mask_bg_in_enc:
-            bg_enc_mask = self.get_bg_mask_from_particle_glimpses(z_v, z_obj_on_v, mask_size=x.shape[-1])
-            bg_dict = self.bg_encoder(x, bg_enc_mask, deterministic, timestep_horizon)
+            bg_mask_pc = self.make_bg_mask_from_anchors(
+                x,
+                anchors=z,            # [B,K,3]
+                scales=z_scale,       # [B,K,3] (logits/params; your helper should know how to treat them)
+                mask_pc=mask_pc,
+                r_base=getattr(self, 'bg_r_base', 0.25),
+                r_mult=getattr(self, 'bg_r_mult', 1.5),
+                gate=z_obj_on         # optional gating per kp
+            )
         else:
-            bg_enc_mask = None
-            bg_dict = self.bg_encoder(x, None, deterministic, timestep_horizon)  # unmasked bg
-        mu_bg_features = bg_dict['mu_bg']
-        mu_bg_features = mu_bg_features.view(bs, -1, mu_bg_features.shape[-1])
-        logvar_bg_features = bg_dict['logvar_bg']
-        if logvar_bg_features is not None:
-            logvar_bg_features = logvar_bg_features.view(bs, -1, logvar_bg_features.shape[-1])
-        z_bg_features = bg_dict['z_bg']
-        z_bg_features = z_bg_features.view(bs, -1, z_bg_features.shape[-1])
-        if x_goal is not None and deterministic_goal and not self.interaction_features:
-            z_bg_features = torch.cat([z_bg_features[:, :-1], mu_bg_features[:, -1:]], dim=1)
+            bg_mask_pc = None
 
-        if self.use_particle_inter_enc:
-            z_in_inter = z_base + z_offset  # so we can detach z_base (ssm) if more stable
-            inter_dict = self.particle_inter_enc(x, z_in_inter, z_scale, z_obj_on, z_depth, z_features, z_bg_features,
-                                                 z_base_var, z_score, patch_id_embed,
-                                                 deterministic=deterministic, warmup=warmup)
-            if self.interaction_features:
-                mu_features = inter_dict['mu_features']
-                logvar_features = inter_dict['logvar_features']
-                z_features = inter_dict['z_features']
+        # BgEncoderPC forward signature should accept (points, mask, bg_mask, deterministic)
+        bg_out = self.bg_encoder(x, mask=mask_pc, bg_mask=bg_mask_pc, deterministic=deterministic)
+        mu_bg_features   = bg_out['mu_bg']
+        logvar_bg_features = bg_out.get('logvar_bg', None)
+        z_bg_features    = bg_out['z_bg']
 
-                if x_goal is not None and deterministic_goal:
-                    z_features = torch.cat([z_features[:, :-1], mu_features[:, -1:]], dim=1)
+        # ---- 3) pack & return ----
+        return {
+            # positions
+            'z_base': z_base,                  # [B,K,3] anchor/proposal
+            'z':      z,                       # [B,K,3] refined/sample
+            'mu_tot': mu_tot,                  # [B,K,3] mean after offset
+            'logvar_offset': pos_logvar,       # [B,K,3] (kept name for compat)
 
-                if inter_dict.get('mu_bg_features') is not None:
-                    mu_bg_features = inter_dict['mu_bg_features']
-                    logvar_bg_features = inter_dict['logvar_bg_features']
-                    z_bg_features = inter_dict['z_bg_features']
+            # scales
+            'z_scale':      z_scale,           # [B,K,3]
+            'mu_scale':     mu_scale,          # [B,K,3]
+            'logvar_scale': logvar_scale,      # [B,K,3] or None
 
-                    if x_goal is not None and deterministic_goal:
-                        z_bg_features = torch.cat([z_bg_features[:, :-1], mu_bg_features[:, -1:]], dim=1)
-            if self.interaction_obj_on:
-                obj_on_a = inter_dict['obj_on_a']
-                obj_on_b = inter_dict['obj_on_b']
-                mu_obj_on = inter_dict['mu_obj_on']
-                z_obj_on = inter_dict['z_obj_on']
-                if x_goal is not None and deterministic_goal:
-                    z_obj_on = torch.cat([z_obj_on[:, :-1], Beta(obj_on_a[:, -1:], obj_on_b[:, -1:]).mean], dim=1)
-            if self.interaction_depth:
-                mu_depth = inter_dict['mu_depth']
-                logvar_depth = inter_dict['logvar_depth']
-                z_depth = inter_dict['z_depth']
+            # features
+            'z_features':       z_features,    # [B,K,F]
+            'mu_features':      mu_features,   # [B,K,F]
+            'logvar_features':  logvar_features,  # [B,K,F] or None
 
-                if x_goal is not None and deterministic_goal:
-                    z_depth = torch.cat([z_depth[:, :-1], mu_depth[:, -1:]], dim=1)
+            # prior proposal metadata
+            'kp_p':        kp_p,               # [B,K,3]
+            'var_kp':      var_kp,             # [B,K,*]
+            'z_base_var':  z_base_var,         # [B,K,?]
+            'patch_id_embed': patch_id_embed,
 
-        if self.use_ctx_enc:
-            z_in_ctx = z_base + z_offset  # so we can detach z_base (ssm) if more stable
-            if x_goal is not None and deterministic_goal:
-                z_in_ctx = torch.cat([z_in_ctx[:, :-1], mu_tot[:, -1:]], dim=1)
-            z_scale_in_ctx = z_scale
-            z_obj_on_in_ctx = z_obj_on
-            z_depth_in_ctx = z_depth
-            z_features_in_ctx = z_features
-            z_bg_features_in_ctx = z_bg_features
+            'z_obj_on':    z_obj_on,
+            'obj_on_a':    obj_on_a,
+            'obj_on_b':    obj_on_b,
+            'mu_obj_on':   mu_obj_on,
+            'mu_depth':    mu_depth,
+            'logvar_depth':logvar_depth,
+            'z_depth':     z_depth,
 
-            ctx_dict = self.ctx_enc(z_in_ctx, z_scale_in_ctx, z_obj_on_in_ctx, z_depth_in_ctx,
-                                    z_features_in_ctx, z_bg_features_in_ctx, z_base_var,
-                                    z_score, patch_id_embed, deterministic=deterministic, warmup=warmup,
-                                    actions=actions, actions_mask=actions_mask, lang_embed=lang_embed)
-            z_goal_proj = ctx_dict['z_goal_proj']
-            # global context
-            mu_context_global = ctx_dict['mu_context_global']
-            logvar_context_global = ctx_dict['logvar_context_global']
-            z_context_global = ctx_dict['z_context_global']
+            'mu_bg_features':    mu_bg_features,
+            'logvar_bg_features':logvar_bg_features,
+            'z_bg_features':     z_bg_features,
+        }
 
-            mu_context_global_dyn = ctx_dict['mu_context_global_dyn']
-            logvar_context_global_dyn = ctx_dict['logvar_context_global_dyn']
-            z_context_global_dyn = ctx_dict['z_context_global_dyn']
 
-            # local context
-            mu_context = ctx_dict['mu_context']
-            logvar_context = ctx_dict['logvar_context']
-            z_context = ctx_dict['z_context']
-
-            mu_context_dyn = ctx_dict['mu_context_dyn']
-            logvar_context_dyn = ctx_dict['logvar_context_dyn']
-            z_context_dyn = ctx_dict['z_context_dyn']
-        else:
-            mu_context_global = logvar_context_global = z_context_global = None
-            mu_context_global_dyn = logvar_context_global_dyn = z_context_global_dyn = None
-            mu_context = logvar_context = z_context = None
-            mu_context_dyn = logvar_context_dyn = z_context_dyn = None
-            z_goal_proj = None
-
-        if x_goal is not None:
-            # remove last timestep
-            z_base = z_base[:, :-1].contiguous()
-            z = z[:, :-1].contiguous()
-            mu_offset = mu_offset[:, :-1].contiguous()
-            logvar_offset = logvar_offset[:, :-1].contiguous()
-            z_offset = z_offset[:, :-1].contiguous()
-            mu_tot = mu_tot[:, :-1].contiguous()
-            mu_features = mu_features[:, :-1].contiguous()
-            logvar_features = logvar_features[:, :-1].contiguous()
-            z_features = z_features[:, :-1].contiguous()
-            mu_bg_features = mu_bg_features[:, :-1].contiguous()
-            logvar_bg_features = logvar_bg_features[:, :-1].contiguous()
-            z_bg_features = z_bg_features[:, :-1].contiguous()
-            obj_on_a = obj_on_a[:, :-1].contiguous()
-            obj_on_b = obj_on_b[:, :-1].contiguous()
-            z_obj_on = z_obj_on[:, :-1].contiguous()
-            if mu_obj_on is not None:
-                mu_obj_on = mu_obj_on[:, :-1].contiguous()
-            z_base_var = z_base_var[:, :-1].contiguous()
-            mu_depth = mu_depth[:, :-1].contiguous()
-            logvar_depth = logvar_depth[:, :-1].contiguous()
-            z_depth = z_depth[:, :-1].contiguous()
-            mu_scale = mu_scale[:, :-1].contiguous()
-            logvar_scale = logvar_scale[:, :-1].contiguous()
-            z_scale = z_scale[:, :-1].contiguous()
-            kp_p = kp_p.view(bs, -1, *kp_p.shape[1:])[:, :-1].reshape(-1, *kp_p.shape[1:])  # orig: [bs * T, N, 2]
-            var_kp = var_kp.view(bs, -1, *var_kp.shape[1:])[:, :-1].reshape(-1,
-                                                                            *var_kp.shape[1:])  # orig: [bs * T, N, 2]
-            bg_enc_mask = bg_enc_mask.view(bs, -1, *bg_enc_mask.shape[1:])[:, :-1].reshape(-1, *bg_enc_mask.shape[
-                1:])  # orig: [bs * t, 1, im_size, im_size]
-            mu_score = mu_score[:, :-1].contiguous()
-            logvar_score = logvar_score[:, :-1].contiguous()
-            z_score = z_score[:, :-1].contiguous()
-        # TODO: Make sure all the necessary information from the depth encoding is returned and USED
-        encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
-                       'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
-                       'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
-                       'z_depth_features': z_depth_features, 'mu_depth_features': mu_depth_features, 'logvar_depth_features': logvar_depth_features,
-                       'mu_bg_features': mu_bg_features, 'logvar_bg_features': logvar_bg_features,
-                       'z_bg_features': z_bg_features, 'mu_context': mu_context, 'logvar_context': logvar_context,
-                       'z_context': z_context,
-                       'mu_context_global': mu_context_global, 'logvar_context_global': logvar_context_global,
-                       'z_context_global': z_context_global,
-                       'cropped_objects': cropped_objects.detach(), 'patch_id_embed': patch_id_embed,
-                       'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
-                       'z_base_var': z_base_var,
-                       'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
-                       'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
-                       'kp_p': kp_p, 'var_kp': var_kp, 'bg_enc_mask': bg_enc_mask,
-                       'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score,
-                       'mu_context_dyn': mu_context_dyn, 'logvar_context_dyn': logvar_context_dyn,
-                       'z_context_dyn': z_context_dyn,
-                       'mu_context_global_dyn': mu_context_global_dyn,
-                       'logvar_context_global_dyn': logvar_context_global_dyn,
-                       'z_context_global_dyn': z_context_global_dyn,
-                       'z_goal_proj': z_goal_proj
-                       }
-        return encode_dict
 
     def forward(self, x, mask_pc, deterministic=False, warmup=False, actions=None, actions_mask=None, lang_embed=None,
                 x_goal=None):
