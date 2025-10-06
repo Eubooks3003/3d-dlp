@@ -133,6 +133,9 @@ class GUILoad:
         self.ds_root = root
         self.image_size = image_size
 
+        if self.ds_name == "mimicgen":
+            self.cams = config['cams']
+
         if self.model_type == 'ddlp' or self.model_type == 'diffuse_ddlp':
             model_type = 'ddlp'
             self.model = ObjectDynamicsDLP(cdim=ch, enc_channels=enc_channels, prior_channels=prior_channels,

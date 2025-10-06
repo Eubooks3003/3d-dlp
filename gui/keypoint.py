@@ -203,10 +203,11 @@ class KeyPoint:
 
                 self.depth_slider = TickScale(
                     self.gui.root,
-                    from_=0.0, to=1.0,
+                    from_=0.0, to=20.0,
                     orient=tk.HORIZONTAL, length=150,
                     command=self.on_depth_value_change  # new callback
                 )
+                print("Initialized Features Depth as : ", self.features_depth)
                 self.depth_slider.set(self.features_depth)
                 self.depth_slider.grid(row=14, column=1)
 
@@ -281,7 +282,7 @@ class KeyPoint:
     def on_depth_value_change(self, val_str):
         v = float(val_str)
         # clamp
-        v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+        # v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
         self.features_depth = v
         for kp in self.gui.selected_keypoints:
             print("Setting depth feature to: ", v, " from: ", kp.features_depth)

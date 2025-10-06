@@ -26,7 +26,10 @@ def evaluate_validation_elbo(model, config, epoch, batch_size=100, recon_loss_ty
     ch = config['ch']  # image channels
     image_size = config['image_size']
     root = config['root']  # dataset root
-    dataset = get_image_dataset(ds, root, mode='valid', image_size=image_size)
+    cams = None
+    if ds == "mimicgen":
+        cams = config.get("cams", "robot0_eye_in_hand")  # which camera to use
+    dataset = get_image_dataset(ds, root, mode='valid', image_size=image_size, cams=cams)
     dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, drop_last=False)
     if recon_loss_func is None:
         if recon_loss_type == "vgg":

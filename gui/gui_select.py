@@ -16,6 +16,7 @@ from modules.diffusion_modules import PINTDenoiser, GaussianDiffusionPINT, Train
 
 from models import DLP
 from datasets.blender_ds import BlenderRGBD
+from datasets.mimicgen_ds import MimicGenRGBD
 
 from .keypoint import KeyPoint
 from gui.gui_load import GUILoad
@@ -44,21 +45,6 @@ class GUISelect(GUILoad):
             self.load_model()
 
             if self.model_type != 'diffuse_ddlp':
-                # locate example
-                # self.example_dir = f'./assets/{self.ds_name}'
-                # # self.example_dir = f'/media/newhd/data/obj3d/train'
-                # if not os.path.exists(self.example_dir):
-                #     raise SystemExit(f'Examples for dataset {self.ds_name} not found.'
-                #                      f' Please make sure to put each example in its own dir under {self.example_dir}.'
-                #                      f' For example: root -> assets > {self.example_dir} -> 1 -> *.png'
-                #                      f' The directory should include image files.')
-                # self.available_examples = os.listdir(self.example_dir)
-                # if len(self.available_examples) == 0:
-                #     raise SystemExit(f'Examples for dataset {self.ds_name} not found.'
-                #                      f' Please make sure to put each example in its own dir under {self.example_dir}.'
-                #                      f' For example: root -> assets > {self.example_dir} -> 1 -> *.png'
-                #                      f' The directory should include image files.')
-                # print(f'available examples: {self.available_examples}')
 
                 if not self.use_depth:
                     # example scroller
@@ -168,6 +154,8 @@ class GUISelect(GUILoad):
             obj_ons  = particle_dict['obj_on'][0].cpu().numpy()
             bg       = particle_dict['z_bg_features'][0].cpu().numpy()
             depth_features = particle_dict['z_depth_features'][0].cpu().numpy()
+
+            print("Depth Features: ", depth_features)
             context = particle_dict['z_context']
 
             # print the size of all the particle_dict entries above without 0 indexing
@@ -309,9 +297,11 @@ class GUISelect(GUILoad):
         self._reset_ui()
 
         # lazy-init ds
-        if not hasattr(self, "_blender_ds"):
-            self._blender_ds = BlenderRGBD(root=self.ds_root, mode="train", image_size=self.image_size)
-        ds = self._blender_ds
+        if self.ds_name == "blender":
+            ds = BlenderRGBD(root=self.ds_root, mode="train", image_size=self.image_size)
+        elif self.ds_name == "mimicgen":
+            ds = MimicGenRGBD(root=self.ds_root, mode = "train", image_size=self.image_size,cams=self.cams)
+        # ds = self._blender_ds
 
         # choose item
         s = str(choice)
@@ -325,6 +315,8 @@ class GUISelect(GUILoad):
         gid = int(gid_t.item()) if hasattr(gid_t, "item") else int(gid_t)
         x = x4chw.unsqueeze(0).float()                                   # [1,4,H,W]
         near, far = ds.depth_range
+
+        print("Near: ", near, " Far: ", far)
         if x[:, :3].max().item() > 1.5: x[:, :3] /= 255.0
         if far > near:
             x[:, 3:] = (x[:, 3:] - near) / (far - near); x[:, 3:].clamp_(0,1)
