@@ -741,11 +741,6 @@ class VoxelDLP(nn.Module):
 
         # CNN Architecture
         sections.append(create_section_header("CNN Architecture"))
-        if self.separate_depth_features:
-            object_cnn_shape = self.encoder_module.particle_enc.particle_features_enc_rgb.cnn_out_shape
-            # TODO: Include separate for depth as well
-        else:
-            object_cnn_shape = self.encoder_module.particle_enc.particle_features_enc.cnn_out_shape
         cnn_info = [
             ("Prior CNN Pre-pool Output Size", self.prior_module.enc3d.out_channels),
             ("Object CNN Output Shape", object),
@@ -762,14 +757,9 @@ class VoxelDLP(nn.Module):
                       + self.learned_bg_feature_dim
                       + context_coeff * self.context_dim)
 
-        if self.separate_depth_features:
-            sections.append(
-            format_row("RGB Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc_rgb.info))
-            sections.append(
-            format_row("Depth Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc_depth.info))
-        else:
-            sections.append(
-                format_row("Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc.info))
+
+        sections.append(
+            format_row("Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc.info))
         sections.append(format_row("Background Encoder", self.encoder_module.bg_encoder.info))
         # if self.encoder_module.particle_inter_enc is not None:
         #     sections.append(format_row("Particle Intermediate Encoder", self.encoder_module.particle_inter_enc.info))

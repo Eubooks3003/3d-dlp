@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from modules.point_cloud_modules.prior_encoder.grid_voxelizer import GridVoxelizer
+from modules.point_cloud_modules.DLPEncoder.prior_encoder.grid_voxelizer import GridVoxelizer
 from modules.point_cloud_modules.vision_modules_3d import Encoder3D
-from modules.point_cloud_modules.prior_encoder.SSM3D import AlternativeSpatialSoftmax3D
+from modules.point_cloud_modules.DLPEncoder.prior_encoder.SSM3D import AlternativeSpatialSoftmax3D
 
 
 class DLPPrior(nn.Module):
