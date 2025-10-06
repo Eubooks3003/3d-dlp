@@ -9,7 +9,8 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-from modules.point_cloud_modules import DLPEncoder, DLPDecoder, DLPContext
+# TODO: Fix this weird naming
+from modules.point_cloud_modules.point_cloud_modules import DLPEncoder, DLPDecoder, DLPContext
 from modules.modules import DLPDynamics
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
@@ -466,8 +467,8 @@ class VoxelDLP(nn.Module):
 
         # prior
         self.prior_module = self.encoder_module.prior_encoder
-        particle_anchors = self.encoder_module.patch_centers[:, :-1]  # [1, n_patches, 2], no need for (0,0)-the bg
-        particle_anchors = particle_anchors.unsqueeze(-2).repeat(1, 1, self.n_kp_per_patch, 1).view(1, -1, 2)
+        # particle_anchors = self.encoder_module.patch_centers[:, :-1]  # [1, n_patches, 2], no need for (0,0)-the bg
+        # particle_anchors = particle_anchors.unsqueeze(-2).repeat(1, 1, self.n_kp_per_patch, 1).view(1, -1, 2)
         # [1, n_patches * n_kp_per_patch, 2]
 
         # decoder
@@ -746,7 +747,7 @@ class VoxelDLP(nn.Module):
         else:
             object_cnn_shape = self.encoder_module.particle_enc.particle_features_enc.cnn_out_shape
         cnn_info = [
-            ("Prior CNN Pre-pool Output Size", self.prior_module.enc.conv_output_size),
+            ("Prior CNN Pre-pool Output Size", self.prior_module.enc3d.out_channels),
             ("Object CNN Output Shape", object),
             ("Background CNN Output Shape", self.encoder_module.bg_encoder.cnn_out_shape),
             ("Decoder Background Upsamples", self.decoder_module.num_bg_upsample),
@@ -770,8 +771,8 @@ class VoxelDLP(nn.Module):
             sections.append(
                 format_row("Encoder Particle Features", self.encoder_module.particle_enc.particle_features_enc.info))
         sections.append(format_row("Background Encoder", self.encoder_module.bg_encoder.info))
-        if self.encoder_module.particle_inter_enc is not None:
-            sections.append(format_row("Particle Intermediate Encoder", self.encoder_module.particle_inter_enc.info))
+        # if self.encoder_module.particle_inter_enc is not None:
+        #     sections.append(format_row("Particle Intermediate Encoder", self.encoder_module.particle_inter_enc.info))
         if self.separate_depth_features:
             sections.append(format_row("RGB Particle Decoder", self.decoder_module.particle_dec_rgb.info))
             sections.append(format_row("Depth Particle Decoder", self.decoder_module.particle_dec_depth.info))
@@ -841,7 +842,7 @@ class VoxelDLP(nn.Module):
         if len(x.shape) == 4:
             # that means x: [bs, ch, h, w]
             x = x.unsqueeze(1)  # -> [bs, T=1, ch, h, w]]
-        enc_dict = self.encoder_module(x, deterministic, warmup, actions=actions, actions_mask=actions_mask,
+        enc_dict = self.encoder_module(x, mask, deterministic, warmup, actions=actions, actions_mask=actions_mask,
                                        lang_embed=lang_embed, x_goal=x_goal)
         cropped_objects = enc_dict['cropped_objects']
         if self.normalize_rgb:

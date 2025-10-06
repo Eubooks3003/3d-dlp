@@ -284,17 +284,12 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
-            pts   = batch["points"].to(device)   # [B, N_max, C]
-            mask  = batch["mask"].to(device)     # [B, N_max]
-
-            # 2) add a time dim (T=1) so the model sees [B, T, ...]
-            #    If your PC encoder expects [B,T,N,C]:
-            x_pc = pts.unsqueeze(1)              # [B, 1, N_max, C]
-            m_pc = mask.unsqueeze(1)             # [B, 1, N_max]
+            pts  = batch["points"].to(device)   # [B, N, 3]
+            mask = batch["mask"].to(device) 
 
             warmup = (epoch < warmup_epoch)
             # forward pass
-            model_output = model(x_pc, m_pc, warmup=warmup, with_loss=True,
+            model_output = model(pts, mask, warmup=warmup, with_loss=True,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
@@ -643,6 +638,7 @@ if __name__ == "__main__":
                         help="dataset of to train the model on: ['traffic', 'clevrer', 'obj3d128', 'phyre']")
     args = parser.parse_args()
     ds = args.dataset
+    # TODO: Create a separate folder for PC configs since the params are pretty different
     if ds.endswith('json'):
         conf_path = ds
     else:
