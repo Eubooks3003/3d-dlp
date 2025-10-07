@@ -10,8 +10,9 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 # TODO: Fix this weird naming
-from modules.point_cloud_modules.point_cloud_modules import DLPDecoder, DLPContext
+from modules.point_cloud_modules.point_cloud_modules import DLPContext
 from modules.point_cloud_modules.DLPEncoder.dlp_encoder import DLPEncoder
+from modules.point_cloud_modules.DLPDecoder.dlp_decoder import DLPDecoder
 
 from modules.modules import DLPDynamics
 # util functions
