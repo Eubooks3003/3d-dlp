@@ -170,6 +170,8 @@ class ParticleEncoder(nn.Module):
         # --- Particle appearance/features (PointNet-like) ---
         output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
 
+        print("Output logvar for features: ", output_logvar)
+
         self.particle_features_enc = ParticleFeaturesEncoderPoint(
             anchor_size=anchor_s,                        # used to set canonical crop scale
             features_dim=learned_feature_dim,
@@ -527,6 +529,7 @@ class ParticleEncoder(nn.Module):
             mu_features     = mu_features_full
             z_features      = z_features_full
             logvar_features = logvar_features_full
+            print("Encoded appearance Logvar features is None? ", logvar_features is None)
         else:
             # ---- 3) stage-2: appearance for all proposals ----
             s2 = self.encode_appearance(points, z, z_scale,
@@ -536,6 +539,8 @@ class ParticleEncoder(nn.Module):
             mu_features     = s2['mu_features']           # [B,K,F]
             logvar_features = s2['logvar_features']       # [B,K,F] or None
             z_features      = s2['z_features']            # [B,K,F]
+
+            print("Encoded all appearance Logvar features is None? ", logvar_features is None)
 
         # ---- 4) final compact dict (point-cloud only; no BG) ----
         return {

@@ -12,6 +12,7 @@ from utils.util_func import reparameterize, spatial_transform, create_masks_fast
     modulate
 # modules
 from modules.vision_modules import Encoder, Decoder
+from modules.point_cloud_modules.DLPEncoder.particle_self_attn_transformer import RMSNorm
 
 # Prior
 """
@@ -76,47 +77,6 @@ class AlternativeSpatialSoftmaxKP(torch.nn.Module):
 """
 Normalization
 """
-
-
-class ParticleNorm(nn.Module):
-    """
-    experimental particle normalization module, not used in the code but left here for research
-    """
-
-    def __init__(self, particle_dim, eps=1e-8):
-        super().__init__()
-        self.eps = eps
-        self.particle_dim = particle_dim
-        self.a = nn.Parameter(torch.ones(1, 1, 1, self.particle_dim))
-        self.g = nn.Parameter(torch.ones(1, 1, 1, self.particle_dim))
-        self.s = nn.Parameter(torch.zeros(1, 1, 1, self.particle_dim))
-
-    def forward(self, x):
-        # [bs, n_particles, T, dim]
-        # if self.particle_dim > 1:
-        #     dims = (1, 3)
-        # else:
-        dims = (1,)
-        mean = x.mean(dim=dims, keepdim=True)
-        var = x.var(dim=dims, unbiased=False, keepdim=True)
-        if len(x.shape) == 3:
-            d_n = (x - self.a.squeeze(2) * mean) / (var + self.eps).sqrt()
-            out = d_n * self.g.squeeze(2) + self.s.squeeze(2)
-        else:
-            d_n = (x - self.a * mean) / (var + self.eps).sqrt()
-            out = d_n * self.g + self.s
-        return out
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.scale = dim ** 0.5
-        self.g = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        # F.normalize: x = x / (x ** 2).sum(-1, keepdim=True).sqrt()
-        return F.normalize(x, dim=-1) * self.scale * self.g
 
 
 """
@@ -973,96 +933,7 @@ class ParticleSpatioTemporalTransformer(nn.Module):
         return logits
 
 
-class ParticleSelfAttTransformer(nn.Module):
-    def __init__(self, n_embed, n_head, n_layer, block_size, output_dim, attn_pdrop=0.1, resid_pdrop=0.1,
-                 hidden_dim_multiplier=4, positional_bias=False, activation='gelu', max_particles=None,
-                 norm_type='rms', n_registers=0, init_std=0.02):
-        super().__init__()
-        self.positional_bias = positional_bias
-        self.max_particles = max_particles  # for positional bias
-        self.n_registers = n_registers  # "vision transformers need registers", balances the attention matrix
-        # input embedding stem
-        if self.positional_bias:
-            self.pos_emb = nn.Identity()
-        else:
-            self.pos_emb = nn.Parameter(init_std * torch.randn(1, block_size, n_embed))
-        if self.n_registers > 0:
-            self.registers = nn.Parameter(init_std * torch.randn(1, self.n_registers, 1, n_embed))
-        else:
-            self.registers = None
-        # transformer
-        self.blocks = nn.Sequential(*[SelfBlock(n_embed, n_head, block_size, attn_pdrop,
-                                                resid_pdrop, hidden_dim_multiplier,
-                                                positional_bias, activation=activation, max_particles=max_particles,
-                                                norm_type=norm_type)
-                                      for _ in range(n_layer)])
-        # decoder head
-        if norm_type == 'rms':
-            norm_layer = RMSNorm
-        elif norm_type == 'pn':
-            norm_layer = ParticleNorm
-        else:
-            norm_layer = nn.LayerNorm
-        self.ln_f = norm_layer(n_embed)
-        self.head = nn.Linear(n_embed, output_dim, bias=False)
 
-        self.block_size = block_size
-        self.n_embed = n_embed
-        self.n_layer = n_layer
-        # print(f"particle transformer # parameters: {sum(p.numel() for p in self.parameters())}")
-
-    def get_block_size(self):
-        return self.block_size
-
-    def init_weights(self):
-        # initialize layers
-        pass
-        # self.apply(self._init_weights)
-        # if self.positional_bias:
-        #     for m in self.blocks:
-        #         m.attn.rel_pos_bias.reset_parameters()
-
-    def _init_weights(self, module):
-        std = 0.02
-        if isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
-        # elif isinstance(module, ParticleTransformer):
-        #     if not self.positional_bias:
-        #         torch.nn.init.normal_(module.pos_emb, mean=0.0, std=std)
-
-    def forward(self, x):
-        # x: [b, t, n, f]
-        x = x.permute(0, 2, 1, 3)  # [b, n, t, f]
-        b, n, t, f = x.size()
-        # n is the number of particles
-        assert t <= self.block_size, f"Cannot forward, model block size is exhausted: t:{t}, block_size: {self.block_size}"
-        assert f == self.n_embed, "invalid particle feature dim"
-
-        if self.n_registers > 0 and self.registers is not None:
-            registers = self.registers.repeat(b, 1, t, 1)
-            x = torch.cat([x, registers], dim=1)  # [b, n+n_reg, t, f]
-
-        if not self.positional_bias:
-            position_embeddings = self.pos_emb[:, None, :t, :]
-            x = x + position_embeddings
-        for block in self.blocks:
-            x = block(x)
-        x = self.ln_f(x)
-        logits = self.head(x)
-        if self.n_registers > 0:
-            logits, _ = logits.split([logits.shape[1] - self.n_registers, self.n_registers], dim=1)
-        logits = logits.permute(0, 2, 1, 3)  # [b, t, n, f]
-
-        return logits
 
 
 class ParticleFeatureProjection(torch.nn.Module):

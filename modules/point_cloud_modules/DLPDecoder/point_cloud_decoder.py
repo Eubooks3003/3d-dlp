@@ -150,15 +150,15 @@ class PointCloudDecoderParticles(nn.Module):
             s = torch.exp(z_scale + scale_res)
 
         # ----- depth-aware modulation (optional) -----
-        # depth_factor in (min_depth_scale, 1]; farther -> closer to min_depth_scale
-        if z_depth is not None:
-            # flip sign so "larger depth" (farther) => smaller factor
-            depth_factor = self.min_depth_scale + (1.0 - self.min_depth_scale) * torch.sigmoid(-z_depth)  # [B,K,1]
-        else:
-            depth_factor = torch.ones(B, K, 1, device=device)
+        # # depth_factor in (min_depth_scale, 1]; farther -> closer to min_depth_scale
+        # if z_depth is not None:
+        #     # flip sign so "larger depth" (farther) => smaller factor
+        #     depth_factor = self.min_depth_scale + (1.0 - self.min_depth_scale) * torch.sigmoid(-z_depth)  # [B,K,1]
+        # else:
+        #     depth_factor = torch.ones(B, K, 1, device=device)
 
-        # apply depth to size (optional; comment out to disable)
-        s = s * depth_factor                                               # [B,K,3]
+        # # apply depth to size (optional; comment out to disable)
+        # s = s * depth_factor                                               # [B,K,3]
 
         p_scaled = p_rot * s.unsqueeze(2)                                  # [B,K,M,3]
 
@@ -191,7 +191,7 @@ class PointCloudDecoderParticles(nn.Module):
             "points_recon": points_recon,   # [B,KM,3] concatenated object points (no bg)
             "rgb_recon":    rgb_recon,      # [B,KM,3] per-point color or None
             "obj_weights":  gate,           # [B,K,1] per-object on/off gate (0..1)
-            "depth_factor": depth_factor,   # [B,K,1] (diagnostics; how depth scaled size)
+            # "depth_factor": depth_factor,   # [B,K,1] (diagnostics; how depth scaled size)
         }
 
     def info(self) -> str:

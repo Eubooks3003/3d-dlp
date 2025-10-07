@@ -212,6 +212,7 @@ class ParticleFeaturesEncoderPoint(nn.Module):
         else:
             z_features = mu if self.interaction_features else self.sample_gauss(mu, logvar, deterministic)
 
+        print("Encoded Logvar features is None? ", logvar is None)
         return {
             'mu_features':           mu,             # [B,K,F]
             'logvar_features':       logvar,         # [B,K,F] or None

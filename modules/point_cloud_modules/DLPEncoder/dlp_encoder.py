@@ -8,6 +8,7 @@ import numpy as np
 
 from modules.point_cloud_modules.DLPEncoder.particle_encoder import ParticleEncoder
 from modules.point_cloud_modules.DLPEncoder.bg_encoder import BgEncoderPC
+from modules.point_cloud_modules.DLPEncoder.particle_interaction_encoder import ParticleInteractionEncoder3D
 
 class DLPEncoder(nn.Module):
     def __init__(self,
@@ -319,48 +320,60 @@ class DLPEncoder(nn.Module):
         # particle_anchors = patch_centers[:, :-1]  # [1, 1, n_kp_enc], no need for (0,0)-the bg
         # particle_anchors = particle_anchors.unsqueeze(-2).repeat(1, 1, self.n_kp_per_patch, 1).view(1, -1, 2)
 
-        # if self.use_particle_inter_enc:
-        #     self.particle_inter_enc = ParticleInteractionEncoder(n_kp_enc=n_kp_enc, dropout=0.0,
-        #                                                          learned_feature_dim=learned_feature_dim,
-        #                                                          learned_bg_feature_dim=learned_bg_feature_dim,
-        #                                                          embed_init_std=embed_init_std,
-        #                                                          projection_dim=projection_dim,
-        #                                                          timestep_horizon=timestep_horizon,
-        #                                                          pte_layers=pte_layers,
-        #                                                          pte_heads=pte_heads,
-        #                                                          attn_norm_type=attn_norm_type, pad_mode=pad_mode,
-        #                                                          use_resblock=use_resblock,
-        #                                                          hidden_dim=mlp_hidden_dim,
-        #                                                          temporal_interaction=self.temporal_interaction,
-        #                                                          interaction_features=interaction_features,
-        #                                                          interaction_depth=interaction_depth,
-        #                                                          interaction_obj_on=interaction_obj_on,
-        #                                                          cdim=cdim, image_size=image_size, n_views=self.n_views,
-        #                                                          ch_mult=bg_ch_mult, base_ch=bg_base_ch,
-        #                                                          final_cnn_ch=bg_final_cnn_ch,
-        #                                                          num_res_blocks=num_res_blocks,
-        #                                                          bg=True, use_img_input=True,
-        #                                                          cnn_mid_blocks=cnn_mid_blocks,
-        #                                                          particle_score=True,
-        #                                                          particle_positional_embed=particle_positional_embed,
-        #                                                          norm_layer=use_norm_layer,
-        #                                                          add_particle_temp_embed=self.add_particle_temp_embed,
-        #                                                          features_dist=self.features_dist,
-        #                                                          n_fg_categories=n_fg_categories,
-        #                                                          n_fg_classes=n_fg_classes,
-        #                                                          n_bg_categories=n_bg_categories,
-        #                                                          n_bg_classes=n_bg_classes,
-        #                                                          scale_anchor=self.scale_anchor,
-        #                                                          obj_on_min=self.obj_on_min,
-        #                                                          obj_on_max=self.obj_on_max,
-        #                                                          particle_anchors=particle_anchors,
-        #                                                          use_z_orig=self.use_z_orig,
-        #                                                          init_zero_bias=init_zero_bias,
-        #                                                          init_conv_layers=init_conv_layers,
-        #                                                          init_conv_fg_std=init_conv_fg_std
-        #                                                          )
-        # else:
-        #     self.particle_inter_enc = None
+        if self.use_particle_inter_enc:
+            self.particle_inter_enc = ParticleInteractionEncoder3D(
+                # core sizes
+                n_kp_enc=n_kp_enc,
+                learned_feature_dim=learned_feature_dim,
+                learned_bg_feature_dim=learned_bg_feature_dim,
+                projection_dim=projection_dim,
+                hidden_dim=mlp_hidden_dim,          # or `hidden_dim` if that's your var name
+
+                # transformer config
+                pte_layers=pte_layers,
+                pte_heads=pte_heads,
+                attn_norm_type=attn_norm_type,
+                dropout=0.0,
+                activation='gelu',
+                temporal_interaction=self.temporal_interaction,
+
+                # what to refine
+                interaction_features=interaction_features,
+                interaction_depth=interaction_depth,
+                interaction_obj_on=interaction_obj_on,
+
+                # tokens / embeddings
+                particle_positional_embed=particle_positional_embed,
+                add_particle_temp_embed=self.add_particle_temp_embed,
+                particle_score=False, # TODO: this has to be set to false for shape size for now
+                with_bg=True,               # include bg token
+
+                # PC context (no image CNN)
+                use_pc_ctx=True,
+                ctx_type="pointnet",
+
+                # feature distribution (FG/BG)
+                features_dist=self.features_dist,
+                n_fg_categories=n_fg_categories,
+                n_fg_classes=n_fg_classes,
+                n_bg_categories=n_bg_categories,
+                n_bg_classes=n_bg_classes,
+
+                # obj_on shaping + anchors
+                obj_on_min=self.obj_on_min,
+                obj_on_max=self.obj_on_max,
+                use_z_orig=self.use_z_orig,
+
+                # init
+                embed_init_std=embed_init_std,
+                init_zero_bias=init_zero_bias,
+                init_conv_layers=init_conv_layers,
+                init_conv_fg_std=init_conv_fg_std,
+            )
+
+
+        else:
+            self.particle_inter_enc = None
 
         self.ctx_enc = ctx_enc
 
@@ -523,7 +536,7 @@ class DLPEncoder(nn.Module):
         z_features      = p.get('feat',       p.get('z_features', None))   # [B,K,F]
         mu_features     = p.get('feat_mu',    p.get('mu_features', z_features))
         logvar_features = p.get('feat_logvar', p.get('logvar_features', None))
-
+        print("Getting Logvar featuress: ", logvar_features is None)
         # prior metadata
         kp_p        = p.get('kp_p',        p.get('kp_prior', None))        # [B,K,3]
         var_kp      = p.get('kp_var',      p.get('var_kp',   None))        # [B,K,*]
@@ -538,6 +551,7 @@ class DLPEncoder(nn.Module):
         mu_obj_on   = p.get('mu_obj_on', None)
 
         mu_depth     = p.get('mu_depth', None)
+        mu_offset = p.get('mu_offset', None)
         logvar_depth = p.get('logvar_depth', None)
         z_depth      = p.get('z_depth', None)
 
@@ -564,12 +578,38 @@ class DLPEncoder(nn.Module):
         logvar_bg_features = bg_out.get('logvar_bg', None)
         z_bg_features    = bg_out['z_bg']
 
+        if self.use_particle_inter_enc:
+            inter = self.particle_inter_enc(
+                x, mask_pc, z, z_scale, z_obj_on, z_depth, z_features,
+                z_bg_features=z_bg_features, z_base_var=z_base_var, z_score=None,
+                deterministic=deterministic, warmup=warmup
+            )
+            # then selectively override:
+            if self.interaction_features:
+                mu_features      = inter['mu_features']      
+                logvar_features   = inter['logvar_features']
+                z_features       = inter['z_features']
+                mu_bg_features   = inter['mu_bg_features']   
+                logvar_bg_features= inter['logvar_bg_features']
+                z_bg_features    = inter['z_bg_features']
+            if self.interaction_depth:
+                mu_depth         = inter['mu_depth']         
+                logvar_depth      = inter['logvar_depth']
+                z_depth          = inter['z_depth']
+            if self.interaction_obj_on:
+                obj_on_a         = inter['obj_on_a']         
+                obj_on_b          = inter['obj_on_b']
+                mu_obj_on        = inter['mu_obj_on']        
+                z_obj_on          = inter['z_obj_on']
+
+
         # ---- 3) pack & return ----
         return {
             # positions
             'z_base': z_base,                  # [B,K,3] anchor/proposal
             'z':      z,                       # [B,K,3] refined/sample
             'mu_tot': mu_tot,                  # [B,K,3] mean after offset
+            'mu_offset': mu_offset,
             'logvar_offset': pos_logvar,       # [B,K,3] (kept name for compat)
 
             # scales

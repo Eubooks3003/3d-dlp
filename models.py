@@ -1925,6 +1925,7 @@ class DLP(nn.Module):
         rec_x = model_output['rec']
         mu_features = model_output['mu_features']
         logvar_features = model_output['logvar_features']
+        print("LOGVAR FEATURES NONE? :", logvar_features is None)
         z_features = model_output['z_features']
         mu_bg = model_output['mu_bg_features']
         logvar_bg = model_output['logvar_bg_features']

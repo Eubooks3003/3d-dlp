@@ -4398,7 +4398,8 @@ class ParticleEncoder(nn.Module):
                                                                init_conv_fg_std=init_conv_fg_std)
         # appearance encoder - visual features encoder (z_f)
         output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
-
+        
+        print("Output logvar for feature encoder: ", output_logvar)
         # Split RGB and Depth Feature Encoder when RGBD
         if self.separate_depth_features and cdim == 4:
             self.particle_features_enc_rgb = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
@@ -4662,6 +4663,7 @@ class ParticleEncoder(nn.Module):
             mu_rgb, logvar_rgb = out_rgb['mu_features'], out_rgb['logvar_features']
             crop_rgb           = out_rgb['cropped_objects']     # [B,N,3,s,s] or [B,T,N,3,s,s] depending on impl
 
+            print("Logvar features is none after particle encoder") if logvar_rgb is None else None
             # encode depth (optional)
             if x_d is not None:
                 out_d = self.particle_features_enc_depth(x_d, z, z_scale=z_scale, timesteps=timesteps)
@@ -4728,6 +4730,7 @@ class ParticleEncoder(nn.Module):
             # crops
             crop_4ch = torch.cat([crop_rgb, crop_d], dim=2) if (crop_d is not None) else crop_rgb
 
+            print("Logvar features is none after encode appearance") if logvar_rgb_eff is None else None
             return {
                 # Back-compat (RGB branch under original names)
                 'mu_features':       mu_rgb_eff,
@@ -4905,6 +4908,7 @@ class ParticleEncoder(nn.Module):
         logvar_score = logvar_score.view(bs, timestep_horizon, *logvar_score.shape[1:])
         z_score = z_score.view(bs, timestep_horizon, *z_score.shape[1:])
 
+        print("Logvar features is none in final output dict") if logvar_features is None else None
         encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features, 
@@ -5432,6 +5436,7 @@ class DLPEncoder(nn.Module):
             z_bg_features = torch.cat([z_bg_features[:, :-1], mu_bg_features[:, -1:]], dim=1)
 
         if self.use_particle_inter_enc:
+            print("Using particle interaction encoder")
             z_in_inter = z_base + z_offset  # so we can detach z_base (ssm) if more stable
             inter_dict = self.particle_inter_enc(x, z_in_inter, z_scale, z_obj_on, z_depth, z_features, z_bg_features,
                                                  z_base_var, z_score, patch_id_embed,
@@ -5540,6 +5545,7 @@ class DLPEncoder(nn.Module):
             logvar_score = logvar_score[:, :-1].contiguous()
             z_score = z_score[:, :-1].contiguous()
         # TODO: Make sure all the necessary information from the depth encoding is returned and USED
+        print("logvar features is none in encoder: ", logvar_features is None)
         encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
