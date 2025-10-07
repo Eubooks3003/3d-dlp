@@ -528,6 +528,7 @@ class DLPEncoder(nn.Module):
         kp_p        = p.get('kp_p',        p.get('kp_prior', None))        # [B,K,3]
         var_kp      = p.get('kp_var',      p.get('var_kp',   None))        # [B,K,*]
         z_base_var  = p.get('z_base_var',  None)                           # [B,K,?]
+
         patch_id_embed = p.get('patch_id_embed', None)
 
         # optional extras (pass-through)

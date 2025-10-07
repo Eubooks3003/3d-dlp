@@ -941,41 +941,6 @@ class VoxelDLP(nn.Module):
             warmup=warmup
         )
 
-        # ---------- 3) Postprocess (same as you had) ----------
-        dec_objects      = dec_dict['dec_objects']
-        dec_objects_trans= dec_dict['dec_objects_trans']
-        rec              = dec_dict['rec']
-        bg_rec           = dec_dict['bg_rec']
-        rec_rgb          = dec_dict['rec_rgb']
-        rec_depth        = dec_dict['rec_depth']
-
-        if self.normalize_rgb:
-            if self.cdim == 4:
-                rec_rgb = minusoneone_to_rgb(rec_rgb if self.separate_depth_features else rec[:, :3])
-            else:
-                rec_rgb = minusoneone_to_rgb(rec)
-            bg_rec_rgb       = minusoneone_to_rgb(bg_rec[:, :3])
-            dec_objects_trans= minusoneone_to_rgb(dec_objects_trans)
-
-            if dec_objects.shape[2] >= 4:
-                a   = dec_objects[:, :, :1]
-                rgb = minusoneone_to_rgb(dec_objects[:, :, 1:4])
-                dec_objects_rgb = torch.cat([a, rgb], dim=2)
-            else:
-                dec_objects_rgb = minusoneone_to_rgb(dec_objects)
-        else:
-            rec_rgb        = rec_rgb if (self.cdim == 4 and self.separate_depth_features) else rec[:, :3]
-            bg_rec_rgb     = bg_rec[:, :3]
-            dec_objects_rgb= dec_objects
-
-        bg_depth = bg_rec[:, 3:4] if bg_rec.shape[1] > 3 else None
-
-        dec_dict['rec_rgb']                 = rec_rgb
-        dec_dict['bg_rgb']                  = bg_rec_rgb
-        dec_dict['rec_depth']               = rec_depth
-        dec_dict['bg_depth']                = bg_depth
-        dec_dict['dec_objects_trans']       = dec_objects_trans
-        dec_dict['dec_objects_original_rgb']= dec_objects_rgb
         return dec_dict
 
 
@@ -1183,166 +1148,82 @@ class VoxelDLP(nn.Module):
                 beta_rec=1.0, kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
                 balance=0.5, beta_dyn_rec=1.0, num_static=None, actions=None, actions_mask=None, lang_embed=None,
                 beta_obj=0.0, done_mask=None, x_goal=None):
-        enc = self.encode_all(x, mask,deterministic=deterministic,warmup=warmup,actions=actions, actions_mask=actions_mask,lang_embed=lang_embed, x_goal=x_goal)
 
+        # -------- Encode (PC) --------
+        enc = self.encode_all(x, mask, deterministic=deterministic, warmup=warmup,
+                            actions=actions, actions_mask=actions_mask,
+                            lang_embed=lang_embed, x_goal=x_goal)
+
+        # Required from encoder
         z               = enc['z']                 # [B,K,3]
-        z_scale         = enc['z_scale']           # [B,K,3] or None
-        z_features      = enc['z_features']        # [B,K,F] or None
-        z_obj_on        = enc['z_obj_on'] if 'z_obj_on' in enc else enc['obj_on']  # [B,K] or [B,K,1] or None
+        z_scale         = enc['z_scale']           # [B,K,3]
+        z_features      = enc['z_features']        # [B,K,F]
+        z_obj_on        = enc['z_obj_on']            # [B,K,1] (PC pipeline returns 'obj_on')
         z_depth         = enc['z_depth']           # [B,K,1] or None
-        z_bg_features   = enc['z_bg_features']     # [B,?] or None
-        # z_context       = enc['z_context']         # [B,?] or None
-        z_base_var      = enc['z_base_var']        # [B,K,Dv] or None
+        z_bg_features   = enc['z_bg_features']     # [B,Fbg] or None
+        z_base_var      = enc['z_base_var']        # [B,K,Dv] (variance features)
 
-        # Optional extras that many decoders don’t strictly need but are nice to have
+        # Nice-to-have encoder outputs (kept for logs/losses)
         z_base          = enc['z_base']            # [B,K,3]
         mu_tot          = enc['mu_tot']            # [B,K,3]
-        mu_features     = enc['mu_features']       # [B,K,F] or None
+        mu_features     = enc['mu_features']       # [B,K,F]
         logvar_features = enc['logvar_features']   # [B,K,F] or None
-        mu_scale        = enc['mu_scale']          # [B,K,3] or None
+        mu_scale        = enc['mu_scale']          # [B,K,3]
         logvar_scale    = enc['logvar_scale']      # [B,K,3] or None
+        kp_p            = enc['kp_p']              # [B,K,3]
+        var_kp          = enc['var_kp']            # [B,K,*]
+        mu_bg_features  = enc['mu_bg_features']    # [B,Fbg]
+        logvar_bg_features = enc['logvar_bg_features']  # [B,Fbg] or None
 
-        # Optional variance filter key for the decoder (expect sum-over-last-dim)
-        filter_key = None
-        if z_base_var is not None and z_base_var.dim() >= 2:
-            filter_key = z_base_var.sum(dim=-1)    # -> [B,K]
-        dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features,
-                                   warmup, filter_key=filter_key)
+        # Optional filter key for decoder (sum last dim)
+        filter_key = z_base_var.sum(dim=-1)  # [B,K]
 
-        bg_mask = dec_dict['bg_mask']
-        dec_objects = dec_dict['dec_objects']
-        dec_objects_trans = dec_dict['dec_objects_trans']
-        alpha_masks = dec_dict['alpha_masks']
-        rec = dec_dict['rec']
-        bg_rec = dec_dict['bg_rec']
+        # -------- Decode (PC) --------
+        dec_dict = self.decode_all(
+            z, z_scale, z_features, z_obj_on, z_depth, z_bg_features,
+            warmup=warmup, filter_key=filter_key
+        )
 
-        rec_rgb = dec_dict['rec_rgb']
-        bg_rec_rgb = dec_dict['bg_rgb']
-        dec_objects_rgb = dec_dict['dec_objects_original_rgb']
-        rec_depth = dec_dict['rec_depth']
-        bg_rec_depth = dec_dict['bg_depth']
+        # Point-cloud decoder outputs (direct keys)
+        pts_scene   = dec_dict['points_scene']   # [B, M_tot, 3]
+        pts_bg      = dec_dict['points_bg']      # [B, M_bg, 3]
+        pts_obj     = dec_dict['points_obj']     # [B, K, M, 3]
+        rgb_scene   = dec_dict['rgb_scene']      # [B, M_tot, 3] or None
+        rgb_bg      = dec_dict['rgb_bg']         # [B, M_bg, 3] or None
+        rgb_obj     = dec_dict['rgb_obj']        # [B, K, M, 3] or None
+        obj_weights = dec_dict['obj_weights']    # [B, K, 1]
 
-        # dynamics - all but the last timestep
-        if self.is_dynamics_model:
-            detach_dyn_inputs = False
-            # forward PINT
-            # [bs, T-1, n_kp, attribute/feature_dim]
+        # -------- Pack outputs --------
+        output_dict = {
+            # encoder passthroughs (PC)
+            'kp_p': kp_p,
+            'var_kp': var_kp,
+            'z_base_var': z_base_var,
+            'z_base': z_base,
+            'z': z,
+            'mu_tot': mu_tot,
+            'mu_features': mu_features,
+            'logvar_features': logvar_features,
+            'z_features': z_features,
+            'mu_scale': mu_scale,
+            'logvar_scale': logvar_scale,
+            'z_scale': z_scale,
+            'obj_on': z_obj_on,
+            'z_depth': z_depth,
+            'mu_bg_features': mu_bg_features,
+            'logvar_bg_features': logvar_bg_features,
+            'z_bg_features': z_bg_features,
 
-            z_dyn = z_base + z_offset  # = z, but can now detach z_base if more stable
-            z_v = z_dyn[:, :-1].detach() if detach_dyn_inputs else z_dyn[:, :-1]
-            z_scale_v = z_scale[:, :-1].detach() if detach_dyn_inputs else z_scale[:, :-1]
-            z_obj_on_v = z_obj_on[:, :-1].detach() if detach_dyn_inputs else z_obj_on[:, :-1]
-            z_depth_v = z_depth[:, :-1].detach() if detach_dyn_inputs else z_depth[:, :-1]
-            z_features_v = z_features[:, :-1].detach() if detach_dyn_inputs else z_features[:, :-1]
-            z_bg_features_v = z_bg_features[:, :-1].detach() if detach_dyn_inputs else z_bg_features[:, :-1]
-            if z_context is not None:
-                z_context_v = z_context[:, 1:]
-            else:
-                z_context_v = None
-            # [bs, T-1, context_dim]
-            if z_score is not None:
-                z_score_v = z_score[:, :-1]
-            else:
-                z_score_v = None
-            if actions is not None:
-                actions_v = actions[:, :-1]
-            else:
-                actions_v = None
-            if actions_mask is not None:
-                actions_mask_v = actions_mask[:, :-1]
-            else:
-                actions_mask_v = None
-            dyn_out = self.dyn_module(z_v,
-                                      z_scale_v,
-                                      z_obj_on_v,
-                                      z_depth_v,
-                                      z_features_v,
-                                      z_bg_features_v,
-                                      z_context_v,
-                                      z_score_v,
-                                      actions=actions_v,
-                                      actions_mask=actions_mask_v)
+            # decoder (point clouds)
+            'points_scene': pts_scene,
+            'points_bg': pts_bg,
+            'points_obj': pts_obj,
+            'rgb_scene': rgb_scene,
+            'rgb_bg': rgb_bg,
+            'rgb_obj': rgb_obj,
+            'obj_weights': obj_weights,
+        }
 
-            mu_dyn = dyn_out['mu']
-            logvar_dyn = dyn_out['logvar']
-
-            mu_features_dyn = dyn_out['mu_features']
-            logvar_features_dyn = dyn_out['logvar_features']
-
-            obj_on_a_dyn = dyn_out['obj_on_a']
-            obj_on_b_dyn = dyn_out['obj_on_b']
-
-            mu_depth_dyn = dyn_out['mu_depth']
-            logvar_depth_dyn = dyn_out['logvar_depth']
-
-            mu_scale_dyn = dyn_out['mu_scale']
-            logvar_scale_dyn = dyn_out['logvar_scale']
-
-            mu_bg_features_dyn = dyn_out['mu_bg_features']
-            logvar_bg_features_dyn = dyn_out['logvar_bg_features']
-
-            mu_score_dyn = dyn_out['mu_score']
-            logvar_score_dyn = dyn_out['logvar_score']
-
-        else:
-            mu_dyn = None
-            logvar_dyn = None
-
-            mu_features_dyn = None
-            logvar_features_dyn = None
-
-            obj_on_a_dyn = None
-            obj_on_b_dyn = None
-
-            mu_depth_dyn = None
-            logvar_depth_dyn = None
-
-            mu_scale_dyn = None
-            logvar_scale_dyn = None
-
-            mu_bg_features_dyn = None
-            logvar_bg_features_dyn = None
-
-            mu_context_dyn = None
-            logvar_context_dyn = None
-
-            mu_context_global_dyn = None
-            logvar_context_global_dyn = None
-
-            mu_score_dyn = None
-            logvar_score_dyn = None
-
-        output_dict = {'kp_p': kp_p, 'rec': rec, 'rec_rgb': rec_rgb, 'rec_depth': rec_depth, 'mu_anchor': mu_anchor,
-                       'logvar_anchor': logvar_anchor, 'z_base_var': z_base_var,
-                       'z_base': z_base, 'z': z,
-                       'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
-                       'mu_tot': mu_tot, 'mu_features': mu_features, 'logvar_features': logvar_features,
-                       'z_features': z_features, 'z_depth_features': z_depth_features, 'mu_depth_features': mu_depth_features,
-                       'logvar_depth_features': logvar_depth_features,
-                       'bg': bg_rec, 'bg_rgb': bg_rec_rgb, 'bg_depth': bg_rec_depth, 'mu_bg_features': mu_bg_features,
-                       'logvar_bg_features': logvar_bg_features, 'z_bg_features': z_bg_features,
-                       'mu_context': mu_context, 'logvar_context': logvar_context, 'z_context': z_context,
-                       'cropped_objects_original': cropped_objects, 'cropped_objects_original_rgb': cropped_objects_rgb,
-                       'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b,
-                       'obj_on': z_obj_on, 'mu_obj_on': mu_obj_on, 'dec_objects_original': dec_objects,
-                       'dec_objects_original_rgb': dec_objects_rgb, 'dec_objects': dec_objects_trans,
-                       'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth, 'mu_scale': mu_scale,
-                       'logvar_scale': logvar_scale, 'z_scale': z_scale,
-                       'alpha_masks': alpha_masks, 'mu_dyn': mu_dyn,
-                       'logvar_dyn': logvar_dyn, 'mu_features_dyn': mu_features_dyn,
-                       'logvar_features_dyn': logvar_features_dyn, 'obj_on_a_dyn': obj_on_a_dyn,
-                       'obj_on_b_dyn': obj_on_b_dyn, 'mu_depth_dyn': mu_depth_dyn, 'logvar_depth_dyn': logvar_depth_dyn,
-                       'mu_scale_dyn': mu_scale_dyn, 'logvar_scale_dyn': logvar_scale_dyn,
-                       'mu_bg_dyn': mu_bg_features_dyn, 'logvar_bg_dyn': logvar_bg_features_dyn,
-                       'mu_context_dyn': mu_context_dyn, 'logvar_context_dyn': logvar_context_dyn,
-                       'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score,
-                       'mu_score_dyn': mu_score_dyn, 'logvar_score_dyn': logvar_score_dyn,
-                       'mu_context_global': mu_context_global, 'logvar_context_global': logvar_context_global,
-                       'z_context_global': z_context_global,
-                       'mu_context_global_dyn': mu_context_global_dyn,
-                       'logvar_context_global_dyn': logvar_context_global_dyn,
-                       'z_context_global_dyn': z_context_global_dyn,
-                       }
 
         if with_loss:
             if num_static is None:
