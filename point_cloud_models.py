@@ -1831,7 +1831,6 @@ class VoxelDLP(nn.Module):
         mu_scale           = model_output['mu_scale']          # [B,K,3]
         logvar_scale       = model_output['logvar_scale']      # [B,K,3] or None
         mu_features        = model_output['mu_features']       # [B,K,F]
-        print("logvar_features None:", model_output['logvar_features'] is None)
         logvar_features    = model_output['logvar_features']   # [B,K,F] or None
         mu_bg              = model_output['mu_bg_features']    # [B,F_bg]
         logvar_bg          = model_output['logvar_bg_features']# [B,F_bg] or None

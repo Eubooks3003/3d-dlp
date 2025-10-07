@@ -339,7 +339,6 @@ class ParticleEncoder(nn.Module):
                 mu_depth     = mu_depth[b_idx, embed_ind]
                 logvar_depth = logvar_depth[b_idx, embed_ind]
 
-        print("Z Base Var: ", z_base_var.mean())
         out_dict = {
             'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'mu_tot': mu_tot,
             'patch_id_embed': patch_id_embed,
@@ -540,7 +539,6 @@ class ParticleEncoder(nn.Module):
             logvar_features = s2['logvar_features']       # [B,K,F] or None
             z_features      = s2['z_features']            # [B,K,F]
 
-            print("Encoded all appearance Logvar features is None? ", logvar_features is None)
 
         # ---- 4) final compact dict (point-cloud only; no BG) ----
         return {

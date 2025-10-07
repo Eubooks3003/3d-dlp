@@ -250,6 +250,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     losses_kl_depth = []
     losses_kl_obj_on = []
 
+
+
     # initialize validation statistics
     valid_loss = best_valid_loss = 1e8
     valid_losses = []
@@ -281,6 +283,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         batch_losses_kl_depth = []
         batch_losses_kl_obj_on = []
         batch_psnrs = []
+        
+        losses_rec_geom = []
+        losses_rec_color = []
+        obj_on_l1_list = []
+        obj_on_mean_list = []
+        mu_scale_mean_list = []
+        
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
@@ -305,330 +314,113 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
             iteration += 1
 
-            # output for logging and plotting
-            mu_p = model_output['kp_p']
-            z_base = model_output['z_base']
-            mu_offset = model_output['mu_offset']
-            logvar_offset = model_output['logvar_offset']
-            if ch ==4:
-                # Use normalized RGB in RGBD
-                rec_x = model_output['rec_rgb'].clamp(0, 1) 
-            else:
-                rec_x = model_output['rec_rgb']
-            mu_scale = model_output['mu_scale']
-            mu_depth = model_output['mu_depth']
-            # object stuff
-            dec_objects_original = model_output['dec_objects_original']
-            cropped_objects_original = model_output['cropped_objects_original']
-            obj_on = model_output['obj_on']  # [batch_size, n_kp]
-            alpha_masks = model_output['alpha_masks']  # [batch_size, n_kp, 1, h, w]
+            # --- helpers ---
+            def _to_float(x, default=0.0):
+                if x is None:
+                    return float(default)
+                if isinstance(x, (float, int)):
+                    return float(x)
+                try:
+                    return float(x.detach().mean().item())
+                except Exception:
+                    return float(default)
 
-            psnr = all_losses['psnr']
-            obj_on_l1 = all_losses['obj_on_l1']
-            loss_kl = all_losses['kl']
-            loss_rec = all_losses['loss_rec']
-            loss_kl_kp = all_losses['loss_kl_kp']
-            loss_kl_feat = all_losses['loss_kl_feat']
-            loss_kl_scale = all_losses['loss_kl_scale']
-            loss_kl_depth = all_losses['loss_kl_depth']
-            loss_kl_obj_on = all_losses['loss_kl_obj_on']
+            # --- unpack logged losses from calc_static_elbo_pc ---
+            loss            = all_losses['loss']
+            loss_rec        = all_losses['loss_rec']               # chamfer + color*weight
+            loss_rec_geom   = all_losses.get('loss_rec_geom', None)
+            loss_rec_color  = all_losses.get('loss_rec_color', None)
+            loss_kl         = all_losses['kl']
+            loss_kl_kp      = all_losses.get('loss_kl_kp', None)
+            loss_kl_scale   = all_losses.get('loss_kl_scale', None)
+            loss_kl_feat    = all_losses.get('loss_kl_feat', None)
+            loss_kl_obj_on  = all_losses.get('loss_kl_obj_on', None)
+            obj_on_l1       = all_losses.get('obj_on_l1', None)
 
-            # for plotting, confidence calculation
-            mu_tot = z_base + mu_offset
-            mu_tot = mu_tot.view(-1, *mu_tot.shape[2:])
-            logvar_tot = logvar_offset
-            logvar_tot = logvar_tot.view(-1, *logvar_tot.shape[2:])
+            # --- a few encoder-side sanity stats (guarded) ---
+            obj_on          = model_output.get('obj_on', None)         # [B,K,1] or None
+            obj_on_mean     = _to_float(obj_on)                        # fraction of active objs (roughly)
+            mu_scale        = model_output.get('mu_scale', None)       # [B,K,3] or [B,K,1]
+            mu_scale_mean   = _to_float(torch.sigmoid(mu_scale) if mu_scale is not None else None)
+            a_mean          = _to_float(model_output.get('obj_on_a', None))
+            b_mean          = _to_float(model_output.get('obj_on_b', None))
 
-            # for progress bar
-            a_mean = model_output['obj_on_a'].mean()  # the mean value of the "a" param in transparency Beta(a,b) dist
-            b_mean = model_output['obj_on_b'].mean()  # the mean value of the "b" param in transparency Beta(a,b) dist
-            mu_scale_mean = torch.sigmoid(model_output['mu_scale']).mean()  # the mean bounding-box size
+            # point count sanity
+            valid_points    = _to_float(mask.float().sum(dim=1) if mask is not None else None)
+            valid_points    = int(valid_points) if not isinstance(valid_points, float) else valid_points
 
-            # log
-            batch_psnrs.append(psnr.data.cpu().item())
-            batch_losses.append(loss.data.cpu().item())
-            batch_losses_rec.append(loss_rec.data.cpu().item())
-            batch_losses_kl.append(loss_kl.data.cpu().item())
-            batch_losses_kl_kp.append(loss_kl_kp.data.cpu().item())
-            batch_losses_kl_feat.append(loss_kl_feat.data.cpu().item())
-            batch_losses_kl_scale.append(loss_kl_scale.data.cpu().item())
-            batch_losses_kl_depth.append(loss_kl_depth.data.cpu().item())
-            batch_losses_kl_obj_on.append(loss_kl_obj_on.data.cpu().item())
-            # progress bar
+            # --- collect per-batch scalars ---
+            batch_losses.append(_to_float(loss))
+            batch_losses_rec.append(_to_float(loss_rec))
+            batch_losses_kl.append(_to_float(loss_kl))
+            batch_losses_kl_kp.append(_to_float(loss_kl_kp))
+            batch_losses_kl_feat.append(_to_float(loss_kl_feat))
+            batch_losses_kl_scale.append(_to_float(loss_kl_scale))
+            batch_losses_kl_obj_on.append(_to_float(loss_kl_obj_on))
+
+            # optional: track geometry/color separately
+            if loss_rec_geom is not None:
+                # you can create these lists outside the loop: losses_rec_geom, losses_rec_color
+                losses_rec_geom.append(_to_float(loss_rec_geom))
+            if loss_rec_color is not None:
+                losses_rec_color.append(_to_float(loss_rec_color))
+
+            # optional: track obj_on stats
+            obj_on_l1_list.append(_to_float(obj_on_l1))
+            obj_on_mean_list.append(obj_on_mean)
+            mu_scale_mean_list.append(mu_scale_mean)
+
+            # --- tqdm/postfix (compact) ---
             if epoch < warmup_epoch:
                 pbar.set_description_str(f'epoch #{epoch} (warmup)')
             else:
                 pbar.set_description_str(f'epoch #{epoch}')
 
-            pbar.set_postfix(loss=loss.data.cpu().item(), rec=loss_rec.data.cpu().item(),
-                             kl=loss_kl.data.cpu().item(), on_l1=obj_on_l1.cpu().item(),
-                             a=a_mean.data.cpu().item(), b=b_mean.data.cpu().item(),
-                             smu=mu_scale_mean.data.cpu().item())
+            pbar.set_postfix(
+                loss=_to_float(loss),
+                rec=_to_float(loss_rec),
+                cham=_to_float(loss_rec_geom),
+                KL=_to_float(loss_kl),
+                kp=_to_float(loss_kl_kp),
+                feat=_to_float(loss_kl_feat),
+                scale=_to_float(loss_kl_scale),
+                obj=_to_float(loss_kl_obj_on),
+                on_l1=_to_float(obj_on_l1),
+                on=_to_float(obj_on),
+                s_mean=mu_scale_mean
+            )
+
             # break  # for debug
         pbar.close()
-        losses.append(np.mean(batch_losses))
-        losses_rec.append(np.mean(batch_losses_rec))
-        losses_kl.append(np.mean(batch_losses_kl))
-        losses_kl_kp.append(np.mean(batch_losses_kl_kp))
-        losses_kl_feat.append(np.mean(batch_losses_kl_feat))
-        losses_kl_scale.append(np.mean(batch_losses_kl_scale))
-        losses_kl_depth.append(np.mean(batch_losses_kl_depth))
-        losses_kl_obj_on.append(np.mean(batch_losses_kl_obj_on))
-        if len(batch_psnrs) > 0:
-            psnrs.append(np.mean(batch_psnrs))
-        # scheduler
-        if use_scheduler:
-            scheduler.step()
-            curr_lr = scheduler.get_lr()
-            lr_str = f'learning rate: {curr_lr}'
-            print(curr_lr)
-            log_line(log_dir, lr_str)
+        # at end of epoch
+        losses.append(float(np.mean(batch_losses)))
+        losses_rec.append(float(np.mean(batch_losses_rec)))
+        losses_kl.append(float(np.mean(batch_losses_kl)))
+        losses_kl_kp.append(float(np.mean(batch_losses_kl_kp)))
+        losses_kl_feat.append(float(np.mean(batch_losses_kl_feat)))
+        losses_kl_scale.append(float(np.mean(batch_losses_kl_scale)))
+        losses_kl_obj_on.append(float(np.mean(batch_losses_kl_obj_on)))
 
-        # epoch summary
-        log_str = format_epoch_summary(
-            epoch=epoch,
-            loss=losses[-1],
-            loss_rec=losses_rec[-1],
-            loss_kl=losses_kl[-1],
-            kl_balance=kl_balance,
-            loss_kl_kp=losses_kl_kp[-1],
-            loss_kl_feat=losses_kl_feat[-1],
-            loss_kl_scale=losses_kl_scale[-1],
-            loss_kl_depth=losses_kl_depth[-1],
-            loss_kl_obj_on=losses_kl_obj_on[-1],
-            mu_tot=mu_tot,
-            mu_offset=mu_offset,
-            valid_loss=valid_loss,
-            best_valid_loss=best_valid_loss,
-            best_valid_epoch=best_valid_epoch,
-            obj_on=obj_on,
-            mu_scale=mu_scale,
-            mu_depth=mu_depth,
-            eval_epoch_freq=eval_epoch_freq,
-            val_lpips=val_lpips if eval_im_metrics else None,
-            best_val_lpips=best_val_lpips if eval_im_metrics else None,
-            best_val_lpips_epoch=best_val_lpips_epoch if eval_im_metrics else None,
-            psnr=psnrs[-1] if len(psnrs) > 0 else None
+        mean_chamfer = float(np.mean(losses_rec_geom)) if len(losses_rec_geom) else None
+        mean_color   = float(np.mean(losses_rec_color)) if len(losses_rec_color) else None
+        mean_on_l1   = float(np.mean(obj_on_l1_list)) if len(obj_on_l1_list) else None
+        mean_on_prob = float(np.mean(obj_on_mean_list)) if len(obj_on_mean_list) else None
+        mean_s_scale = float(np.mean(mu_scale_mean_list)) if len(mu_scale_mean_list) else None
+
+        log_str = (
+            f"epoch {epoch:04d} | "
+            f"loss {losses[-1]:.4f} | rec {losses_rec[-1]:.4f}"
+            f"{'' if mean_chamfer is None else f' (cham {mean_chamfer:.4f})'}"
+            f"{'' if mean_color   is None else f' + color {mean_color:.4f}'} | "
+            f"KL {losses_kl[-1]:.4f} [kp {losses_kl_kp[-1]:.3f}, feat {losses_kl_feat[-1]:.3f}, "
+            f"scale {losses_kl_scale[-1]:.3f}, obj {losses_kl_obj_on[-1]:.3f}] | "
+            f"on_L1 {mean_on_l1 if mean_on_l1 is not None else 0:.3f} | "
+            f"on̄ {mean_on_prob if mean_on_prob is not None else 0:.3f} | "
+            f"s̄ {mean_s_scale if mean_s_scale is not None else 0:.3f}"
         )
         print(log_str)
         log_line(log_dir, log_str)
 
-        if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
-            x = x.view(-1, *x.shape[2:])
-            # for plotting purposes
-            mu_plot = mu_tot.clamp(min=kp_range[0], max=kp_range[1])
-            max_imgs = 8
-            img_with_kp = plot_keypoints_on_image_batch(mu_plot, x, radius=3,
-                                                        thickness=1, max_imgs=max_imgs, kp_range=kp_range)
-            img_with_kp_p = plot_keypoints_on_image_batch(mu_p, x, radius=3, thickness=1, max_imgs=max_imgs,
-                                                          kp_range=kp_range)
-            # top-k
-            with torch.no_grad():
-                z_base_var = model_output['z_base_var']
-                z_base_var = z_base_var.view(-1, *z_base_var.shape[2:])
-                logvar_sum = z_base_var.sum(-1) * obj_on.view(-1, *obj_on.shape[2:]).squeeze(-1)  # [bs, n_kp]
-                logvar_topk = torch.topk(logvar_sum, k=topk, dim=-1, largest=False)
-                indices = logvar_topk[1]  # [batch_size, topk]
-                batch_indices = torch.arange(mu_tot.shape[0]).view(-1, 1).to(mu_tot.device)
-                topk_kp = mu_tot[batch_indices, indices]
-                # bounding boxes
-                bb_scores = -1 * logvar_sum
-                hard_threshold = None
-
-            kp_batch = mu_plot
-            scale_batch = mu_scale.view(-1, *mu_scale.shape[2:])
-            img_with_masks_nms, nms_ind = plot_bb_on_image_batch_from_z_scale_nms(kp_batch, scale_batch, x,
-                                                                                  scores=bb_scores,
-                                                                                  iou_thresh=iou_thresh,
-                                                                                  thickness=1, max_imgs=max_imgs,
-                                                                                  hard_thresh=hard_threshold)
-            alpha_masks = torch.where(alpha_masks < 0.05, 0.0, 1.0)
-            if alpha_masks.shape[1] != bb_scores.shape[1]:
-                bb_scores = -1 * torch.topk(logvar_sum, k=alpha_masks.shape[1], dim=-1, largest=False)[0]
-            img_with_masks_alpha_nms, _ = plot_bb_on_image_batch_from_masks_nms(alpha_masks, x, scores=bb_scores,
-                                                                                iou_thresh=iou_thresh, thickness=1,
-                                                                                max_imgs=max_imgs,
-                                                                                hard_thresh=hard_threshold)
-            img_with_seg_maps = create_segmentation_map(x=x, masks=alpha_masks, scores=bb_scores, alpha=0.7)
-            # hard_thresh: a general threshold for bb scores (set None to not use it)
-            bb_str = f'\nbb scores: max: {bb_scores.max():.2f}, min: {bb_scores.min():.2f},' \
-                     f' mean: {bb_scores.mean():.2f}\n'
-            print(bb_str)
-            log_line(log_dir, bb_str)
-            img_with_kp_topk = plot_keypoints_on_image_batch(topk_kp.clamp(min=kp_range[0], max=kp_range[1]), x,
-                                                             radius=3, thickness=1, max_imgs=max_imgs,
-                                                             kp_range=kp_range)
-            dec_objects = model_output['dec_objects']
-            bg = model_output['bg_rgb']
-            vutils.save_image(torch.cat([x[:max_imgs, :3], img_with_kp[:max_imgs, :3].to(device),
-                                         rec_x[:max_imgs, :3], img_with_kp_p[:max_imgs, :3].to(device),
-                                         img_with_kp_topk[:max_imgs, :3].to(device),
-                                         dec_objects[:max_imgs, :3],
-                                         img_with_masks_nms[:max_imgs, :3].to(device),
-                                         img_with_masks_alpha_nms[:max_imgs, :3].to(device),
-                                         img_with_seg_maps[:max_imgs, :3],
-                                         bg[:max_imgs, :3]],
-                                        dim=0).data.cpu(), '{}/image_{}.jpg'.format(fig_dir, epoch),
-                              nrow=8, pad_value=1)
-            
-            # ----- Depth figure (separate panel) -----
-            # 1) Gather depth tensors
-            if ch == 4:
-                depth_gt = x[:, 3:4]
-
-
-                rec_depth = model_output['rec_depth'] # [B,1,H,W] or None
-
-
-                if rec_depth is not None and rec_depth.dim() == 5:
-                    rec_depth = rec_depth.view(-1, *rec_depth.shape[2:])
-
-                dec_depth_trans = model_output.get('dec_depth_trans', None)  # [B,1,H,W] or None
-                bg_depth = model_output['bg_depth']  # [B,1,H,W] or None
-
-                # 2) Make 3-ch visualizations (choose a colormap)
-                depth_viz = []
-                if depth_gt is not None:
-                    depth_viz.append(depth_to_rgb(depth_gt,  cmap_name="viridis"))
-                if rec_depth is not None:
-                    depth_viz.append(depth_to_rgb(rec_depth,  cmap_name="viridis"))
-                if dec_depth_trans is not None:
-                    depth_viz.append(depth_to_rgb(dec_depth_trans, cmap_name="viridis"))
-                if bg_depth is not None:
-                    depth_viz.append(depth_to_rgb(bg_depth,  cmap_name="viridis"))
-
-                # pad missing slots to keep concat layout simple
-                while len(depth_viz) < 4:
-                    filler = depth_viz[0] if len(depth_viz) else depth_to_rgb(torch.zeros_like(x[:, :1]), cmap_name="viridis")
-                    depth_viz.append(filler)
-
-                depth_gt_vis, rec_depth_vis, dec_depth_vis, bg_depth_vis = depth_viz[:4]
-
-                # 3) Reuse your KP/BB/mask utilities with depth visualizations
-                kp_batch = mu_plot  # same KP used for RGB
-                scale_batch = mu_scale.view(-1, *mu_scale.shape[2:])
-
-                img_depth_with_kp = plot_keypoints_on_image_batch(kp_batch, depth_gt_vis, radius=3, thickness=1,
-                                                                max_imgs=max_imgs, kp_range=kp_range)
-                img_depth_with_kp_rec = plot_keypoints_on_image_batch(kp_batch, rec_depth_vis, radius=3, thickness=1,
-                                                                    max_imgs=max_imgs, kp_range=kp_range)
-
-                # NMS BB over depth viz
-                img_depth_with_masks_nms, _ = plot_bb_on_image_batch_from_z_scale_nms(
-                    kp_batch, scale_batch, depth_gt_vis, scores=bb_scores, iou_thresh=iou_thresh,
-                    thickness=1, max_imgs=max_imgs, hard_thresh=hard_threshold
-                )
-
-                alpha_masks_bin = torch.where(alpha_masks < 0.05, 0.0, 1.0)
-                if alpha_masks_bin.shape[1] != bb_scores.shape[1]:
-                    bb_scores_depth = -1 * torch.topk(logvar_sum, k=alpha_masks_bin.shape[1], dim=-1, largest=False)[0]
-                else:
-                    bb_scores_depth = bb_scores
-
-                img_depth_with_masks_alpha_nms, _ = plot_bb_on_image_batch_from_masks_nms(
-                    alpha_masks_bin, depth_gt_vis, scores=bb_scores_depth, iou_thresh=iou_thresh,
-                    thickness=1, max_imgs=max_imgs, hard_thresh=hard_threshold
-                )
-
-
-                # 4) Save a dedicated depth figure (mirrors your RGB collage order)
-                #    Order suggestion: GT depth, GT+KP, REC depth, REC+KP, DEC depth, BB(NMS) on depth, Alpha NMS on depth, BG depth
-                depth_panel = torch.cat([
-                    depth_gt_vis[:max_imgs],
-                    img_depth_with_kp[:max_imgs].to(device),
-                    rec_depth_vis[:max_imgs],
-                    img_depth_with_kp_rec[:max_imgs].to(device),
-                    dec_depth_vis[:max_imgs],
-                    img_depth_with_masks_nms[:max_imgs].to(device),
-                    img_depth_with_masks_alpha_nms[:max_imgs].to(device),
-                    bg_depth_vis[:max_imgs],
-                ], dim=0)
-
-                vutils.save_image(
-                    depth_panel.data.cpu(),
-                    '{}/image_depth_{}.jpg'.format(fig_dir, epoch),
-                    nrow=8, pad_value=1
-                )
-
-            # object plot
-
-            # with torch.no_grad():
-            #     if cropped_objects_original is None:
-            #         z = model_output['z']
-            #         z_scale = model_output['z_scale']
-            #         z_v = z.view(-1, *z.shape[2:])  # [bs * T, n_kp, 2]
-            #         z_scale_v = z_scale.view(-1, *z_scale.shape[2:])  # [bs * T, n_kp, 2]
-            #         cropped_objects_original = model.encoder_module.get_cropped_objects(x, z_v, z_scale_v)
-            #     _, dec_objects_rgb = torch.split(dec_objects_original, [1, 3], dim=2)
-            #     dec_objects_rgb = dec_objects_rgb.reshape(-1, *dec_objects_rgb.shape[2:])
-            #     cropped_objects_original = cropped_objects_original.clone().reshape(-1, 3,
-            #                                                                         cropped_objects_original.shape[
-            #                                                                             -1],
-            #                                                                         cropped_objects_original.shape[
-            #                                                                             -1])
-            #     if cropped_objects_original.shape[-1] != dec_objects_rgb.shape[-1]:
-            #         cropped_objects_original = F.interpolate(cropped_objects_original,
-            #                                                  size=dec_objects_rgb.shape[-1],
-            #                                                  align_corners=False, mode='bilinear')
-            # vutils.save_image(
-            #     torch.cat([cropped_objects_original[:max_imgs * 2, -3:], dec_objects_rgb[:max_imgs * 2, -3:]],
-            #               dim=0).data.cpu(), '{}/image_obj_{}.jpg'.format(fig_dir, epoch),
-            #     nrow=8, pad_value=1)
-
-            torch.save(model.state_dict(), os.path.join(save_dir, f'{ds}_gdlp{run_prefix}.pth'))
-            print("validation step...")
-            valid_loss = evaluate_validation_elbo(model, config, epoch, batch_size=batch_size,
-                                                  recon_loss_type=recon_loss_type, device=device,
-                                                  save_image=True, fig_dir=fig_dir, topk=topk,
-                                                  recon_loss_func=recon_loss_func, beta_rec=beta_rec,
-                                                  iou_thresh=iou_thresh,
-                                                  beta_kl=beta_kl, kl_balance=kl_balance, beta_obj=beta_obj,
-                                                  near=near, far=far)
-            log_str = f'validation loss: {valid_loss:.3f}\n'
-            print(log_str)
-            log_line(log_dir, log_str)
-            if best_valid_loss > valid_loss:
-                log_str = f'validation loss updated: {best_valid_loss:.3f} -> {valid_loss:.3f}\n'
-                print(log_str)
-                log_line(log_dir, log_str)
-                best_valid_loss = valid_loss
-                best_valid_epoch = epoch
-                torch.save(model.state_dict(),
-                           os.path.join(save_dir,
-                                        f'{ds}_gdlp{run_prefix}_best.pth'))
-            torch.cuda.empty_cache()
-            if eval_im_metrics and epoch > 0:
-                valid_imm_results = eval_dlp_im_metric(model, device, config,
-                                                       val_mode='val',
-                                                       eval_dir=log_dir,
-                                                       batch_size=batch_size)
-                log_str = f'validation: lpips: {valid_imm_results["lpips"]:.3f}, '
-                log_str += f'psnr: {valid_imm_results["psnr"]:.3f}, ssim: {valid_imm_results["ssim"]:.3f}\n'
-                val_lpips = valid_imm_results['lpips']
-                print(log_str)
-                log_line(log_dir, log_str)
-                if (not torch.isinf(torch.tensor(val_lpips))) and (best_val_lpips > val_lpips):
-                    log_str = f'validation lpips updated: {best_val_lpips:.3f} -> {val_lpips:.3f}\n'
-                    print(log_str)
-                    log_line(log_dir, log_str)
-                    best_val_lpips = val_lpips
-                    best_val_lpips_epoch = epoch
-                    torch.save(model.state_dict(),
-                               os.path.join(save_dir, f'{ds}_gdlp{run_prefix}_best_lpips.pth'))
-                torch.cuda.empty_cache()
-        valid_losses.append(valid_loss)
-        if eval_im_metrics:
-            val_lpipss.append(val_lpips)
-        # plot graphs
-        if epoch > start_epoch:
-            metrics_data = [
-                (losses[1:], "Total Loss", "#2d72bc", True),
-                (losses_kl[1:], "KL Loss", "#c92a2a", True),
-                (losses_rec[1:], "Reconstruction Loss", "#087f5b", True),
-                (valid_losses[1:], "Validation Loss", "#862e9c", True),
-            ]
-            save_metrics_data(metrics_data, run_name, save_dir=os.path.join(save_dir, 'metrics'))
-            plot_training_metrics(metrics_data, run_name, fig_dir, max_plots_per_figure=4)
     return model
 
 

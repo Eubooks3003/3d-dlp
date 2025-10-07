@@ -536,7 +536,6 @@ class DLPEncoder(nn.Module):
         z_features      = p.get('feat',       p.get('z_features', None))   # [B,K,F]
         mu_features     = p.get('feat_mu',    p.get('mu_features', z_features))
         logvar_features = p.get('feat_logvar', p.get('logvar_features', None))
-        print("Getting Logvar featuress: ", logvar_features is None)
         # prior metadata
         kp_p        = p.get('kp_p',        p.get('kp_prior', None))        # [B,K,3]
         var_kp      = p.get('kp_var',      p.get('var_kp',   None))        # [B,K,*]
