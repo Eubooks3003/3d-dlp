@@ -474,26 +474,42 @@ class VoxelDLP(nn.Module):
         # [1, n_patches * n_kp_per_patch, 2]
 
         # decoder
-        self.decoder_module = DLPDecoder(cdim=cdim, image_size=image_size,
-                                         learned_feature_dim=self.learned_feature_dim,
-                                         learned_bg_feature_dim=self.learned_bg_feature_dim,
-                                         anchor_s=anchor_s, n_kp_enc=self.n_kp_dec, pad_mode=pad_mode,
-                                         context_dim=self.context_dim,
-                                         obj_res_from_fc=obj_res_from_fc, obj_ch_mult=obj_ch_mult,
-                                         obj_base_ch=obj_base_ch, obj_final_cnn_ch=obj_final_cnn_ch,
-                                         bg_res_from_fc=bg_res_from_fc, bg_ch_mult=bg_ch_mult, bg_base_ch=bg_base_ch,
-                                         bg_final_cnn_ch=bg_final_cnn_ch,
-                                         num_res_blocks=num_res_blocks, decode_with_ctx=False,
-                                         timestep_horizon=timestep_horizon, use_resblock=use_resblock,
-                                         normalize_rgb=normalize_rgb, cnn_mid_blocks=cnn_mid_blocks,
-                                         mlp_hidden_dim=mlp_hidden_dim,
-                                         init_zero_bias=init_zero_bias,  # zero bias for conv and linear layers
-                                         init_conv_layers=init_conv_layers,  # initialize conv layers with normal dist
-                                         init_conv_fg_std=init_conv_fg_std,  # std for conv fg normal dist
-                                         init_conv_bg_std=init_conv_bg_std,  # std for conv bg normal dist
-                                         separate_depth_features=separate_depth_features,
-                                         depth_feature_dim=depth_feature_dim,
-                                         )
+        self.decoder_module = DLPDecoder(
+            # --- essentials / dimensions ---
+            cdim=cdim,
+            learned_feature_dim=self.learned_feature_dim,
+            learned_bg_feature_dim=self.learned_bg_feature_dim,
+            n_kp_enc=self.n_kp_dec,
+            context_dim=self.context_dim,
+
+            # --- init & MLP sizing (kept from 2D) ---
+            mlp_hidden_dim=mlp_hidden_dim,
+            init_zero_bias=init_zero_bias,
+            init_conv_layers=init_conv_layers,
+            init_conv_fg_std=init_conv_fg_std,   # used for object MLPs
+            init_conv_bg_std=init_conv_bg_std,   # used for background MLPs
+
+            # --- rendering / color behavior ---
+            normalize_rgb=normalize_rgb,
+            color_activation=("tanh" if normalize_rgb else "sigmoid"),
+
+            # --- PC-specific knobs ---
+            points_per_obj=getattr(self, "points_per_obj", 256),  # M_obj
+            points_bg=getattr(self, "points_bg", 2048),           # M_bg
+            predict_obj_color=(cdim >= 3),
+            predict_bg_color=(cdim >= 3),
+            use_context=(self.context_dim > 0),
+
+            # --- geometry & blending ---
+            sphere_sigma=getattr(self, "sphere_sigma", 0.06),
+            depth_blend=getattr(self, "depth_blend", "softmax"),  # {'softmax','alpha'}
+            clamp_bounds=True,
+
+            # --- background template ---
+            bg_template=getattr(self, "bg_template", "sphere"),   # {'sphere','cube','gridxy'}
+            learn_bg_template=getattr(self, "learn_bg_template", False),
+        )
+
 
         # context (latent actions)
         if self.context_dim > 0:
@@ -747,8 +763,8 @@ class VoxelDLP(nn.Module):
             ("Prior CNN Pre-pool Output Size", self.prior_module.enc3d.out_channels),
             ("Object CNN Output Shape", object),
             # ("Background CNN Output Shape", self.encoder_module.bg_encoder.cnn_out_shape),
-            ("Decoder Background Upsamples", self.decoder_module.num_bg_upsample),
-            ("Decoder Object Upsamples", self.decoder_module.num_obj_upsample)
+            # ("Decoder Background Upsamples", self.decoder_module.num_bg_upsample),
+            # ("Decoder Object Upsamples", self.decoder_module.num_obj_upsample)
         ]
         sections.extend(format_row(label, value) for label, value in cnn_info)
 
@@ -765,11 +781,6 @@ class VoxelDLP(nn.Module):
         sections.append(format_row("Background Encoder", self.encoder_module.bg_encoder.info))
         # if self.encoder_module.particle_inter_enc is not None:
         #     sections.append(format_row("Particle Intermediate Encoder", self.encoder_module.particle_inter_enc.info))
-        if self.separate_depth_features:
-            sections.append(format_row("RGB Particle Decoder", self.decoder_module.particle_dec_rgb.info))
-            sections.append(format_row("Depth Particle Decoder", self.decoder_module.particle_dec_depth.info))
-        else:
-            sections.append(format_row("Particle Decoder", self.decoder_module.particle_dec.info))
         sections.append(format_row("Background Decoder", self.decoder_module.bg_dec.info))
 
         # Add latent dimension with formula
@@ -836,103 +847,136 @@ class VoxelDLP(nn.Module):
             x = x.unsqueeze(1)  # -> [bs, T=1, ch, h, w]]
         enc_dict = self.encoder_module(x, mask, deterministic, warmup, actions=actions, actions_mask=actions_mask,
                                        lang_embed=lang_embed, x_goal=x_goal)
-        cropped_objects = enc_dict['cropped_objects']
-        if self.normalize_rgb:
-            cropped_objects_rgb = minusoneone_to_rgb(cropped_objects)
-        else:
-            cropped_objects_rgb = cropped_objects
-        enc_dict['cropped_objects_rgb'] = cropped_objects_rgb
+        # cropped_objects = enc_dict['cropped_objects']
+        # if self.normalize_rgb:
+        #     cropped_objects_rgb = minusoneone_to_rgb(cropped_objects)
+        # else:
+        #     cropped_objects_rgb = cropped_objects
+        # enc_dict['cropped_objects_rgb'] = cropped_objects_rgb
         return enc_dict
 
-    def decode_all(self, z, z_scale, z_features, z_depth_features, obj_on_sample, z_depth, z_bg_features, z_ctx,
-                   warmup=False, filter_key=None):
+    def decode_all(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features,
+                warmup=False, filter_key=None):
+        # ---------- 0) Coerce inputs for the decoder ----------
+        B, K, Dpos = z.shape          # expect Dpos==3
+        device = z.device
+
+        # z_scale -> [B,K,3]
+        if z_scale is None:
+            z_scale = torch.zeros(B, K, 3, device=device)          # logits (zero-centered)
+        elif z_scale.dim() == 2:
+            z_scale = z_scale.unsqueeze(-1).expand(B, K, 3)
+        elif z_scale.size(-1) == 1:
+            z_scale = z_scale.expand(B, K, 3)
+
+        # features -> [B,K,F] (or zeros)
+        if z_features is None:
+            F = getattr(self, "learned_feature_dim", 16)
+            z_features = torch.zeros(B, K, F, device=device)
+
+        # obj_on gate -> [B,K,1]
+        if obj_on_sample is None:
+            obj_on_sample = torch.ones(B, K, 1, device=device)
+        elif obj_on_sample.dim() == 2:
+            obj_on_sample = obj_on_sample.unsqueeze(-1)
+        elif obj_on_sample.size(-1) != 1:
+            # if logits or two params slipped in, squash to gate
+            obj_on_sample = torch.sigmoid(obj_on_sample.mean(dim=-1, keepdim=True))
+
+        # depth latent -> [B,K,1] (or None)
+        if z_depth is not None and z_depth.dim() == 2:
+            z_depth = z_depth.unsqueeze(-1)
+
+        # background features -> [B,?] or None -> keep as-is, decoder decides
+        if z_bg_features is None:
+            # give the decoder a tiny zero code if it expects something
+            z_bg_features = torch.zeros(B, getattr(self, "bg_code_dim", 0), device=device) \
+                            if getattr(self, "bg_code_dim", 0) > 0 else None
+
+        # context -> pass through (decoder can handle None)
+        # z_ctx stays as passed in
+
+        # ---------- 1) Optional variance-based filtering ----------
         if filter_key is not None:
             orig_shape = z.shape
-            # filter_key: [batch_size, n_kp]
-            if len(filter_key.shape) == 3:
-                # [bs, T, n_kp]
+            if filter_key.dim() == 3:  # [B,T,K] -> [BT,K]
                 filter_key = filter_key.view(-1, filter_key.shape[-1])
-            if len(orig_shape) == 4:
-                # [bs, T, n_kp, ...] -> [bs * T, n_kp, ...]
-                z = z.view(-1, *z.shape[2:])
-                z_scale = z_scale.view(-1, *z_scale.shape[2:])
-                z_depth = z_depth.view(-1, *z_depth.shape[2:])
+
+            if len(orig_shape) == 4:   # [B,T,K,*] -> [BT,K,*]
+                z          = z.view(-1, *z.shape[2:])
+                z_scale    = z_scale.view(-1, *z_scale.shape[2:])
+                z_depth    = None if z_depth is None else z_depth.view(-1, *z_depth.shape[2:])
                 z_features = z_features.view(-1, *z_features.shape[2:])
                 obj_on_sample = obj_on_sample.view(-1, *obj_on_sample.shape[2:])
-            # k = self.n_kp_dec
-            # discourage "lazy" particles that don't move by choking the model to use less particles for reconstruction
+
             k = self.n_kp_dec if not warmup else min(self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc))
-            _, embed_ind = torch.topk(filter_key, k=k, dim=-1, largest=False)
-            # make selection
-            batch_ind = torch.arange(z.shape[0], device=z.device)[:, None]
+            _, keep = torch.topk(filter_key, k=k, dim=-1, largest=False)
+            bidx = torch.arange(z.shape[0], device=z.device)[:, None]
 
-            z = z[batch_ind, embed_ind]  # [bs * T, n_kp_dec, 2]
-            z_scale = z_scale[batch_ind, embed_ind]  # [bs * T, n_kp_dec, 2]
-            obj_on_sample = obj_on_sample[batch_ind, embed_ind]  # [bs * T, n_kp_dec, 1]
-            z_depth = z_depth[batch_ind, embed_ind]  # [bs * T, n_kp_dec, 1]
-            z_features = z_features[batch_ind, embed_ind]  # [bs * T, n_kp_dec, features_dim]
+            z          = z[bidx, keep]
+            z_scale    = z_scale[bidx, keep]
+            obj_on_sample = obj_on_sample[bidx, keep]
+            z_features = z_features[bidx, keep]
+            if z_depth is not None:
+                z_depth = z_depth[bidx, keep]
 
-            if len(orig_shape) == 4:
-                # [bs * T, n_kp, ...] -> [bs, T, n_kp, ...]
-                z = z.reshape(orig_shape[0], orig_shape[1], *z.shape[1:])
-                z_scale = z_scale.reshape(orig_shape[0], orig_shape[1], *z_scale.shape[1:])
-                z_depth = z_depth.reshape(orig_shape[0], orig_shape[1], *z_depth.shape[1:])
-                z_features = z_features.reshape(orig_shape[0], orig_shape[1], *z_features.shape[1:])
-                obj_on_sample = obj_on_sample.reshape(orig_shape[0], orig_shape[1], *obj_on_sample.shape[1:])
+            if len(orig_shape) == 4:  # back to [B,T,...]
+                def unflatten(t):
+                    return None if t is None else t.reshape(orig_shape[0], orig_shape[1], *t.shape[1:])
+                z          = unflatten(z)
+                z_scale    = unflatten(z_scale)
+                z_features = unflatten(z_features)
+                obj_on_sample = unflatten(obj_on_sample)
+                z_depth    = unflatten(z_depth)
 
-        dec_dict = self.decoder_module(z, z_scale, z_features, z_depth_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup)
+        # ---------- 2) Call the decoder ----------
+        dec_dict = self.decoder_module(
+            z=z,                              # [B,K,3]
+            z_scale=z_scale,                  # [B,K,3] (logits or params; your decoder decides)
+            z_features=z_features,            # [B,K,F]
+            obj_on=obj_on_sample,             # [B,K,1]
+            z_depth=z_depth,                  # [B,K,1] or None
+            z_bg_features=z_bg_features,               # [B,?] or None
+            warmup=warmup
+        )
 
-        dec_objects = dec_dict['dec_objects']
-        dec_objects_trans = dec_dict['dec_objects_trans']
-        rec = dec_dict['rec']
-        bg_rec = dec_dict['bg_rec']
+        # ---------- 3) Postprocess (same as you had) ----------
+        dec_objects      = dec_dict['dec_objects']
+        dec_objects_trans= dec_dict['dec_objects_trans']
+        rec              = dec_dict['rec']
+        bg_rec           = dec_dict['bg_rec']
+        rec_rgb          = dec_dict['rec_rgb']
+        rec_depth        = dec_dict['rec_depth']
 
-        # Separate RGB Depth 
-        rec_rgb = dec_dict['rec_rgb']
-        rec_depth = dec_dict['rec_depth']
-
-        # TODO: check if rec_depth need to be normalized
-        # TODO: Check if bg_rec needs to be separated into rgb and depth
         if self.normalize_rgb:
-            # final RGB
             if self.cdim == 4:
-                if self.separate_depth_features:
-                    # rec_rgb already 3ch from your pipeline; normalize it
-                    rec_rgb = minusoneone_to_rgb(rec_rgb)
-                else:
-                    rec_rgb = minusoneone_to_rgb(rec[:, :3])
+                rec_rgb = minusoneone_to_rgb(rec_rgb if self.separate_depth_features else rec[:, :3])
             else:
                 rec_rgb = minusoneone_to_rgb(rec)
+            bg_rec_rgb       = minusoneone_to_rgb(bg_rec[:, :3])
+            dec_objects_trans= minusoneone_to_rgb(dec_objects_trans)
 
-            bg_rec_rgb = minusoneone_to_rgb(bg_rec[:, :3])
-            dec_objects_trans = minusoneone_to_rgb(dec_objects_trans)
-
-            # per-object patches: keep α, normalize only RGB
             if dec_objects.shape[2] >= 4:
-                a = dec_objects[:, :, :1]
+                a   = dec_objects[:, :, :1]
                 rgb = minusoneone_to_rgb(dec_objects[:, :, 1:4])
-                dec_objects_rgb = torch.cat([a, rgb], dim=2)   # RGBA for viz
+                dec_objects_rgb = torch.cat([a, rgb], dim=2)
             else:
-                # if for some reason patches are only RGB
                 dec_objects_rgb = minusoneone_to_rgb(dec_objects)
         else:
-            # no normalization — just slice correctly
-            if self.cdim == 4:
-                rec_rgb = rec_rgb if self.separate_depth_features else rec[:, :3]
-            else:
-                rec_rgb = rec
-            bg_rec_rgb = bg_rec[:, :3]
-            dec_objects_rgb = dec_objects
+            rec_rgb        = rec_rgb if (self.cdim == 4 and self.separate_depth_features) else rec[:, :3]
+            bg_rec_rgb     = bg_rec[:, :3]
+            dec_objects_rgb= dec_objects
 
         bg_depth = bg_rec[:, 3:4] if bg_rec.shape[1] > 3 else None
 
-        dec_dict['rec_rgb'] = rec_rgb
-        dec_dict['bg_rgb'] = bg_rec_rgb
-        dec_dict['rec_depth'] = rec_depth
-        dec_dict['bg_depth'] = bg_depth   
-        dec_dict['dec_objects_trans'] = dec_objects_trans
-        dec_dict['dec_objects_original_rgb'] = dec_objects_rgb
+        dec_dict['rec_rgb']                 = rec_rgb
+        dec_dict['bg_rgb']                  = bg_rec_rgb
+        dec_dict['rec_depth']               = rec_depth
+        dec_dict['bg_depth']                = bg_depth
+        dec_dict['dec_objects_trans']       = dec_objects_trans
+        dec_dict['dec_objects_original_rgb']= dec_objects_rgb
         return dec_dict
+
 
     def sample_from_x(self, x, num_steps=10, deterministic=True, cond_steps=None, return_z=False, use_all_ctx=False,
                       actions=None, actions_mask=None, lang_embed=None, x_goal=None, decode=True, n_pred_eq_gt=True,
@@ -1138,92 +1182,30 @@ class VoxelDLP(nn.Module):
                 beta_rec=1.0, kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
                 balance=0.5, beta_dyn_rec=1.0, num_static=None, actions=None, actions_mask=None, lang_embed=None,
                 beta_obj=0.0, done_mask=None, x_goal=None):
-        if len(x.shape) == 4:
-            # x: [bs, ch, h, w]
-            batch_size = x.size(0)
-            timestep_horizon = 1
-            x = x.unsqueeze(1)
-        else:
-            # x: [bs, T + 1, ch, h, w]
-            batch_size, timestep_horizon = x.size(0), x.size(1)
+        enc = self.encode_all(x, mask,deterministic=deterministic,warmup=warmup,actions=actions, actions_mask=actions_mask,lang_embed=lang_embed, x_goal=x_goal)
 
-        if self.normalize_rgb:
-            x = rgb_to_minusoneone(x)
-            if x_goal is not None:
-                x_goal = rgb_to_minusoneone(x_goal)
+        z               = enc['z']                 # [B,K,3]
+        z_scale         = enc['z_scale']           # [B,K,3] or None
+        z_features      = enc['z_features']        # [B,K,F] or None
+        z_obj_on        = enc['z_obj_on'] if 'z_obj_on' in enc else enc['obj_on']  # [B,K] or [B,K,1] or None
+        z_depth         = enc['z_depth']           # [B,K,1] or None
+        z_bg_features   = enc['z_bg_features']     # [B,?] or None
+        # z_context       = enc['z_context']         # [B,?] or None
+        z_base_var      = enc['z_base_var']        # [B,K,Dv] or None
 
-        # encode particles
-        enc_dict = self.encode_all(x, mask, deterministic, warmup=warmup, actions=actions, actions_mask=actions_mask,
-                                   lang_embed=lang_embed, x_goal=x_goal)
+        # Optional extras that many decoders don’t strictly need but are nice to have
+        z_base          = enc['z_base']            # [B,K,3]
+        mu_tot          = enc['mu_tot']            # [B,K,3]
+        mu_features     = enc['mu_features']       # [B,K,F] or None
+        logvar_features = enc['logvar_features']   # [B,K,F] or None
+        mu_scale        = enc['mu_scale']          # [B,K,3] or None
+        logvar_scale    = enc['logvar_scale']      # [B,K,3] or None
 
-        # unpack encoder output: [bs, T, ...]
-        kp_p = enc_dict['kp_p']
-        mu_anchor = enc_dict['mu_anchor']  # mu_anchor = z_base = top-k(kp_p)
-        logvar_anchor = enc_dict['logvar_anchor']
-        z_base = enc_dict['z_base']
-        z_base_var = enc_dict['z_base_var']
-        z = enc_dict['z']
-        mu_offset = enc_dict['mu_offset']
-        logvar_offset = enc_dict['logvar_offset']
-        z_offset = enc_dict['z_offset']
-        mu_tot = enc_dict['mu_tot']
-        mu_features = enc_dict['mu_features']
-        mu_depth_features = enc_dict['mu_depth_features']
-        logvar_features = enc_dict['logvar_features']
-        logvar_depth_features = enc_dict['logvar_depth_features']   
-        z_features = enc_dict['z_features']
-        z_depth_features = enc_dict['z_depth_features']
-        # cropped_objects = enc_dict['cropped_objects_original']
-        obj_on_a = enc_dict['obj_on_a']
-        obj_on_b = enc_dict['obj_on_b']
-        z_obj_on = enc_dict['obj_on']
-        mu_obj_on = enc_dict['mu_obj_on']
-        mu_depth = enc_dict['mu_depth']
-        logvar_depth = enc_dict['logvar_depth']
-        z_depth = enc_dict['z_depth']
-        mu_scale = enc_dict['mu_scale']
-        logvar_scale = enc_dict['logvar_scale']
-        z_scale = enc_dict['z_scale']
-        mu_bg_features = enc_dict['mu_bg_features']
-        logvar_bg_features = enc_dict['logvar_bg_features']
-        z_bg_features = enc_dict['z_bg_features']
-        mu_context_global = enc_dict['mu_context_global']
-        logvar_context_global = enc_dict['logvar_context_global']
-        z_context_global = enc_dict['z_context_global']
-        mu_context = enc_dict['mu_context']
-        logvar_context = enc_dict['logvar_context']
-        z_context = enc_dict['z_context']
-        cropped_objects = enc_dict['cropped_objects']
-        cropped_objects_rgb = enc_dict['cropped_objects_rgb']
-
-        mu_score = enc_dict['mu_score']
-        logvar_score = enc_dict['logvar_score']
-        z_score = enc_dict['z_score']
-
-        if self.context_dim > 0:
-            mu_context_dyn = enc_dict['mu_context_dyn'][:, :-1]
-            if self.context_dist != 'categorical':
-                logvar_context_dyn = enc_dict['logvar_context_dyn'][:, :-1]
-            else:
-                logvar_context_dyn = mu_context_dyn
-            z_context_dyn = enc_dict['z_context_dyn'][:, :-1]
-
-            if self.global_ctx_pool:
-                mu_context_global_dyn = enc_dict['mu_context_global_dyn'][:, :-1]
-                if self.context_dist != 'categorical':
-                    logvar_context_global_dyn = enc_dict['logvar_context_global_dyn'][:, :-1]
-                else:
-                    logvar_context_global_dyn = mu_context_global_dyn
-                z_context_global_dyn = enc_dict['z_context_global_dyn'][:, :-1]
-            else:
-                mu_context_global_dyn = logvar_context_global_dyn = z_context_global_dyn = None
-        else:
-            mu_context_dyn = logvar_context_dyn = z_context_dyn = None
-            mu_context_global_dyn = logvar_context_global_dyn = z_context_global_dyn = None
-
-        filter_key = z_base_var.sum(-1) if (
-                self.filter_particles_in_decoder and self.n_kp_enc != self.n_kp_dec) else None
-        dec_dict = self.decode_all(z, z_scale, z_features, z_depth_features, z_obj_on, z_depth, z_bg_features, z_context,
+        # Optional variance filter key for the decoder (expect sum-over-last-dim)
+        filter_key = None
+        if z_base_var is not None and z_base_var.dim() >= 2:
+            filter_key = z_base_var.sum(dim=-1)    # -> [B,K]
+        dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features,
                                    warmup, filter_key=filter_key)
 
         bg_mask = dec_dict['bg_mask']
