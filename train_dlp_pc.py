@@ -27,6 +27,8 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
 from utils.rgbd_utils import get_depth_range, normalize_rgbd
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
+from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly
+import wandb
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
@@ -272,6 +274,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # iteration counter
     iteration = 0
 
+    wandb.init()
     for epoch in range(start_epoch, num_epochs):
         model.train()
         batch_losses = []
@@ -325,6 +328,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 except Exception:
                     return float(default)
 
+            pts_scene = model_output["points_scene"]
+            print("pts_scene Shape: ", pts_scene.shape)
             # --- unpack logged losses from calc_static_elbo_pc ---
             loss            = all_losses['loss']
             loss_rec        = all_losses['loss_rec']               # chamfer + color*weight
@@ -420,6 +425,41 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         )
         print(log_str)
         log_line(log_dir, log_str)
+
+        if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
+            b0 = 0
+
+            # GT (filtered by mask)
+            gt_clean = clean_pts(pts[b0], mask[b0] if mask is not None else None)
+
+            # REC
+            rec_pts  = model_output.get('points_scene')
+            rec_pts  = clean_pts(rec_pts[b0]) if rec_pts is not None else None
+            rec_cols = model_output.get('rec_colors')
+            rec_cols = rec_cols[b0] if rec_cols is not None else None
+            ids      = model_output.get('assign_ids')
+            ids      = ids[b0] if ids is not None else None
+
+            # KPs
+            mu_b = model_output.get('mu') or model_output.get('mu_tot')
+            kp_xyz = model_output['kp_p']
+
+            # Interactive logs with adjustable marker size
+            log_pc_plotly("gt/plotly_pc",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=iteration, point_size=2)
+            log_pc_plotly("rec/plotly_pc", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=iteration, point_size=2)
+
+
+            log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=kp_xyz,
+                      color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+
+            # # or overlay using REC RGB vs gray GT:
+            # log_pc_overlay_plotly("viz/overlay_rec_rgb", gt_clean, rec_pts, rec_colors=rec_cols, kps=kp_xyz,
+            #                     color_mode="rec_rgb", step=iteration, point_size_gt=2, point_size_rec=2)
+
+            # # or overlay using REC ids vs gray GT:
+            # log_pc_overlay_plotly("viz/overlay_rec_ids", gt_clean, rec_pts, rec_ids=ids, kps=kp_xyz,
+            #                     color_mode="rec_ids", step=iteration, point_size_gt=2, point_size_rec=2)
+
 
     return model
 
