@@ -237,7 +237,6 @@ class ParticleEncoder(nn.Module):
         # var_kp: [B, K, 3, 3] covariance per proposal
         kp_p, var_kp = self.encode_prior(x, mask)       # this calls self.prior_encoder(points, mask)
 
-        # Base (deterministic) proposal position: z_base == mu (like 2D code)
         mu      = kp_p                                  # [B, K, 3]
         logvar  = torch.zeros_like(mu)                  # [B, K, 3] (deterministic chamfer KL)
         z_base  = mu                                    # [B, K, 3]

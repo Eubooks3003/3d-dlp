@@ -25,7 +25,7 @@ class GridVoxelizer(nn.Module):
         self.out_feat = out_feat
         self.pooling = pooling
 
-    def forward(self, pts: torch.Tensor, mask: torch.Tensor = None):
+    def forward(self, pts: torch.Tensor, mask: torch.Tensor = None, weights=None, with_moments=True):
         assert pts.dim() == 3 and pts.size(-1) >= 3, f"pts should be [B,N,3(+F)], got {tuple(pts.shape)}"
         B, N, C = pts.shape
         device = pts.device
@@ -35,12 +35,31 @@ class GridVoxelizer(nn.Module):
             mask = torch.ones(B, N, dtype=torch.bool, device=device)
         mask_f = mask.float()  # [B,N]
 
+        if weights is None:
+            weights = torch.ones(B, N, device=device)
+        weights = weights * mask_f  # [B,N]
+
         # split coords / features
         xyz = pts[..., :3]  # [-1,1]
         if C > 3 and (C - 3) == self.out_feat:
             feat = pts[..., 3:]                       # [B,N,out_feat]
         else:
             feat = torch.ones(B, N, self.out_feat, device=device)  # [B,N,out_feat]
+
+
+        # per-point features to splat
+        if with_moments:
+            # [1] density
+            f_den = weights[:, :, None]                             # [B,N,1]
+            # [2] first moments (weighted xyz)
+            f_xyz = weights[:, :, None] * xyz                       # [B,N,3]
+            # [3] second moments (weighted xyz^2)
+            f_xyz2 = weights[:, :, None] * (xyz * xyz)              # [B,N,3]
+            feat = torch.cat([f_den, f_xyz, f_xyz2], dim=-1)        # [B,N,7]
+            Cg = 7
+        else:
+            feat = torch.ones(B, N, self.out_feat, device=device)   # fallback
+            Cg = self.out_feat
 
         # map to voxel index space [0, size-1]
         px = (xyz[..., 0] + 1) * 0.5 * (self.W - 1)
@@ -110,6 +129,17 @@ class GridVoxelizer(nn.Module):
         scatter(w101, x1, y0, z1)
         scatter(w011, x0, y1, z1)
         scatter(w111, x1, y1, z1)
+
+        if with_moments:
+            den   = vox[:, 0:1]                    # [B,1,D,H,W]
+            sum_x = vox[:, 1:2]; sum_y = vox[:, 2:3]; sum_z = vox[:, 3:4]
+            sum_x2= vox[:, 4:5]; sum_y2= vox[:, 5:6]; sum_z2= vox[:, 6:7]
+            eps = 1e-6
+            mean_x = sum_x / (den + eps); mean_y = sum_y / (den + eps); mean_z = sum_z / (den + eps)
+            var_x  = (sum_x2 / (den + eps) - mean_x**2).clamp_min(0.)
+            var_y  = (sum_y2 / (den + eps) - mean_y**2).clamp_min(0.)
+            var_z  = (sum_z2 / (den + eps) - mean_z**2).clamp_min(0.)
+            vox = torch.cat([den, mean_x, mean_y, mean_z, var_x, var_y, var_z], dim=1)
 
         # mean pooling if requested
         if cnt is not None:

@@ -609,3 +609,97 @@ if __name__ == '__main__':
     for metric in ['cosine', 'l1', 'l2', 'l2_simple']:
         P = batch_pairwise_dist(x, y, metric)
         print(f'metric: {metric}, P: {P.shape}, max: {P.max()}, min: {P.min()}')
+
+
+
+# POINT CLOUD LOSSES
+
+
+# ---------- curvature weights on x_pts (input) ----------
+def estimate_curvature(x, k=16):
+    # x: [B,N,3]; return kappa in [B,N] (bigger => more curved/edgey)
+    with torch.no_grad():
+        # quick kNN via pairwise distances (ok up to medium N)
+        d2 = torch.cdist(x, x, p=2) ** 2             # [B,N,N]
+        knn_idx = d2.topk(k=k+1, largest=False).indices[..., 1:]  # drop self
+        b = torch.arange(x.size(0), device=x.device)[:, None, None]
+        nbrs = x[b, knn_idx]                          # [B,N,k,3]
+        mu = nbrs.mean(dim=2, keepdim=True)           # [B,N,1,3]
+        C = (nbrs - mu).transpose(-1, -2) @ (nbrs - mu) / max(k-1,1)  # [B,N,3,3]
+        # curvature ~ smallest eigenvalue / trace; use symmetric eig
+        # torch.linalg.eigvals on 3x3 is fine
+        evals = torch.linalg.eigvalsh(C).clamp_min(0.)  # [B,N,3]
+        kappa = (evals[..., 0] / (evals.sum(dim=-1) + 1e-8))        # [B,N]
+        # normalize across N for stability
+        kappa = kappa / (kappa.mean(dim=1, keepdim=True) + 1e-6)
+        return kappa.clamp(min=0.1, max=5.0)          # avoid extremes
+
+def chamfer_l2_weighted(p, q, q_mask=None, q_weights=None):
+    # p: [B,M,3], q: [B,N,3], q_weights: [B,N] positive weights
+    B, M, _ = p.shape; N = q.shape[1]
+    q_pad = q
+    if q_mask is not None:
+        big = torch.tensor(1e6, device=q.device, dtype=q.dtype)
+        q_pad = torch.where(q_mask[..., None], q, big)
+    d_pq = torch.cdist(p, q_pad, p=2) ** 2                       # [B,M,N]
+    term_pq = d_pq.min(dim=-1).values.mean(dim=-1)               # [B]
+
+    d_qp = (torch.cdist(q, p, p=2) ** 2).min(dim=-1).values      # [B,N]
+    if q_weights is None:
+        qw = torch.ones_like(d_qp)
+    else:
+        qw = q_weights
+    if q_mask is not None:
+        qw = qw * q_mask.float()
+    qw = qw / (qw.sum(dim=-1, keepdim=True).clamp_min(1.0))      # normalize per batch
+    term_qp = (d_qp * qw).sum(dim=-1)                            # [B]
+    return 0.5 * (term_pq + term_qp)
+
+
+def repulsion_loss(P, k=8, r_frac=0.01):
+    # P: [B,M,3]; radius r as % of scene diagonal (assuming coords in [-1,1])
+    with torch.no_grad():
+        scene_diag = 2.0  # [-1,1] cube -> diagonal ~2*sqrt(3); using 2.0 as scale is fine
+        r = r_frac * scene_diag
+    d2 = torch.cdist(P, P, p=2) ** 2                            # [B,M,M]
+    knn = d2.topk(k=k+1, largest=False).values[..., 1:]         # [B,M,k]
+    d = knn.sqrt()                                              # [B,M,k]
+    return torch.relu(r - d).mean()
+
+
+def coverage_loss(p, q, q_mask=None, tau=0.01):
+    # distance from each q to nearest p, hinge at tau
+    d = (torch.cdist(q, p, p=2)).min(dim=-1).values  # [B,N]
+    if q_mask is not None:
+        d = d * q_mask.float()
+        denom = q_mask.sum(dim=-1).clamp_min(1).float()
+        return torch.relu(d - tau).sum(dim=-1) / denom
+    return torch.relu(d - tau).mean(dim=-1)
+
+
+def estimate_normals_pca(P, k=16):
+    # P: [B,M,3] -> normals [B,M,3] (unit)
+    d2 = torch.cdist(P, P, p=2) ** 2
+    knn_idx = d2.topk(k=k+1, largest=False).indices[..., 1:]       # [B,M,k]
+    b = torch.arange(P.size(0), device=P.device)[:, None, None]
+    nbrs = P[b, knn_idx]                                           # [B,M,k,3]
+    mu = nbrs.mean(dim=2, keepdim=True)
+    C = (nbrs - mu).transpose(-1, -2) @ (nbrs - mu) / max(k-1,1)   # [B,M,3,3]
+    evals, evecs = torch.linalg.eigh(C)                            # ascending
+    n = evecs[..., 0]                                              # smallest eigenvector
+    return torch.nn.functional.normalize(n, dim=-1)
+
+
+
+
+def kp_separation_loss(kp_xyz, obj_on, delta=0.05):
+    # kp_xyz: [B,K,3], obj_on: [B,K,1] in [0,1]
+    w = obj_on.squeeze(-1)                              # [B,K]
+    # pairwise distances
+    diff = kp_xyz.unsqueeze(2) - kp_xyz.unsqueeze(1)    # [B,K,K,3]
+    d = diff.norm(dim=-1) + torch.eye(kp_xyz.size(1), device=kp_xyz.device)[None]*1e9
+    # weight by presence of both kps
+    w_pair = (w.unsqueeze(2) * w.unsqueeze(1))          # [B,K,K]
+    sep = torch.relu(delta - d) * w_pair
+    return sep.mean()
+

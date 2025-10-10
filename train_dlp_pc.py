@@ -289,6 +289,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         
         losses_rec_geom = []
         losses_rec_color = []
+        losses_cov = []
+        losses_norm = []
+        losses_repulsion = []
         obj_on_l1_list = []
         obj_on_mean_list = []
         mu_scale_mean_list = []
@@ -329,12 +332,14 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                     return float(default)
 
             pts_scene = model_output["points_scene"]
-            print("pts_scene Shape: ", pts_scene.shape)
             # --- unpack logged losses from calc_static_elbo_pc ---
             loss            = all_losses['loss']
             loss_rec        = all_losses['loss_rec']               # chamfer + color*weight
             loss_rec_geom   = all_losses.get('loss_rec_geom', None)
             loss_rec_color  = all_losses.get('loss_rec_color', None)
+            loss_repulsion = all_losses.get('loss_repulsion', None)
+            loss_cov = all_losses.get('loss_cov', None)
+            loss_norm = all_losses.get('loss_norm', None)
             loss_kl         = all_losses['kl']
             loss_kl_kp      = all_losses.get('loss_kl_kp', None)
             loss_kl_scale   = all_losses.get('loss_kl_scale', None)
@@ -369,6 +374,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 losses_rec_geom.append(_to_float(loss_rec_geom))
             if loss_rec_color is not None:
                 losses_rec_color.append(_to_float(loss_rec_color))
+            losses_repulsion.append(_to_float(loss_repulsion))
+            losses_cov.append(_to_float(loss_cov))
+            losses_norm.append(_to_float(loss_norm))
 
             # optional: track obj_on stats
             obj_on_l1_list.append(_to_float(obj_on_l1))
@@ -411,6 +419,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         mean_on_l1   = float(np.mean(obj_on_l1_list)) if len(obj_on_l1_list) else None
         mean_on_prob = float(np.mean(obj_on_mean_list)) if len(obj_on_mean_list) else None
         mean_s_scale = float(np.mean(mu_scale_mean_list)) if len(mu_scale_mean_list) else None
+        mean_repulsion = float(np.mean(losses_repulsion)) if len(losses_repulsion) else None
+        mean_cov = float(np.mean(losses_cov)) if len(losses_cov) else None
+        mean_norm = float(np.mean(losses_norm)) if len(losses_norm) else None
 
         log_str = (
             f"epoch {epoch:04d} | "
@@ -445,13 +456,33 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             kp_xyz = model_output['kp_p']
 
             # Interactive logs with adjustable marker size
-            log_pc_plotly("gt/plotly_pc",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=iteration, point_size=2)
-            log_pc_plotly("rec/plotly_pc", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=iteration, point_size=2)
+            log_pc_plotly("gt/plotly_pc",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
+            log_pc_plotly("rec/plotly_pc", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)
 
 
             log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=kp_xyz,
-                      color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+                      color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            
 
+            # Log mean values before in wandb
+
+            metrics = {
+                "rec/chamfer": mean_chamfer,
+                "rec/color": mean_color,
+                "obj/on_L1": mean_on_l1,
+                "obj/on_prob": mean_on_prob,
+                "obj/scale_mean": mean_s_scale,
+                "reg/repulsion": mean_repulsion,
+                "reg/cov": mean_cov,
+                "reg/norm": mean_norm,
+            }
+            # drop None values so W&B only logs valid scalars
+            metrics = {k: v for k, v in metrics.items() if v is not None}
+
+            if metrics:  # only log if something to log
+                print("LOGGING METRICS")
+                print(metrics)
+                wandb.log(metrics, step=epoch)
             # # or overlay using REC RGB vs gray GT:
             # log_pc_overlay_plotly("viz/overlay_rec_rgb", gt_clean, rec_pts, rec_colors=rec_cols, kps=kp_xyz,
             #                     color_mode="rec_rgb", step=iteration, point_size_gt=2, point_size_rec=2)

@@ -18,7 +18,7 @@ from modules.modules import DLPDynamics
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \
-    ChamferLossKL
+    ChamferLossKL, estimate_curvature, kp_separation_loss, coverage_loss, repulsion_loss, chamfer_l2_weighted, estimate_normals_pca
 from modules.vision_modules import rgb_to_minusoneone, minusoneone_to_rgb
 
 
@@ -1901,7 +1901,42 @@ class VoxelDLP(nn.Module):
             )                                               # [B,M,3]
             loss_rec_color = F.mse_loss(rgb_scene, nn_rgb, reduction='mean')
 
-        loss_rec = loss_rec_geom + color_weight * loss_rec_color
+        # compute curvature weights and replace/augment loss_rec_geom
+        kappa = estimate_curvature(x_pts, k=16)                  # [B,N]
+        chamfer_edge = chamfer_l2_weighted(pts_scene, x_pts, mask_pc, q_weights=kappa)
+        # blend 50/50 with uniform Chamfer you already computed
+        loss_rec_geom = 0.5 * loss_rec_geom + 0.5 * chamfer_edge.mean()
+
+
+        loss_repulsion = repulsion_loss(pts_scene, k=8, r_frac=0.01)
+        loss_cov = coverage_loss(pts_scene, x_pts, mask_pc, tau=0.01).mean()
+
+        with torch.no_grad():
+            n_rec = estimate_normals_pca(pts_scene, k=16)                   # [B,M,3]
+            # map input→rec via NN from x to p for normal targets
+            nn_idx = torch.cdist(x_pts, pts_scene, p=2).argmin(dim=-1)      # [B,N]
+        b = torch.arange(x_pts.size(0), device=x_pts.device)[:, None]
+        n_tgt = n_rec[b, nn_idx]                                            # [B,N,3]
+        # estimate input normals too (or approximate via n_tgt only if expensive)
+        n_in = estimate_normals_pca(x_pts, k=16)
+        loss_norm = (1.0 - (n_in * n_tgt).sum(dim=-1).abs()).mean()
+
+        loss_kp_sep = kp_separation_loss(mu_tot, obj_on, delta=0.05)
+
+        # ADDITIONAL LOSSES
+
+        w_repulsion = 0.1
+        w_cov       = 0.5
+        w_norm      = 0.1
+        w_kp_sep    = 1e-3
+
+        loss_geom_total = loss_rec_geom \
+                + w_repulsion * loss_repulsion \
+                + w_cov       * loss_cov \
+                + w_norm      * loss_norm
+
+        # keep your existing color part
+        loss_rec = loss_geom_total + color_weight * loss_rec_color
 
         # ---- KL mask from obj_on ----
         if use_kl_mask:
@@ -2035,10 +2070,20 @@ class VoxelDLP(nn.Module):
 
         # Optional regularizer on number of active objects (same idea as before)
         obj_on_l1 = obj_on.squeeze(-1).abs().sum(dim=-1).mean()
-        loss_obj_reg = (obj_on.squeeze(-1).sum(dim=-1) ** 2).mean()
 
+        # ADDITIONAL LOSSES 
         # ---- Total loss ----
         loss_kl_total = loss_kl_kp + loss_kl_scale + loss_kl_feat + loss_kl_obj_on
+
+        # (existing) KLs
+        loss_kl_total = loss_kl_kp + loss_kl_scale + loss_kl_feat + loss_kl_obj_on
+
+        # (existing) obj_on regularizers
+        loss_obj_reg = (obj_on.squeeze(-1).sum(dim=-1) ** 2).mean()
+        # add kp separation
+        loss_obj_reg = loss_obj_reg + w_kp_sep * loss_kp_sep
+
+        # final loss
         loss = beta_rec * loss_rec + beta_kl * loss_kl_total + beta_obj * loss_obj_reg
 
         return {
@@ -2046,6 +2091,9 @@ class VoxelDLP(nn.Module):
             'loss_rec': loss_rec,
             'loss_rec_geom': loss_rec_geom,
             'loss_rec_color': loss_rec_color,
+            'loss_repulsion': loss_repulsion,
+            'loss_cov': loss_cov,
+            'loss_norm': loss_norm,
             'kl': loss_kl_total,
             'loss_kl_kp': loss_kl_kp,
             'loss_kl_scale': loss_kl_scale,
