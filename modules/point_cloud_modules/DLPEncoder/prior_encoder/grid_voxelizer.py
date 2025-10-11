@@ -25,6 +25,70 @@ class GridVoxelizer(nn.Module):
         self.out_feat = out_feat
         self.pooling = pooling
 
+    @staticmethod
+    def _pad_to_multiple(x, mult):
+        """Pad [B,C,D,H,W] so D,H,W are multiples of mult=(md,mh,mw)."""
+        B,C,D,H,W = x.shape
+        md,mh,mw = mult
+        padD = (md - D % md) % md
+        padH = (mh - H % mh) % mh
+        padW = (mw - W % mw) % mw
+        if padD or padH or padW:
+            # pad = (W_l, W_r, H_l, H_r, D_l, D_r)
+            x = F.pad(x, (0,padW, 0,padH, 0,padD))
+        return x, (padD, padH, padW)
+
+    def get_tile_location_idx(self, Dp, Hp, Wp, tile_size, device=None, dtype=torch.int32):
+        """Return starts (z,y,x) for each tile in the **padded** grid."""
+        td,th,tw = map(int, tile_size)
+        Td,Th,Tw = Dp//td, Hp//th, Wp//tw
+        zz = torch.arange(Td, device=device, dtype=dtype) * td
+        yy = torch.arange(Th, device=device, dtype=dtype) * th
+        xx = torch.arange(Tw, device=device, dtype=dtype) * tw
+        Z,Y,X = torch.meshgrid(zz, yy, xx, indexing="ij")
+        starts = torch.stack([Z, Y, X], dim=-1).reshape(-1, 3)   # [T,3]
+        return starts
+
+    def get_tile_centers(self, Dp, Hp, Wp, tile_size, device=None, dtype=torch.float32):
+        """Centers (z,y,x) of every tile in voxel coordinates (padded grid)."""
+        starts = self.get_tile_location_idx(Dp, Hp, Wp, tile_size, device=device, dtype=torch.int32)
+        td,th,tw = map(float, tile_size)
+        mid = torch.tensor([td/2, th/2, tw/2], device=starts.device, dtype=torch.float32)
+        return starts.to(torch.float32) + mid  # [T,3]
+
+    def vox_to_tiles(self, vox, tile_size):
+        """
+        Split [B,C,D,H,W] -> tiles [B,C,T,td,th,tw], returns tiles + meta (pads, shapes, grid).
+        """
+        B,C,D,H,W = vox.shape
+        td,th,tw = map(int, tile_size)
+        vox_padded, pads = self._pad_to_multiple(vox, (td,th,tw))
+        _,_,Dp,Hp,Wp = vox_padded.shape
+        Td,Th,Tw = Dp//td, Hp//th, Wp//tw
+
+        # [B,C,Td,td,Th,th,Tw,tw] -> [B,C,Td,Th,Tw,td,th,tw] -> [B,C,T,td,th,tw]
+        g = vox_padded.view(B, C, Td, td, Th, th, Tw, tw).permute(0,1,2,4,6,3,5,7).contiguous()
+        tiles = g.view(B, C, Td*Th*Tw, td, th, tw)
+
+        meta = {
+            "pads": (pads[0], pads[1], pads[2]),      # (padD,padH,padW)
+            "padded_shape": (Dp,Hp,Wp),               # after padding
+            "tiles_grid": (Td,Th,Tw),                 # number of tiles per axis
+            "tile_size": (td,th,tw),                  # tile extent
+        }
+        return tiles, meta
+
+    def tiles_to_vox(self, tiles, meta):
+        """
+        Inverse of vox_to_tiles for debugging/visualization.
+        tiles: [B,C,T,td,th,tw] -> [B,C,Dp,Hp,Wp] (still padded)
+        """
+        B,C,T,td,th,tw = tiles.shape
+        Td,Th,Tw = meta["tiles_grid"]
+        Dp,Hp,Wp = meta["padded_shape"]
+        g = tiles.view(B, C, Td, Th, Tw, td, th, tw).permute(0,1,2,5,3,6,4,7).contiguous()
+        return g.view(B, C, Dp, Hp, Wp)
+
     def forward(self, pts: torch.Tensor, mask: torch.Tensor = None, weights=None, with_moments=True):
         assert pts.dim() == 3 and pts.size(-1) >= 3, f"pts should be [B,N,3(+F)], got {tuple(pts.shape)}"
         B, N, C = pts.shape

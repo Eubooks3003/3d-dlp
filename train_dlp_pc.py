@@ -27,7 +27,7 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
 from utils.rgbd_utils import get_depth_range, normalize_rgbd
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
-from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly
+from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly, select_topk_keypoints
 import wandb
 
 matplotlib.use("Agg")
@@ -137,6 +137,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
     decoder_point_mode = config["decoder_point_mode"]
     points_per_object = config["points_per_object"]
+    points_per_scale = config["points_per_scale"]
+    points_bg = config["points_bg"]
 
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=pc_collate)
@@ -209,10 +211,12 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         # PC Stuff
         decoder_point_mode=decoder_point_mode,
         points_per_object=points_per_object,
+        points_per_scale=points_per_scale,
+        points_bg=points_bg,
         ).to(device)
         
     model_info = model.info()
-    print(model_info)
+    # print(model_info)
     # prepare saving location
     run_name = f'{ds}_gdlp' + run_prefix
     log_dir = prepare_logdir(runname=run_name, src_dir='./logs')
@@ -467,6 +471,18 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             mu_b = model_output.get('mu') or model_output.get('mu_tot')
             kp_xyz = model_output['kp_p']
 
+            with torch.no_grad():
+                idx, kp_topk, scores_topk = select_topk_keypoints(model_output, topk, prefer_logvar=True)
+
+
+            print('pts xmin/xmax:', gt_clean[:,0].min().item(), gt_clean[:,0].max().item())
+            print('pts ymin/ymax:', gt_clean[:,1].min().item(), gt_clean[:,1].max().item())
+            print('pts zmin/zmax:', gt_clean[:,2].min().item(), gt_clean[:,2].max().item())
+
+            print('kps xmin/xmax:', kp_xyz[:,0].min().item(), kp_xyz[:,0].max().item())
+            print('kps ymin/ymax:', kp_xyz[:,1].min().item(), kp_xyz[:,1].max().item())
+            print('kps zmin/zmax:', kp_xyz[:,2].min().item(), kp_xyz[:,2].max().item())
+
             # Interactive logs with adjustable marker size
             log_pc_plotly("gt/plotly_pc_with_kp",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
             log_pc_plotly("rec/plotly_pc_with_kp", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)
@@ -475,8 +491,14 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             log_pc_plotly("rec/plotly_pc", rec_pts,  colors=rec_cols, ids=ids,  kps=None, step=epoch, point_size=2)
 
 
-            log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=kp_xyz,
-                      color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            log_pc_overlay_plotly("viz/overlay_source_with_kp", gt_clean, rec_pts, kps=kp_xyz,
+                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=None,
+                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            
+            if 'kp_topk' in model_output:
+                log_pc_plotly("gt/plotly_pc_topk",  gt_clean, kps=kp_topk, step=epoch, point_size=3)
+                log_pc_plotly("rec/plotly_pc_topk", rec_pts,   kps=kp_topk, step=epoch, point_size=3)
             
 
             # Log mean values before in wandb

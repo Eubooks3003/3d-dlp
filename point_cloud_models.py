@@ -142,6 +142,9 @@ class VoxelDLP(nn.Module):
                  # PC Stuff
                  decoder_point_mode="deform",
                  points_per_object=128,
+                 points_per_scale=(32, 64),
+                 points_bg=256,
+
                 ):
         super(VoxelDLP, self).__init__()
         """
@@ -340,6 +343,8 @@ class VoxelDLP(nn.Module):
         # PC specific:
         self.decoder_point_mode = decoder_point_mode
         self.points_per_object = points_per_object
+        self.points_per_scale = points_per_scale
+        self.points_bg = points_bg
 
         self.context_dist = ctx_dist
         assert self.context_dist in ["gauss", "beta", "categorical"], f'ctx distribution {ctx_dist} unrecognized'
@@ -530,13 +535,13 @@ class VoxelDLP(nn.Module):
             normalize_rgb=normalize_rgb,
             # PC knobs
             points_per_obj=self.points_per_object,
-            points_bg=getattr(self, "points_bg", 2048),
+            points_bg=self.points_bg,
             predict_obj_color=(cdim >= 3),
             predict_bg_color=(cdim >= 3),
             # NEW:
             decoder_point_mode=self.decoder_point_mode,   # 'spawn' | 'deform' | 'hybrid'
             nsp_scales=getattr(self, "nsp_scales", 2),
-            points_per_scale=getattr(self, "points_per_scale", (64, 128)),
+            points_per_scale=self.points_per_scale,
             spawn_use_rotation=True,
             spawn_scale_activation="sigmoid",
             spawn_predict_color=False,

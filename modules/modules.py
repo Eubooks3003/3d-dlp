@@ -3418,6 +3418,8 @@ class DLPPrior(nn.Module):
         x_patches = x_patches.permute(0, 2, 1, 3, 4)  # [batch_size, num_patches, cdim, patch_size, patch_size]
         x_patches = x_patches.contiguous().view(-1, cdim, self.patcher.patch_size, self.patcher.patch_size)
         enc_out = self.enc(x_patches)  # [batch_size*num_patches, n_kp, features_dim, features_dim]
+        
+        print("ENC OUT: ", enc_out.shape)
         if isinstance(enc_out, tuple):
             z = enc_out[1]
         else:
@@ -3427,6 +3429,7 @@ class DLPPrior(nn.Module):
         kp_p = self.get_global_kp(kp_p)
         var_kp = var_kp.view(batch_size, kp_p.shape[1], self.n_kp, -1)  # [batch_size, num_patches, n_kp, 3]
 
+        print("Keypoints: ", kp_p.shape)
         if k is None:
             k = self.n_kp_prior
         kp_p = kp_p.view(x.shape[0], -1, 2)  # [batch_size, n_kp_total, 2]

@@ -144,7 +144,7 @@ def log_pc_plotly(name, pts, colors=None, ids=None, kps=None, step=None,
         fig.add_trace(go.Scatter3d(
             x=K[:,0], y=K[:,1], z=K[:,2],
             mode="markers",
-            marker=dict(size=6, symbol="x", color="red"),
+            marker=dict(size=2, symbol="x", color="red"),
             name="keypoints"
         ))
 
@@ -288,7 +288,7 @@ def log_pc_overlay_plotly(
         fig.add_trace(go.Scatter3d(
             x=K[:,0], y=K[:,1], z=K[:,2],
             mode="markers",
-            marker=dict(size=6, symbol="x", color="red"),
+            marker=dict(size=2, symbol="x", color="red"),
             name="keypoints"
         ))
 
@@ -306,3 +306,54 @@ def log_pc_overlay_plotly(
     fig.update_layout(margin=dict(l=0,r=0,t=30,b=0), showlegend=True,
                       scene_dragmode="turntable")
     wandb.log({name: fig}, step=step)
+def select_topk_keypoints(model_output, topk, prefer_logvar=True, eps=1e-8):
+    kp = model_output.get('kp_p', None)   # [B,Kp,C]
+    assert kp is not None, "model_output['kp_p'] must be present"
+    B, Kp, C = kp.shape
+    device = kp.device
+
+    # ----- score source -----
+    score = None
+    if prefer_logvar and ('z_base_var' in model_output):
+        z_var = model_output['z_base_var']
+        # collapse trailing dims, keep [B, ?]
+        if z_var.dim() > 2:
+            while z_var.dim() > 2:
+                z_var = z_var.sum(-1)
+        # If shape is [B, Kv] and Kv != Kp, we can't align -> skip
+        if z_var.shape[0] == B and z_var.shape[1] == Kp:
+            score = -z_var  # smaller var = better
+        else:
+            # sizes don’t match; fall back later
+            score = None
+
+    # fallback to covariance trace if present
+    if score is None and ('kp_cov' in model_output):
+        cov = model_output['kp_cov']  # [B,Kp,3,3]
+        tr = cov[..., 0,0] + cov[..., 1,1] + cov[..., 2,2]
+        score = -tr
+
+    if score is None:
+        score = torch.zeros(B, Kp, device=device)
+
+    # ----- optional obj_on gating (only if sizes match) -----
+    obj_on = model_output.get('obj_on', None)
+    if obj_on is not None:
+        o = obj_on
+        if o.dim() == 3 and o.size(-1) == 1:
+            o = o.squeeze(-1)
+        if o.shape == (B, Kp):         # only apply when it matches Kp
+            score = score * o.clamp(0, 1)
+
+    # ----- top-k -----
+    k_eff = min(int(topk), Kp)
+    scores_topk, idx = torch.topk(score, k=k_eff, dim=-1, largest=True, sorted=True)
+    b = torch.arange(B, device=device)[:, None]
+    kp_topk = kp[b, idx]
+
+    # pack for logging
+    model_output['kp_scores'] = score
+    model_output['kp_topk_idx'] = idx
+    model_output['kp_topk'] = kp_topk
+    model_output['kp_scores_topk'] = scores_topk
+    return idx, kp_topk, scores_topk
