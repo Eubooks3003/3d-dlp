@@ -109,7 +109,8 @@ def downsample(x, c=None, ids=None, n=80_000):
 
 def log_pc_plotly(name, pts, colors=None, ids=None, kps=None, step=None,
                   point_size=2, opacity=0.9):
-    P = to_np(pts); C = to_np(colors); I = to_np(ids); K = to_np(kps)
+    P = to_np(pts); C = to_np(colors); I = to_np(ids) 
+    K = _to_xyz2(kps)
     if P is None or P.size == 0: 
         return
     P, C, I = downsample(P, C, I)
@@ -139,7 +140,7 @@ def log_pc_plotly(name, pts, colors=None, ids=None, kps=None, step=None,
     ))
 
     # Keypoints as larger red X markers (if provided)
-    if K is not None and K.size > 0:
+    if K is not None and K.size:
         fig.add_trace(go.Scatter3d(
             x=K[:,0], y=K[:,1], z=K[:,2],
             mode="markers",

@@ -12,7 +12,8 @@ import torch.nn as nn
 # TODO: Fix this weird naming
 from modules.point_cloud_modules.point_cloud_modules import DLPContext
 from modules.point_cloud_modules.DLPEncoder.dlp_encoder import DLPEncoder
-from modules.point_cloud_modules.DLPDecoder.dlp_decoder import DLPDecoder
+# from modules.point_cloud_modules.DLPDecoder.dlp_decoder import DLPDecoder
+from modules.point_cloud_modules.DLPDecoder.PointDecoder.dlp_decoder import DLPDecoder
 
 from modules.modules import DLPDynamics
 # util functions
@@ -137,7 +138,11 @@ class VoxelDLP(nn.Module):
                  depth_feature_dim=16,  # depth feature dimension if separate encoding
                  split_loss=False,  # split loss into components for logging
                  depth_loss_ratio=1.0,  # weight of depth loss if split_loss is True
-                 ):
+
+                 # PC Stuff
+                 decoder_point_mode="deform",
+                 points_per_object=128,
+                ):
         super(VoxelDLP, self).__init__()
         """
         Args:
@@ -332,6 +337,10 @@ class VoxelDLP(nn.Module):
         self.n_static_frames = n_static_frames
         self.predict_delta = predict_delta
 
+        # PC specific:
+        self.decoder_point_mode = decoder_point_mode
+        self.points_per_object = points_per_object
+
         self.context_dist = ctx_dist
         assert self.context_dist in ["gauss", "beta", "categorical"], f'ctx distribution {ctx_dist} unrecognized'
         self.ctx_pool_mode = ctx_pool_mode
@@ -475,40 +484,62 @@ class VoxelDLP(nn.Module):
         # [1, n_patches * n_kp_per_patch, 2]
 
         # decoder
+        # self.decoder_module = DLPDecoder(
+        #     # --- essentials / dimensions ---
+        #     cdim=cdim,
+        #     learned_feature_dim=self.learned_feature_dim,
+        #     learned_bg_feature_dim=self.learned_bg_feature_dim,
+        #     n_kp_enc=self.n_kp_dec,
+        #     context_dim=self.context_dim,
+
+        #     # --- init & MLP sizing (kept from 2D) ---
+        #     mlp_hidden_dim=mlp_hidden_dim,
+        #     init_zero_bias=init_zero_bias,
+        #     init_conv_layers=init_conv_layers,
+        #     init_conv_fg_std=init_conv_fg_std,   # used for object MLPs
+        #     init_conv_bg_std=init_conv_bg_std,   # used for background MLPs
+
+        #     # --- rendering / color behavior ---
+        #     normalize_rgb=normalize_rgb,
+        #     color_activation=("tanh" if normalize_rgb else "sigmoid"),
+
+        #     # --- PC-specific knobs ---
+        #     points_per_obj=getattr(self, "points_per_obj", 256),  # M_obj
+        #     points_bg=getattr(self, "points_bg", 2048),           # M_bg
+        #     predict_obj_color=(cdim >= 3),
+        #     predict_bg_color=(cdim >= 3),
+        #     use_context=(self.context_dim > 0),
+
+        #     # --- geometry & blending ---
+        #     sphere_sigma=getattr(self, "sphere_sigma", 0.06),
+        #     depth_blend=getattr(self, "depth_blend", "softmax"),  # {'softmax','alpha'}
+        #     clamp_bounds=True,
+
+        #     # --- background template ---
+        #     bg_template=getattr(self, "bg_template", "sphere"),   # {'sphere','cube','gridxy'}
+        #     learn_bg_template=getattr(self, "learn_bg_template", False),
+        # )
+
         self.decoder_module = DLPDecoder(
-            # --- essentials / dimensions ---
             cdim=cdim,
             learned_feature_dim=self.learned_feature_dim,
             learned_bg_feature_dim=self.learned_bg_feature_dim,
             n_kp_enc=self.n_kp_dec,
             context_dim=self.context_dim,
-
-            # --- init & MLP sizing (kept from 2D) ---
             mlp_hidden_dim=mlp_hidden_dim,
-            init_zero_bias=init_zero_bias,
-            init_conv_layers=init_conv_layers,
-            init_conv_fg_std=init_conv_fg_std,   # used for object MLPs
-            init_conv_bg_std=init_conv_bg_std,   # used for background MLPs
-
-            # --- rendering / color behavior ---
             normalize_rgb=normalize_rgb,
-            color_activation=("tanh" if normalize_rgb else "sigmoid"),
-
-            # --- PC-specific knobs ---
-            points_per_obj=getattr(self, "points_per_obj", 256),  # M_obj
-            points_bg=getattr(self, "points_bg", 2048),           # M_bg
+            # PC knobs
+            points_per_obj=self.points_per_object,
+            points_bg=getattr(self, "points_bg", 2048),
             predict_obj_color=(cdim >= 3),
             predict_bg_color=(cdim >= 3),
-            use_context=(self.context_dim > 0),
-
-            # --- geometry & blending ---
-            sphere_sigma=getattr(self, "sphere_sigma", 0.06),
-            depth_blend=getattr(self, "depth_blend", "softmax"),  # {'softmax','alpha'}
-            clamp_bounds=True,
-
-            # --- background template ---
-            bg_template=getattr(self, "bg_template", "sphere"),   # {'sphere','cube','gridxy'}
-            learn_bg_template=getattr(self, "learn_bg_template", False),
+            # NEW:
+            decoder_point_mode=self.decoder_point_mode,   # 'spawn' | 'deform' | 'hybrid'
+            nsp_scales=getattr(self, "nsp_scales", 2),
+            points_per_scale=getattr(self, "points_per_scale", (64, 128)),
+            spawn_use_rotation=True,
+            spawn_scale_activation="sigmoid",
+            spawn_predict_color=False,
         )
 
 

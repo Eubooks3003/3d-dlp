@@ -135,6 +135,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
     # Point Cloud Stuff
 
+    decoder_point_mode = config["decoder_point_mode"]
+    points_per_object = config["points_per_object"]
 
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=pc_collate)
@@ -202,7 +204,12 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         separate_depth_features=separate_depth_features, 
         depth_feature_dim=depth_feature_dim,
         split_loss=split_loss, 
-        depth_loss_ratio=depth_loss_ratio).to(device)
+        depth_loss_ratio=depth_loss_ratio,
+        
+        # PC Stuff
+        decoder_point_mode=decoder_point_mode,
+        points_per_object=points_per_object,
+        ).to(device)
         
     model_info = model.info()
     print(model_info)
@@ -273,8 +280,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
     # iteration counter
     iteration = 0
-
-    wandb.init()
+    
+    run_name = f"{decoder_point_mode}-{points_per_object}"
+    wandb.init(
+        name=run_name,
+        config=config,
+        reinit=True,
+    )
     for epoch in range(start_epoch, num_epochs):
         model.train()
         batch_losses = []
@@ -456,8 +468,11 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             kp_xyz = model_output['kp_p']
 
             # Interactive logs with adjustable marker size
-            log_pc_plotly("gt/plotly_pc",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
-            log_pc_plotly("rec/plotly_pc", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)
+            log_pc_plotly("gt/plotly_pc_with_kp",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
+            log_pc_plotly("rec/plotly_pc_with_kp", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)
+
+            log_pc_plotly("gt/plotly_pc",  gt_clean, colors=None, ids=None, kps=None, step=epoch, point_size=2)
+            log_pc_plotly("rec/plotly_pc", rec_pts,  colors=rec_cols, ids=ids,  kps=None, step=epoch, point_size=2)
 
 
             log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=kp_xyz,
