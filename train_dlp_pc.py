@@ -475,30 +475,38 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 idx, kp_topk, scores_topk = select_topk_keypoints(model_output, topk, prefer_logvar=True)
 
 
-            print('pts xmin/xmax:', gt_clean[:,0].min().item(), gt_clean[:,0].max().item())
-            print('pts ymin/ymax:', gt_clean[:,1].min().item(), gt_clean[:,1].max().item())
-            print('pts zmin/zmax:', gt_clean[:,2].min().item(), gt_clean[:,2].max().item())
-
-            print('kps xmin/xmax:', kp_xyz[:,0].min().item(), kp_xyz[:,0].max().item())
-            print('kps ymin/ymax:', kp_xyz[:,1].min().item(), kp_xyz[:,1].max().item())
-            print('kps zmin/zmax:', kp_xyz[:,2].min().item(), kp_xyz[:,2].max().item())
-
             # Interactive logs with adjustable marker size
-            log_pc_plotly("gt/plotly_pc_with_kp",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
-            log_pc_plotly("rec/plotly_pc_with_kp", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)
-
-            log_pc_plotly("gt/plotly_pc",  gt_clean, colors=None, ids=None, kps=None, step=epoch, point_size=2)
-            log_pc_plotly("rec/plotly_pc", rec_pts,  colors=rec_cols, ids=ids,  kps=None, step=epoch, point_size=2)
-
-
+            # log_pc_plotly("gt/plotly_pc_with_kp",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
+            # log_pc_plotly("rec/plotly_pc_with_kp", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)
+            
+            # print(" Overlay GT with KP")
+            log_pc_overlay_plotly("gt/gt_with_kp", gt_clean, None, kps=kp_xyz,
+                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            # print("Rec with KP")
+            log_pc_overlay_plotly("rec/rec_with_kp", None, rec_pts, kps=kp_xyz,
+                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            
+            log_pc_overlay_plotly("gt/gt", gt_clean, None, kps=None,
+                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            log_pc_overlay_plotly("rec/rec", None, rec_pts, kps=None,
+                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+            
             log_pc_overlay_plotly("viz/overlay_source_with_kp", gt_clean, rec_pts, kps=kp_xyz,
                 color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
             log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=None,
                 color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
             
             if 'kp_topk' in model_output:
-                log_pc_plotly("gt/plotly_pc_topk",  gt_clean, kps=kp_topk, step=epoch, point_size=3)
-                log_pc_plotly("rec/plotly_pc_topk", rec_pts,   kps=kp_topk, step=epoch, point_size=3)
+
+                # print("GT TOP K")
+                log_pc_overlay_plotly("gt/gt_topk", gt_clean, None, kps=kp_topk,
+                                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+                # print("REC TOP K")
+                log_pc_overlay_plotly("rec/rec_topk", None, rec_pts, kps=kp_topk,
+                                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
+                # print("OVERLAY TOP K")
+                log_pc_overlay_plotly("viz/overlay_source_topk", gt_clean, rec_pts, kps=kp_topk,
+                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
             
 
             # Log mean values before in wandb

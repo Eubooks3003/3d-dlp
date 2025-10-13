@@ -123,18 +123,19 @@ class ParticleEncoder(nn.Module):
         print("Creating DLP Prior with cdim: ", cdim)
         # TODO: Make all parameters configurable if necessary
         self.prior_encoder = DLPPrior(
-            grid=(48, 48, 48),          # (D,H,W) of the voxel volume
-            out_feat=4,                 # voxelizer output channels (e.g., density, rgb bins, etc.)
-            base_ch=32,                 # 3D encoder base width
-            ch_mult=(1, 2, 3),          # per-level multipliers
+            grid=(48, 48, 48),           # original voxel grid (D,H,W)
+            tile_size=(12, 12, 12),      # must divide the padded grid; 48 works perfectly
+            base_ch=32,
+            ch_mult=(1, 2, 3),
             num_res_blocks=2,
             use_resblock=True,
             use_attention=False,
-            cnn_mid_blocks=False,       # False -> keep mid blocks in Encoder3D
-            n_kp_prior=n_kp_prior,      # total K keypoint channels/proposals
-            kp_range=(-1., 1.),         # coordinate range for SSM3D
-            temperature=1.0,            # softmax temperature for SSM3D
-            filtering_heuristic='none', # 'none' | 'variance' | 'distance' | 'random'
+            cnn_mid_blocks=False,        # False -> keep mid blocks in Encoder3D
+            n_kp_per_tile=1,             # K channels per tile
+            n_kp_prior=n_kp_prior,       # final number to return (<= tiles * n_kp_per_tile)
+            kp_range=(-1., 1.),
+            temperature=1.0,             # try 0.25–0.5 for sharper peaks
+            filtering_heuristic='variance',  # 'variance' | 'random' | 'none'
             init_zero_bias=True,
             init_conv_layers=True,
             init_conv_std=0.02
@@ -235,11 +236,13 @@ class ParticleEncoder(nn.Module):
         # ---- 1) Prior proposals from point cloud ----
         # kp_p:   [B, K, 3] in [-1,1]^3 (global normalized coords)
         # var_kp: [B, K, 3, 3] covariance per proposal
-        kp_p, var_kp = self.encode_prior(x, mask)       # this calls self.prior_encoder(points, mask)
+        kp_p, var_kp, kp_mask = self.encode_prior(x, mask)       # this calls self.prior_encoder(points, mask)
 
+        # print("KP MASK: ", kp_mask.shape)
         mu      = kp_p                                  # [B, K, 3]
         logvar  = torch.zeros_like(mu)                  # [B, K, 3] (deterministic chamfer KL)
         z_base  = mu                                    # [B, K, 3]
+        g = kp_mask.float().unsqueeze(-1) 
 
         # ---- 2) Particle attribute encoder (offset/scale/obj_on/depth) ----
         # If you already implemented a PC attribute encoder, call it.
@@ -247,30 +250,38 @@ class ParticleEncoder(nn.Module):
             x, z_base, mask=mask,
             timesteps=timesteps, deterministic=deterministic
         )
-        mu_offset     = attr['mu']                  # [B, K, 3]
-        logvar_offset = attr['logvar']              # [B, K, 3]
-        mu_scale      = attr['mu_scale']            # [B, K, 3] (3D scales)
-        logvar_scale  = attr['logvar_scale']        # [B, K, 3]
-        # optional heads
-        if not self.interaction_obj_on:
-            lobj_on_a   = attr['lobj_on_a']
-            lobj_on_b   = attr['lobj_on_b']
-            obj_on_a    = attr['obj_on_a']
-            obj_on_b    = attr['obj_on_b']
-            mu_obj_on   = attr['mu_obj_on']
-            z_obj_on    = attr['z_obj_on']
-        else:
-            obj_on_a = obj_on_b = z_obj_on = mu_obj_on = None
+        mu_offset     = attr['mu']       * g
+        logvar_offset = attr['logvar']   # keep as-is for grads; (optional) clamp where masked:
+        logvar_offset = torch.where(kp_mask.unsqueeze(-1), logvar_offset, logvar_offset.new_full(logvar_offset.shape, math.log(1e-6)))
 
+        mu_scale      = attr['mu_scale'] * g
+        logvar_scale  = attr['logvar_scale'] if 'logvar_scale' in attr else None
+        if logvar_scale is not None:
+            logvar_scale = torch.where(kp_mask.unsqueeze(-1), logvar_scale, logvar_scale.new_full(logvar_scale.shape, math.log(1e-6)))
+
+        # presence (if produced here)
+        if not self.interaction_obj_on:
+            # concentrations/logits -> gate safely
+            obj_on_a   = attr['obj_on_a'] * g
+            obj_on_b   = attr['obj_on_b'] * g
+            mu_obj_on  = attr['mu_obj_on'] * g
+            z_obj_on   = attr['z_obj_on']  * g
+        else:
+            obj_on_a = obj_on_b = mu_obj_on = z_obj_on = None
+
+        # depth (if produced here)
         if not self.interaction_depth:
-            mu_depth      = attr['mu_depth']        # you can define this as radial depth or leave None
-            logvar_depth  = attr['logvar_depth']
-            z_depth       = mu_depth if deterministic else reparameterize(mu_depth, logvar_depth)
+            mu_depth     = attr['mu_depth'] * g
+            logvar_depth = torch.where(kp_mask.unsqueeze(-1), attr['logvar_depth'], attr['logvar_depth'].new_full(attr['logvar_depth'].shape, math.log(1e-6)))
+            z_depth      = mu_depth if deterministic else reparameterize(mu_depth, logvar_depth)
         else:
             mu_depth = logvar_depth = z_depth = None
 
         # ---- 3) Combine base + offsets, reparameterize if stochastic ----
-        mu_tot    = z_base + mu_offset                  # [B, K, 3]
+        mu_tot   = (z_base + mu_offset) * g
+        z_offset = mu_offset if deterministic else reparameterize(mu_offset, logvar_offset)
+        z        = (z_base + z_offset) * g
+
         logvar_tot= logvar_offset
         # Optional prior on scale; keep as-is if you don’t have a 3D prior for scale yet.
         # Example if you keep the same API: mu_scale = self.mu_scale_prior + mu_scale  # (make mu_scale_prior 3D if used)
@@ -287,7 +298,8 @@ class ParticleEncoder(nn.Module):
         # ---- 4) Variance-based utilities / filtering (3D) ----
         # total_var: use trace of covariance as scalar uncertainty
         # var_kp: [B,K,3,3] -> [B,K]
-        total_var = var_kp.diagonal(dim1=-2, dim2=-1).sum(-1)
+        total_var = var_kp.diagonal(dim1=-2, dim2=-1).sum(-1)       # [B,K]
+        total_var = total_var.masked_fill(~kp_mask, float('inf'))    # masked -> worst
 
         # z_base_var: keep the full covariance flattened (like 2D had extra stats)
         z_base_var = var_kp.view(B, var_kp.shape[1], 9) # [B,K,9]
@@ -313,6 +325,7 @@ class ParticleEncoder(nn.Module):
             b_idx = torch.arange(B, device=x.device)[:, None]
 
             # index everything consistently
+            kp_mask     = kp_mask[b_idx, embed_ind] 
             mu_tot        = mu_tot[b_idx, embed_ind]
             z_base        = z_base[b_idx, embed_ind]
             z_base_var    = z_base_var[b_idx, embed_ind]
@@ -325,6 +338,10 @@ class ParticleEncoder(nn.Module):
             mu_scale      = mu_scale[b_idx, embed_ind]
             mu_score      = mu_score[b_idx, embed_ind]
             logvar_score  = logvar_score[b_idx, embed_ind]
+
+            kp_p     = kp_p[b_idx, embed_ind]          # [B, n_filter, 3]
+            var_kp   = var_kp[b_idx, embed_ind]        # [B, n_filter, 3,3]
+            total_var = total_var[b_idx, embed_ind]    # keep consistent if you carry it forward
 
             if logvar_scale is not None:
                 logvar_scale = logvar_scale[b_idx, embed_ind]
@@ -344,7 +361,7 @@ class ParticleEncoder(nn.Module):
             'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
             'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
             'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
-            'kp_p': kp_p, 'var_kp': var_kp,
+            'kp_p': kp_p, 'var_kp': var_kp, 'kp_mask': kp_mask,
             'z_base_var': z_base_var, 'total_var': total_var,
             'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
             'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score
@@ -460,6 +477,7 @@ class ParticleEncoder(nn.Module):
         var_kp       = s1['var_kp']                # [B,K,*]
         z_base       = s1['z_base']                # [B,K,3]
         z            = s1['z']                     # [B,K,3]
+        kp_mask = s1['kp_mask']
         mu_tot       = s1['mu_tot']                # [B,K,3]
         z_base_var   = s1['z_base_var']            # [B,K,Dv]
         mu_scale     = s1['mu_scale']              # [B,K,3]
@@ -478,21 +496,28 @@ class ParticleEncoder(nn.Module):
 
         # ---- 2) variance-based filtering if you plan to encode fewer particles later ----
         if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
-            total_var = z_base_var.sum(-1)                                     # [B,K]
-            n_filter  = self.n_kp_dec if not warmup else min(
+            # keep masked KPs out of Top-K
+            total_var = z_base_var.sum(-1)                               # [B,K]
+            total_var = total_var.masked_fill(~kp_mask, float('inf'))
+
+            n_filter = self.n_kp_dec if not warmup else min(
                 self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc)
             )
-            _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)   # [B,n_filter]
+            _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)     # [B,n_filter]
             bidx = torch.arange(B, device=points.device)[:, None]
 
-            # subset for appearance stage
-            z_app       = z[bidx, keep_idx].contiguous()        # [B,n_filter,3]
-            z_scale_app = z_scale[bidx, keep_idx].contiguous()  # [B,n_filter,3]
+            z_app         = z[bidx, keep_idx].contiguous()         # [B,n_filter,3]
+            z_scale_app   = z_scale[bidx, keep_idx].contiguous()   # [B,n_filter,3]
+            kp_mask_app   = kp_mask.gather(1, keep_idx)            # [B,n_filter]
+            gate_app      = kp_mask_app.unsqueeze(-1).to(z.dtype)  # [B,n_filter,1]
+
+            print("GATE APP SHAPE: ", gate_app.shape)
+            print("KP MASK: ", kp_mask_app.shape)
 
             # ---- 3) stage-2: appearance on subset ----
             s2 = self.encode_appearance(points, z_app, z_scale_app,
                                         deterministic=deterministic,
-                                        obj_on=None,
+                                        obj_on=gate_app,                 # gate matches n_filter
                                         mask_pc=mask_pc)
 
             # scatter back into full K slots using nulls/zeros
@@ -512,7 +537,7 @@ class ParticleEncoder(nn.Module):
                 logvar_features_full[bidx, keep_idx] = s2['logvar_features']
 
             # keep stage-1 tensors consistent with the selected set
-            take = keep_idx
+            take        = keep_idx
             z           = z[bidx, take]
             z_scale     = z_scale[bidx, take]
             z_base      = z_base[bidx, take]
@@ -523,16 +548,19 @@ class ParticleEncoder(nn.Module):
             mu_scale    = mu_scale[bidx, take]
             if logvar_scale is not None:
                 logvar_scale = logvar_scale[bidx, take]
+            kp_mask     = kp_mask[bidx, take] 
 
             mu_features     = mu_features_full
             z_features      = z_features_full
             logvar_features = logvar_features_full
-            print("Encoded appearance Logvar features is None? ", logvar_features is None)
+
         else:
             # ---- 3) stage-2: appearance for all proposals ----
+            gate_all = kp_mask.unsqueeze(-1).to(z.dtype)      # [B,K,1] matches z: [B,K,3]
+
             s2 = self.encode_appearance(points, z, z_scale,
                                         deterministic=deterministic,
-                                        obj_on=None,
+                                        obj_on=gate_all,
                                         mask_pc=mask_pc)
             mu_features     = s2['mu_features']           # [B,K,F]
             logvar_features = s2['logvar_features']       # [B,K,F] or None
@@ -546,6 +574,7 @@ class ParticleEncoder(nn.Module):
             'pos':          z,                 # [B,K,3]
             'pos_mu':       mu_tot,            # [B,K,3]
             'pos_logvar':   s1['logvar_offset'],  # [B,K,3] if produced
+            'kp_mask': kp_mask,
 
             # scales
             'scale_mu':     mu_scale,          # [B,K,3]

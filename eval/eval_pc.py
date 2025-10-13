@@ -172,6 +172,7 @@ def _to_xyz2(x):
     Drops rows with non-finite values.
     """
     if x is None: return None
+
     a = _np(x)
     if a.ndim == 1:
         if a.size == 3:
@@ -306,6 +307,7 @@ def log_pc_overlay_plotly(
     fig.update_layout(margin=dict(l=0,r=0,t=30,b=0), showlegend=True,
                       scene_dragmode="turntable")
     wandb.log({name: fig}, step=step)
+
 def select_topk_keypoints(model_output, topk, prefer_logvar=True, eps=1e-8):
     kp = model_output.get('kp_p', None)   # [B,Kp,C]
     assert kp is not None, "model_output['kp_p'] must be present"

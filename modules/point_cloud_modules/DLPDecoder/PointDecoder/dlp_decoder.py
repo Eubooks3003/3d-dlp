@@ -197,78 +197,54 @@ class DLPDecoder(nn.Module):
             self.bg_dec.init_weights()
 
     # ----------------- object decode -----------------
-    def decode_objects_pc(self, z_kp, z_features, obj_on, z_scale=None, z_depth=None):
-        """
-        Returns:
-          points_obj:   [B,K,M,3]
-          points_obj_flat: [B,K*M,3]
-          rgb_obj_flat: [B,K*M,3] or None
-          obj_weights:  [B,K,1]
-        """
-        if obj_on is not None and obj_on.dim() == 2:
-            obj_on = obj_on.unsqueeze(-1)
+    def decode_objects_pc(self, z_kp, z_features, obj_on, z_scale=None, z_depth=None, kp_mask=None):
+        if obj_on is not None and obj_on.dim()==2:
+            obj_on = obj_on.unsqueeze(-1)  # [B,K,1]
 
-        # Route by mode
-        if self.decoder_point_mode == "deform":
-            assert self.particle_dec_deform is not None
-            out = self.particle_dec_deform(
-                z_pos=z_kp, z_scale=z_scale, z_feat=z_features, z_depth=z_depth, z_obj_on=obj_on
-            )
-            points_obj = out["points_obj"]                              # [B,K,M,3]
-            rgb_obj    = out.get("rgb_recon", None)                     # [B,KM,3] (flattened) or None
-            if rgb_obj is not None and rgb_obj.dim() == 4:              # normalize shapes
-                B, K, M, _ = rgb_obj.shape
-                rgb_obj = rgb_obj.reshape(B, K * M, 3)
-            weights    = out.get("obj_weights", obj_on)                 # [B,K,1]
+        w = (kp_mask.float().unsqueeze(-1) if kp_mask is not None else None)      # [B,K,1]
+        if w is None and obj_on is not None: w = obj_on
+        elif w is not None and obj_on is not None: w = w * obj_on
 
-        elif self.decoder_point_mode == "spawn":
-            assert self.particle_dec_spawn is not None
-            out = self.particle_dec_spawn(
-                z_pos=z_kp, z_scale=z_scale, z_feat=z_features, z_depth=z_depth, z_obj_on=obj_on
-            )
-            points_obj = out["points_obj"]                              # [B,K,M,3]
-            rgb_perobj = out.get("rgb_obj", None)                       # [B,K,M,3] or None
-            if rgb_perobj is not None:
-                B, K, M, _ = rgb_perobj.shape
-                rgb_obj = rgb_perobj.reshape(B, K * M, 3)               # [B,KM,3]
-            else:
-                rgb_obj = None
-            weights = out.get("obj_weights", obj_on)                    # [B,K,1]
+        # route to spawn/deform as before
+        if self.decoder_point_mode == "spawn":
+            out = self.particle_dec_spawn(z_pos=z_kp, z_scale=z_scale, z_feat=z_features,
+                                        z_depth=z_depth, z_obj_on=w)
+        elif self.decoder_point_mode == "deform":
+            out = self.particle_dec_deform(z_pos=z_kp, z_scale=z_scale, z_feat=z_features,
+                                        z_depth=z_depth, z_obj_on=w)
+        else:
+            out = self.particle_dec_spawn(z_pos=z_kp, z_scale=z_scale, z_feat=z_features,
+                                        z_depth=z_depth, z_obj_on=w)
 
-        else:  # 'hybrid' -> currently same as spawn; you can refine with a second head if desired
-            assert self.particle_dec_spawn is not None
-            out = self.particle_dec_spawn(
-                z_pos=z_kp, z_scale=z_scale, z_feat=z_features, z_depth=z_depth, z_obj_on=obj_on
-            )
-            points_obj = out["points_obj"]
-            rgb_perobj = out.get("rgb_obj", None)
-            if rgb_perobj is not None:
-                B, K, M, _ = rgb_perobj.shape
-                rgb_obj = rgb_perobj.reshape(B, K * M, 3)
-            else:
-                rgb_obj = None
-            weights = out.get("obj_weights", obj_on)
+        points_obj = out["points_obj"]                        # [B,K,M,3]
+        rgb_perobj = out.get("rgb_obj", None)                 # [B,K,M,3] or None
 
-        # Flatten for scene concat
+        # If your heads don’t already absorb w, apply it here for safety in losses:
+        # keep coordinates as-is; carry w out so losses can weight them.
+        weights = out.get("obj_weights", w if w is not None else torch.ones_like(points_obj[..., :1, 0:1]))
+        rgb_obj  = None
+        if rgb_perobj is not None:
+            B, K, M, _ = rgb_perobj.shape
+            rgb_obj = rgb_perobj.reshape(B, K*M, 3)
+
         B, K, M, _ = points_obj.shape
-        points_obj_flat = points_obj.reshape(B, K * M, 3)
+        pts_flat = points_obj.reshape(B, K*M, 3)
 
-        return {
-            "points_obj": points_obj,
-            "points_obj_flat": points_obj_flat,
-            "rgb_obj_flat": rgb_obj,
-            "obj_weights": weights,
-        }
+        return {"points_obj": points_obj,
+                "points_obj_flat": pts_flat,
+                "rgb_obj_flat": rgb_obj,
+                "obj_weights": weights}  # [B,K,1]
+
 
     # ----------------- background decode -----------------
     def decode_bg_pc(self, z_bg_features):
         return self.bg_dec(z_bg_features)  # {'bg_points':[B,M_bg,3], 'bg_rgb': Optional[B,M_bg,3]}
 
     # ----------------- full decode -----------------
-    def decode_all(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, warmup: bool = False):
+    def decode_all(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, kp_mask, warmup: bool = False):
         # Objects
         obj = self.decode_objects_pc(
-            z_kp=z, z_features=z_features, obj_on=obj_on, z_scale=z_scale, z_depth=z_depth
+            z_kp=z, z_features=z_features, obj_on=obj_on, z_scale=z_scale, z_depth=z_depth,  kp_mask=kp_mask
         )
         pts_obj_flat = obj["points_obj_flat"]   # [B, K*M, 3]
         rgb_obj_flat = obj["rgb_obj_flat"]      # [B, K*M, 3] or None
@@ -295,5 +271,5 @@ class DLPDecoder(nn.Module):
             "obj_weights":  obj["obj_weights"],  # [B,K,1]
         }
 
-    def forward(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, warmup: bool = False):
-        return self.decode_all(z, z_scale, z_features, obj_on, z_depth, z_bg_features, warmup)
+    def forward(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, kp_mask, warmup: bool = False):
+        return self.decode_all(z, z_scale, z_features, obj_on, z_depth, z_bg_features, kp_mask, warmup)
