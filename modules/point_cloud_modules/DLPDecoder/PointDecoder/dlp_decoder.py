@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 # If you keep your existing modules in the same package:
 from modules.point_cloud_modules.DLPDecoder.DeformationDecoder.point_cloud_decoder import PointCloudDecoderParticles
 from modules.point_cloud_modules.DLPDecoder.bg_decoder import BgDecoderPC
-from modules.point_cloud_modules.DLPDecoder.PointDecoder.point_set_spawner import PointSetSpawner
+from modules.point_cloud_modules.DLPDecoder.PointDecoder.point_set_spawner import PointSetSpawnerNSP
 
 
 # ----------------------------- #
@@ -147,7 +147,7 @@ class DLPDecoder(nn.Module):
 
         if decoder_point_mode in {"spawn", "hybrid"}:
             # Point spawner (Point-NSP style)
-            self.particle_dec_spawn = PointSetSpawner(
+            self.particle_dec_spawn = PointSetSpawnerNSP(
                 features_dim=learned_feature_dim,
                 n_scales=self.nsp_scales,
                 points_per_scale=self.points_per_scale,

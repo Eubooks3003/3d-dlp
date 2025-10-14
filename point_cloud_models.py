@@ -1304,7 +1304,8 @@ class VoxelDLP(nn.Module):
                     apply_mask_on_obj_on=False,
                     beta_obj=beta_obj,
                     done_mask=done_mask,
-                    mask_pc=mask,                          # <-- NEW (important for Chamfer)
+                    mask_pc=mask,
+                    obj_weights=obj_weights,                         
                     color_weight=getattr(self, "pc_color_weight", 0.0)  # optional
                 )
             output_dict['loss_dict'] = loss_dict
@@ -1321,7 +1322,8 @@ class VoxelDLP(nn.Module):
                 apply_mask_on_obj_on=False, beta_obj=0.0,
                 done_mask=None,
                 mask_pc=None,                 # <-- NEW
-                color_weight=0.0):            # <-- optional (RGB Chamfer term)
+                color_weight=0.0,
+                obj_weights=None):            # <-- optional (RGB Chamfer term)
 
         if self.is_dynamics_model:
             return self.calc_dyn_elbo(x, model_output, warmup, beta_kl, beta_dyn, beta_rec,
@@ -1837,7 +1839,7 @@ class VoxelDLP(nn.Module):
                      'loss_kl_obj_on_dyn': loss_kl_obj_on_dyn, 'loss_kl_scale_dyn': loss_kl_scale_dyn,
                      'loss_kl_depth_dyn': loss_kl_depth_dyn, 'loss_obj_reg': loss_obj_reg}
         return loss_dict
-
+    
     def calc_static_elbo_pc(
         self,
         x,                           # [B, N, 3(+C)]
@@ -1850,7 +1852,8 @@ class VoxelDLP(nn.Module):
         use_kl_mask=True,
         apply_mask_on_obj_on=False,
         balance=0.5,
-        color_weight=0.0
+        color_weight=0.0,
+        obj_weights=None
     ):
         # ---- unpack ----
         kp_p             = model_output['kp_p']              # [B,K,3]
