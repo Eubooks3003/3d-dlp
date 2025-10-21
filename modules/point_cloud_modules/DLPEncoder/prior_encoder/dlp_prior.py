@@ -94,35 +94,52 @@ class DLPPrior(nn.Module):
     def _get_tile_starts(self, meta, device, dtype):
         Dp, Hp, Wp = meta["padded_shape"]
         return self.grid_voxelizer.get_tile_location_idx(Dp, Hp, Wp, self.tile_size, device=device, dtype=dtype)  # [T,3] zyx
+    
+    @staticmethod
+    def _as_xyz(t: torch.Tensor) -> torch.Tensor:
+        # swap (z,y,x) -> (x,y,z) for any [...,3]
+        return t[..., [2, 1, 0]]
 
-    def _local_to_global_zyx(self, kp_local, meta):
+    @staticmethod
+    def _cov_zyx_to_xyz(cov: torch.Tensor) -> torch.Tensor:
+        # permute covariance from (z,y,x) basis to (x,y,z) basis
+        # cov: [...,3,3]
+        P = cov.new_tensor([[0.,0.,1.],
+                            [0.,1.,0.],
+                            [1.,0.,0.]])  # maps indices 0=z,1=y,2=x -> 0=x,1=y,2=z
+        return P.transpose(-1, -2) @ cov @ P
+        
+    def _local_to_global_xyz(self, kp_local, meta):
         """
         kp_local: [B,T,K,3] in [-1,1] per-tile (order z,y,x)
-        returns kp_glob_zyx in [-1,1] over the ORIGINAL (unpadded) grid (clamped to [0..D-1/H-1/W-1] before normalization).
+        returns kp_glob_xyz in [-1,1] over the ORIGINAL (unpadded) grid (order x,y,z).
         """
         B, T, K, _ = kp_local.shape
         (td, th, tw) = self.tile_size
         (D, H, W)    = self.grid
 
-        # tile starts in voxel coords on the **padded** grid
         starts_zyx = self._get_tile_starts(meta, kp_local.device, dtype=torch.int32).to(kp_local.dtype)  # [T,3]
         starts_zyx = starts_zyx.view(1, T, 1, 3)  # [1,T,1,3]
 
-        # map [-1,1] -> [0,td-1] (index space), then add tile origin
+        # [-1,1] -> [0, td/th/tw - 1] in tile coords
         lo, hi = self.kp_range
-        p01 = (kp_local - lo) / (hi - lo)                                  # [B,T,K,3] in [0,1]
+        p01 = (kp_local - lo) / (hi - lo)                                  # [B,T,K,3] in [0,1] (z,y,x)
         scale_zyx = kp_local.new_tensor([td-1, th-1, tw-1]).view(1,1,1,3)
         kp_vox_zyx = starts_zyx + p01 * scale_zyx                           # [B,T,K,3]
 
-        # clamp to ORIGINAL (unpadded) grid extents to avoid padding drift
+        # clamp in ORIGINAL (unpadded) grid
         kp_vox_zyx[..., 0].clamp_(0, D-1)   # z
         kp_vox_zyx[..., 1].clamp_(0, H-1)   # y
         kp_vox_zyx[..., 2].clamp_(0, W-1)   # x
 
-        # normalize to [-1,1] over the ORIGINAL box
+        # normalize to [-1,1] over ORIGINAL, still zyx
         full_zyx = kp_local.new_tensor([D-1, H-1, W-1]).view(1,1,1,3)
-        kp_glob_zyx = (kp_vox_zyx / full_zyx) * (hi - lo) + lo
-        return kp_glob_zyx  # [B,T,K,3] (z,y,x)
+        kp_glob_zyx = (kp_vox_zyx / full_zyx) * (hi - lo) + lo              # [B,T,K,3] (z,y,x)
+
+        # convert to xyz for output
+        kp_glob_xyz = self._as_xyz(kp_glob_zyx)                             # [B,T,K,3] (x,y,z)
+        return kp_glob_xyz
+
 
     # ------------------------ main API -------------------------
 
@@ -159,10 +176,12 @@ class DLPPrior(nn.Module):
         kp_local  = kp_local.view(B, T, K, 3)
         cov_local = cov_local.view(B, T, K, 3, 3)
 
-        # (6) local -> global (ORIGINAL grid), flatten
-        kp_glob = self._local_to_global_zyx(kp_local, meta)    # [B,T,K,3]
-        kp_all  = kp_glob.view(B, T*K, 3)                      # [B, K_tot, 3]
-        cov_all = cov_local.view(B, T*K, 3, 3)                 # [B, K_tot, 3,3]
+        # (6) local -> global in **xyz**
+        kp_glob_xyz = self._local_to_global_xyz(kp_local, meta)     # [B,T,K,3] (x,y,z)
+        kp_all  = kp_glob_xyz.view(B, T*K, 3)                       # [B, K_tot, 3]
+
+        # also reorder covariances to xyz
+        cov_all = self._cov_zyx_to_xyz(cov_local).view(B, T*K, 3, 3)
 
         # (7) validity per keypoint (comes from its tile)
         valid_kp = valid_tile.unsqueeze(-1).expand(B, T, K).reshape(B, T*K)   # [B, K_tot]
