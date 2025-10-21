@@ -483,23 +483,26 @@ class ParticleEncoder(nn.Module):
                                             deterministic=deterministic,
                                             warmup=warmup)
 
-        # unpack stage-1 we actually use
-        kp_p         = s1['kp_p']                  # [B,K,3]
-        var_kp       = s1['var_kp']                # [B,K,*]
-        z_base       = s1['z_base']                # [B,K,3]
-        z            = s1['z']                     # [B,K,3]
-        kp_mask = s1['kp_mask']
-        mu_tot       = s1['mu_tot']                # [B,K,3]
-        z_base_var   = s1['z_base_var']            # [B,K,Dv]
-        mu_scale     = s1['mu_scale']              # [B,K,3]
-        logvar_scale = s1.get('logvar_scale', None)
-        z_scale      = s1['z_scale']               # [B,K,3]
+        kp_p         = s1['kp_p']              # [B,K,3]
+        var_kp       = s1['var_kp']            # [B,K,*]
+        z_base       = s1['z_base']            # [B,K,3]
+        z            = s1['z']                 # [B,K,3]
+        kp_mask      = s1['kp_mask']           # [B,K] (bool)
+        mu_tot       = s1['mu_tot']            # [B,K,3]
+        z_base_var   = s1['z_base_var']        # [B,K,Dv]
 
-        # optional extras (presence/depth etc.)
-        obj_on_a     = s1.get('obj_on_a', None)
-        obj_on_b     = s1.get('obj_on_b', None)
-        mu_obj_on    = s1.get('mu_obj_on', None)
-        z_obj_on     = s1.get('z_obj_on', None)
+        mu_scale     = s1['mu_scale']          # [B,K,3]
+        logvar_scale = s1.get('logvar_scale', None)
+        z_scale      = s1['z_scale']           # [B,K,3]
+
+        mu_offset     = s1['mu_offset']        # [B,K,3]
+        logvar_offset = s1['logvar_offset']    # [B,K,3]
+        z_offset      = s1['z_offset']         # [B,K,3]
+
+        obj_on_a   = s1.get('obj_on_a', None)
+        obj_on_b   = s1.get('obj_on_b', None)
+        mu_obj_on  = s1.get('mu_obj_on', None)
+        z_obj_on   = s1.get('z_obj_on', None)
 
         mu_depth     = s1.get('mu_depth', None)
         logvar_depth = s1.get('logvar_depth', None)
@@ -579,40 +582,65 @@ class ParticleEncoder(nn.Module):
 
 
         # ---- 4) final compact dict (point-cloud only; no BG) ----
-        return {
-            # positions
-            'pos_anchor':   z_base,            # [B,K,3]
-            'pos':          z,                 # [B,K,3]
-            'pos_mu':       mu_tot,            # [B,K,3]
-            'pos_logvar':   s1['logvar_offset'],  # [B,K,3] if produced
-            'kp_mask': kp_mask,
+        encode_dict = {
+            # anchors / positions
+            'mu_anchor':       z_base,                                  # [B,K,3]
+            'logvar_anchor':   torch.zeros_like(z_base),                # [B,K,3]
+            'z_base':          z_base,                                  # [B,K,3]
+            'z':               z,                                       # [B,K,3]
+
+            # offsets
+            'mu_offset':       mu_offset,                               # [B,K,3]
+            'logvar_offset':   logvar_offset,                           # [B,K,3]
+            'z_offset':        z_offset,                                # [B,K,3]
+            'mu_tot':          mu_tot,                                  # [B,K,3]
 
             # scales
-            'scale_mu':     mu_scale,          # [B,K,3]
-            'scale_logvar': logvar_scale,      # [B,K,3] or None
-            'scale':        z_scale,           # [B,K,3]
+            'mu_scale':        mu_scale,                                # [B,K,3]
+            'logvar_scale':    logvar_scale,                            # [B,K,3] or None
+            'z_scale':         z_scale,                                 # [B,K,3]
 
             # features
-            'feat_mu':      mu_features,       # [B,K,F]
-            'feat_logvar':  logvar_features,   # [B,K,F] or None
-            'feat':         z_features,        # [B,K,F]
+            'mu_features':     mu_features,                             # [B,K,F]
+            'logvar_features': logvar_features,                         # [B,K,F] or None
+            'z_features':      z_features,                              # [B,K,F]
+
+            # depth-specific feature keys (not used in PC path)
+            'z_depth_features':      None,
+            'mu_depth_features':     None,
+            'logvar_depth_features': None,
+
+            # crops (not available in PC path)
+            'cropped_objects': None,
 
             # prior proposal info
-            'kp_p':         kp_p,              # [B,K,3]
-            'kp_var':       var_kp,            # [B,K,*]
-            'kp_score':     z_base_var.sum(-1, keepdim=True),  # [B,K,1]
+            'kp_p':        kp_p,                                        # [B,K,3]
+            'var_kp':      var_kp,                                      # [B,K,*]
+            'z_base_var':  z_base_var,                                  # [B,K,Dv]
 
-            # optional extras if your stage-1 produced them
-            'obj_on_a':     obj_on_a,
-            'obj_on_b':     obj_on_b,
-            'mu_obj_on':    mu_obj_on,
-            'z_obj_on':     z_obj_on,
+            # optional scores (kept compatible with RGB)
+            'mu_score':     (z_base_var.sum(-1, keepdim=True) / 30.0) * 2 - 1,  # [B,K,1]
+            'logvar_score': torch.full((B, z_base.shape[1], 1),
+                                       math.log(0.2 ** 2),
+                                       device=z_base.device,
+                                       dtype=z_base.dtype),
+            'z_score':      (z_base_var.sum(-1, keepdim=True) / 30.0) * 2 - 1,
+
+            # presence & depth (if produced)
+            'obj_on_a':   obj_on_a,
+            'obj_on_b':   obj_on_b,
+            'mu_obj_on':  mu_obj_on,
+            'z_obj_on':   z_obj_on,
+
             'mu_depth':     mu_depth,
             'logvar_depth': logvar_depth,
             'z_depth':      z_depth,
-            'z_base_var':   z_base_var,      # [B,K,Dv]
-        }
 
+            # odds & ends
+            'patch_id_embed': None,
+            'kp_mask':        kp_mask,   # extra (voxel training uses it)
+        }
+        return encode_dict
 
 
     def forward(self, x, dense, mask,deterministic=False, warmup=False):

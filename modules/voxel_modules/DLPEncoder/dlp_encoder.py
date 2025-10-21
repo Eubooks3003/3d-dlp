@@ -303,7 +303,7 @@ class DLPEncoder(nn.Module):
         in_channels = 7
         self.bg_encoder = BgEncoder3D(
             in_channels=in_channels,
-            grid_dhw=(image_size, image_size, image_size),   # <- set to your voxel grid (D,H,W)
+            grid_dhw=(48, 48, 48),   # <- set to your voxel grid (D,H,W)
             learned_feature_dim=learned_bg_feature_dim,
             features_dist=('categorical' if self.features_dist == 'categorical' else 'gauss'),
             interaction_features=False,                      # bg is usually not interacted
