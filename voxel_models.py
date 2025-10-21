@@ -886,7 +886,7 @@ class VoxelDLP(nn.Module):
         # enc_dict['cropped_objects_rgb'] = cropped_objects_rgb
         return enc_dict
 
-    def decode_all(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, kp_mask,
+    def decode_all(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features,
                 warmup=False, filter_key=None):
         # ---------- 0) Coerce inputs for the decoder ----------
         B, K, Dpos = z.shape          # expect Dpos==3
@@ -1194,7 +1194,6 @@ class VoxelDLP(nn.Module):
         z_scale         = enc['z_scale']           # [B,K,3]
         z_features      = enc['z_features']        # [B,K,F]
         z_obj_on        = enc['z_obj_on']            # [B,K,1] (PC pipeline returns 'obj_on')
-        kp_mask = enc['kp_mask']
 
         # Write the below as quierying from the dict
         z_obj_on_a = enc['obj_on_a']
@@ -1231,8 +1230,7 @@ class VoxelDLP(nn.Module):
         filter_key = z_base_var.sum(dim=-1)  # [B,K]
 
         dec = self.decode_all(
-            z, z_scale, z_features, z_obj_on, z_depth, z_bg_features,
-            kp_mask=kp_mask, warmup=warmup
+            z, z_scale, z_features, z_obj_on, z_depth, z_bg_features, warmup=warmup
         )
 
         # tolerate either 'rec_vox' or 'rec'
@@ -1253,7 +1251,6 @@ class VoxelDLP(nn.Module):
             'z_base_var': z_base_var,
             'z_base': z_base,
             'z': z,
-            'kp_mask': kp_mask,
             'mu_tot': mu_tot,
             'mu_offset': mu_offset,
             'mu_features': mu_features,
@@ -1278,7 +1275,7 @@ class VoxelDLP(nn.Module):
             'dense_target': dense,            # [B,C,D,H,W] (your build_voxel_batch output)
             # keep these for KLs:
             'kp_p': kp_p, 'var_kp': var_kp, 'z_base_var': z_base_var, 'z_base': z_base,
-            'z': z, 'kp_mask': kp_mask, 'mu_tot': mu_tot,
+            'z': z, 'mu_tot': mu_tot,
             'mu_offset': mu_offset, 'logvar_offset': logvar_offset,
             'mu_features': mu_features, 'logvar_features': logvar_features,
             'z_features': z_features,

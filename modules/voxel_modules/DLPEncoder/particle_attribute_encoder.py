@@ -199,19 +199,12 @@ class ParticleAttributeEncoder3D(nn.Module):
                 if self.obj_on_head[-1].bias is not None:
                     nn.init.constant_(self.obj_on_head[-1].bias, 0.0)
 
-    def forward(self, x_dense, kp_xyz, z_scale=None, timesteps=None, deterministic=False, kp_mask=None):
+
+    def forward(self, x_dense, kp_xyz, z_scale=None, timesteps=None, deterministic=False):
         """
         x_dense: [B, C, D, H, W]
         kp_xyz:  [B, K, 3]   (x,y,z) in [-1,1]
         z_scale: [B, K, 3]   (optional, unnormalized; we'll sigmoid like 2D)
-                 If None, default = crop_size / grid_size (per-axis).
-        kp_mask: [B, K] bool (optional) to gate outputs
-
-        Returns (mirrors 2D names):
-          mu, logvar, mu_scale, logvar_scale,
-          obj_on_a, obj_on_b, mu_obj_on, z_obj_on,
-          mu_depth, logvar_depth,
-          cropped_objects: [B, K, C, crop_d, crop_h, crop_w]
         """
         B, C, D, H, W = x_dense.shape
         _, K, _ = kp_xyz.shape
@@ -222,7 +215,7 @@ class ParticleAttributeEncoder3D(nn.Module):
         # default z_scale = (crop / grid)
         if z_scale is None:
             zs = torch.tensor([self.crop_w/(W-1), self.crop_h/(H-1), self.crop_d/(D-1)],
-                              device=x_dense.device, dtype=x_dense.dtype)  # (x,y,z)
+                            device=x_dense.device, dtype=x_dense.dtype)  # (x,y,z)
             z_scale = zs.view(1,1,3).expand(B, K, 3)
         else:
             z_scale = torch.sigmoid(z_scale)  # like 2D path
@@ -238,21 +231,18 @@ class ParticleAttributeEncoder3D(nn.Module):
         # encode with 3D CNN
         feat = self.cnn3d(crops)
         if isinstance(feat, tuple):
-            feat = feat[1]  # keep parity with your Encoders
+            feat = feat[1]
         feat_flat = feat.flatten(1)             # [B*K, Fc]
 
-        # optional temporal embedding
+        # optional temporal embedding (kept no-op here)
         if (self.timestep_horizon > 1) and (self.add_particle_temp_embed) and (self.temp_embed is not None) and (timesteps is not None):
-            # reshape [B,K,Fc] to [B, T, K, Fc] in your caller before passing; here we keep simple:
-            # if your call site feeds multiple timesteps at once, adapt like the 2D code does
-            feat_flat = feat_flat  # placeholder (most setups call one timestep per pass)
+            pass
 
         # presence Beta
         if self.with_obj_on and self.obj_on_head is not None:
             l_a_b = self.obj_on_head(feat_flat)                  # [B*K,2]
             l_a, l_b = l_a_b.split(1, dim=-1)
             gate_a = l_a.sigmoid()
-            # retain your 2D coupling scheme if desired:
             gate_b = 1.0 - l_a.sigmoid()
             a = ((1 - gate_a) * self.obj_on_min + gate_a * self.obj_on_max).exp()
             b = ((1 - gate_b) * self.obj_on_min + gate_b * self.obj_on_max).exp()
@@ -266,7 +256,6 @@ class ParticleAttributeEncoder3D(nn.Module):
         off = self.offset_head(feat_flat)                          # [B*K,6]
         mu, logvar = off[:, :3], off[:, 3:]
 
-        # clamp or keep as-is like 2D (you clamp later during loss if needed)
         if self.kp_activation == "tanh":
             mu = self.max_offset * torch.tanh(mu)
         elif self.kp_activation == "sigmoid":
@@ -279,7 +268,7 @@ class ParticleAttributeEncoder3D(nn.Module):
         else:
             mu_scale, logvar_scale = None, None
 
-        # depth (parity)
+        # depth (optional, parity)
         if self.with_depth and self.depth_head is not None:
             dxy = self.depth_head(feat_flat)                       # [B*K,2]
             mu_depth, logvar_depth = dxy.split(1, dim=-1)
@@ -301,19 +290,6 @@ class ParticleAttributeEncoder3D(nn.Module):
         mu_obj_on    = V(mu_obj_on, 1) if mu_obj_on is not None else None
         z_obj_on     = V(z_obj_on, 1) if z_obj_on is not None else None
 
-        # gate by kp_mask if provided (match your 2D semantics)
-        if kp_mask is not None:
-            g = kp_mask.float().unsqueeze(-1)  # [B,K,1]
-            for name, tensor in {
-                'mu': mu, 'logvar': logvar,
-                'mu_scale': mu_scale, 'logvar_scale': logvar_scale,
-                'mu_depth': mu_depth, 'logvar_depth': logvar_depth,
-                'mu_obj_on': mu_obj_on, 'z_obj_on': z_obj_on,
-                'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b,
-            }.items():
-                if tensor is not None:
-                    tensor.mul_(g)
-
         crops = crops.view(B, K, self.ch_in, self.crop_d, self.crop_h, self.crop_w)
 
         return {
@@ -324,3 +300,4 @@ class ParticleAttributeEncoder3D(nn.Module):
             'mu_depth': mu_depth, 'logvar_depth': logvar_depth,
             'cropped_objects': crops
         }
+

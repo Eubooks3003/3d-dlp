@@ -551,7 +551,6 @@ class DLPEncoder(nn.Module):
         mu_tot       = p.get('pos_mu',     p.get('mu_tot', z))     # [B,K,3]
         pos_logvar   = p.get('pos_logvar', p.get('logvar_offset',
                         torch.zeros_like(z)))                    # [B,K,3]
-        kp_mask = p['kp_mask']
 
         z_scale      = p.get('scale',      p.get('z_scale'))       # [B,K,3]
         mu_scale     = p.get('scale_mu',   p.get('mu_scale', z_scale))
@@ -633,7 +632,6 @@ class DLPEncoder(nn.Module):
             # positions
             'z_base': z_base,                  # [B,K,3] anchor/proposal
             'z':      z,                       # [B,K,3] refined/sample
-            'kp_mask': kp_mask,
             'mu_tot': mu_tot,                  # [B,K,3] mean after offset
             'mu_offset': mu_offset,
             'logvar_offset': pos_logvar,       # [B,K,3] (kept name for compat)
