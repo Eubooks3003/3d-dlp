@@ -239,6 +239,7 @@ class DLPPrior(nn.Module):
         kp_mask = torch.stack(mask_sel_list, dim=0) # [B,k_target]
         
         print("KP SEL: ", kp_sel.shape)
+        print("KP SEL: ", kp_sel)
         return kp_sel, cov_sel
 
     def forward(self, vox: torch.Tensor):

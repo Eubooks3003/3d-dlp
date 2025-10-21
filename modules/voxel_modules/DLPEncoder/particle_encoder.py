@@ -174,7 +174,6 @@ class ParticleEncoder(nn.Module):
             obj_on_min=1e-4, obj_on_max=100.0
         )
 
-        # --- Particle appearance/features (PointNet-like) ---
         output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
 
         print("Output logvar for features: ", output_logvar)
@@ -232,85 +231,119 @@ class ParticleEncoder(nn.Module):
 
     def encode_pos_scale_with_prior(self, x, dense, mask=None, deterministic=False, warmup=False, timesteps=None):
         """
-        Point-cloud version (voxels as context).
+        Voxel-context version aligned with the RGB path.
         x:     [B, N, 3]
         dense: [B, C, D, H, W]
         """
-        assert x.dim() == 3 and x.size(-1) == 3, f"expected points [B,N,3], got {tuple(x.shape)}"
         B = x.shape[0]
 
-        # ---- 1) Prior proposals from voxel prior ----
-        kp_p, var_kp = self.encode_prior(dense)           # kp_p:[B,K,3]  var_kp:[B,K,3,3]
-        mu      = kp_p                                    # [B, K, 3]
-        logvar  = torch.zeros_like(mu)                    # [B, K, 3] (deterministic chamfer KL)
-        z_base  = mu                                      # [B, K, 3]
+        # --- prior proposals ---
+        kp_p, var_kp = self.encode_prior(dense)              # kp_p:[B,K,3], var_kp:[B,K,3,3]
         K = kp_p.shape[1]
-        g = torch.ones(B, K, 1, device=x.device, dtype=mu.dtype)  # gating = 1 (no kp_mask)
 
-        # ---- 2) Attribute encoder (offset/scale/obj_on/depth) ----
-        attr = self.attr_enc_3d(
+        # keep grads, break aliasing exactly like RGB
+        mu     = kp_p.clone()                                 # [B,K,3]
+        logvar = torch.zeros_like(mu)                         # [B,K,3]
+        z_base = mu + 0.0 * logvar                            # [B,K,3]
+
+        # --- posterior offsets & scales (attribute encoder) ---
+        particle_stats_dict = self.attr_enc_3d(
             x_dense=dense,
-            kp_xyz=z_base,
+            kp_xyz=z_base.clone(),                            # keep grads, avoid in-place aliasing
             z_scale=None,
+            timesteps=timesteps,
             deterministic=deterministic
         )
-        mu_offset     = attr['mu'] * g
-        logvar_offset = attr['logvar']
-        mu_scale      = (attr['mu_scale'] * g) if ('mu_scale' in attr and attr['mu_scale'] is not None) else None
-        logvar_scale  = attr.get('logvar_scale', None)
 
-        # presence (if produced here)
+        mu_offset     = particle_stats_dict['mu']             # [B,K,3]
+        logvar_offset = particle_stats_dict['logvar']         # [B,K,3]
+        mu_scale      = particle_stats_dict.get('mu_scale', None)   # [B,K,3] or None
+        logvar_scale  = particle_stats_dict.get('logvar_scale', None)
+
         if not self.interaction_obj_on:
-            obj_on_a   = attr['obj_on_a'] * g if attr['obj_on_a'] is not None else None
-            obj_on_b   = attr['obj_on_b'] * g if attr['obj_on_b'] is not None else None
-            mu_obj_on  = attr['mu_obj_on'] * g if attr['mu_obj_on'] is not None else None
-            z_obj_on   = attr['z_obj_on']  * g if attr['z_obj_on']  is not None else None
+            # match RGB keys/behavior
+            lobj_on_a  = particle_stats_dict.get('lobj_on_a', None) # kept for parity (may be None)
+            lobj_on_b  = particle_stats_dict.get('lobj_on_b', None)
+            obj_on_a   = particle_stats_dict.get('obj_on_a',  None) # [B,K,1] or None
+            obj_on_b   = particle_stats_dict.get('obj_on_b',  None)
+            mu_obj_on  = particle_stats_dict.get('mu_obj_on', None) # [B,K,1] or None
+            z_obj_on   = particle_stats_dict.get('z_obj_on',  None) # [B,K,1] or None
         else:
-            obj_on_a = obj_on_b = mu_obj_on = z_obj_on = None
+            obj_on_a = obj_on_b = z_obj_on = mu_obj_on = None
 
-        # depth (if produced here)
         if not self.interaction_depth:
-            mu_depth     = attr['mu_depth'] * g if attr['mu_depth'] is not None else None
-            logvar_depth = attr['logvar_depth']
-            if (logvar_depth is not None) and (mu_depth is not None):
+            mu_depth     = particle_stats_dict.get('mu_depth', None)     # [B,K,1] or None
+            logvar_depth = particle_stats_dict.get('logvar_depth', None) # [B,K,1] or None
+            if mu_depth is not None and logvar_depth is not None:
                 z_depth = mu_depth if deterministic else reparameterize(mu_depth, logvar_depth)
             else:
                 z_depth = None
         else:
             mu_depth = logvar_depth = z_depth = None
 
-        # ---- 3) Combine base + offsets, reparameterize if stochastic ----
-        mu_tot   = (z_base + mu_offset)
+        # --- final position & scale (match RGB logic) ---
+        mu_tot    = z_base + mu_offset                         # [B,K,3]
+        logvar_tot = logvar_offset
+
+        if mu_scale is not None:
+            # if you have a learned prior term (parity with RGB)
+            if hasattr(self, 'mu_scale_prior') and self.mu_scale_prior is not None:
+                mu_scale = self.mu_scale_prior + mu_scale
+
         if deterministic:
             z_offset = mu_offset
             z_scale  = mu_scale
         else:
             z_offset = reparameterize(mu_offset, logvar_offset)
-            z_scale  = reparameterize(mu_scale,  logvar_scale) if (mu_scale is not None) else None
+            z_scale  = (reparameterize(mu_scale, logvar_scale)
+                        if (mu_scale is not None and logvar_scale is not None) else None)
 
-        z = z_base + z_offset                           # [B, K, 3]
-        logvar_tot = logvar_offset
+        z = z_base + z_offset                                  # [B,K,3]
 
-        # ---- 4) Variance-based utilities / filtering (3D) ----
-        total_var = var_kp.diagonal(dim1=-2, dim2=-1).sum(-1)    # [B,K]
+        # --- variance features / scores (match RGB) ---
+        # var_kp: [B,K,3,3] -> [B,K,9]
+        z_base_var = var_kp.reshape(B, K, -1).detach()         # scoring only; safe to detach
+        confidence_score = logvar_offset.detach()              # scoring only; safe to detach
+        z_base_var = torch.cat([z_base_var, confidence_score], dim=-1)  # [B,K,12]
 
-        # z_base_var: flatten covariance + a tiny confidence (||logvar_offset||)
-        z_base_var = var_kp.view(B, K, 9)                        # [B,K,9]
-        confidence = (logvar_offset.norm(dim=-1, keepdim=True)
-                    if logvar_offset is not None else
-                    torch.zeros(B, K, 1, device=x.device, dtype=z_base_var.dtype))
-        z_base_var = torch.cat([z_base_var, confidence], dim=-1) # [B,K,10]
+        z_base_id = torch.arange(K, device=z_base.device)[None, :, None].repeat(B, 1, 1)  # [B,K,1]
 
-        z_base_id = torch.arange(K, device=x.device)[None, :, None].expand(B, -1, 1)
+        if getattr(self, 'embed_prior_patch_pos', False):
+            # keep API parity; voxel path typically doesn't use this
+            patch_id_embed = self.patch_id_embed.repeat(mu_tot.shape[0], 1, 1)
+        else:
+            patch_id_embed = None
 
-        mu_score     = (z_base_var.mean(-1, keepdim=True) / 30.0) * 2 - 1
-        logvar_score = torch.full_like(mu_score, math.log(0.2 ** 2))
+        mu_score     = (z_base_var.sum(-1, keepdim=True) / 30.0) * 2 - 1  # [B,K,1]
+        logvar_score = torch.full_like(mu_score, math.log(0.2 ** 2))      # [B,K,1]
         z_score      = mu_score
 
-        # ---- 5) Optional Top-K by variance if you need to shrink K ----
+        total_var = z_base_var.sum(-1)                                    # [B,K]
+
+        # --- variance filtering (identical structure to RGB) ---
         if self.n_kp_enc < self.n_kp_prior:
-            n_filter = self.n_kp_enc if not warmup else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior))
-            _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
+            n_filter = (self.n_kp_enc if not warmup
+                        else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior)))
+
+            # Build a validity mask: mark proposals that are non-empty / meaningful.
+            # Two quick heuristics (use either or both):
+            #  1) position not all-zeros
+            #  2) covariance not (near-)zero
+            pos_valid = (kp_p.abs().sum(dim=-1) > 1e-6)                      # [B,K]
+            cov_diag  = var_kp.diagonal(dim1=-2, dim2=-1)                    # [B,K,3]
+            cov_valid = (cov_diag.sum(dim=-1) > 1e-9)                        # [B,K]
+            valid     = (pos_valid | cov_valid)                              # [B,K]
+
+            # Penalize invalids so they are NEVER selected as low-variance
+            big = torch.finfo(total_var.dtype).max / 4.0
+            total_var_masked = torch.where(valid, total_var, torch.full_like(total_var, big))
+
+            # Optional tiny jitter to break ties deterministically across GPUs
+            total_var_masked = total_var_masked + 1e-9 * torch.arange(total_var_masked.shape[-1],
+                                                                    device=total_var_masked.device).float()
+
+            # keep low-var among valid ones
+            _, embed_ind = torch.topk(total_var_masked, k=n_filter, dim=-1, largest=False)
             b_idx = torch.arange(B, device=x.device)[:, None]
 
             def take(t):
@@ -328,34 +361,40 @@ class ParticleEncoder(nn.Module):
             mu_scale      = take(mu_scale)
             mu_score      = take(mu_score)
             logvar_score  = take(logvar_score)
-
+            z_score       = take(z_score)
             kp_p          = take(kp_p)
             var_kp        = take(var_kp)
             total_var     = take(total_var)
 
             if logvar_scale is not None:
                 logvar_scale = take(logvar_scale)
-            if not self.interaction_obj_on and (obj_on_a is not None):
+            if not self.interaction_obj_on:
                 obj_on_a   = take(obj_on_a)
                 obj_on_b   = take(obj_on_b)
                 mu_obj_on  = take(mu_obj_on)
                 z_obj_on   = take(z_obj_on)
-            if not self.interaction_depth and (mu_depth is not None):
+            if not self.interaction_depth:
                 z_depth      = take(z_depth)
                 mu_depth     = take(mu_depth)
                 logvar_depth = take(logvar_depth)
+            if patch_id_embed is not None:
+                patch_id_embed = take(patch_id_embed)
 
-        return {
-            'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'mu_tot': mu_tot,
-            'patch_id_embed': None,
+        # print("KP FROM PARTICLE ENCODER: ", kp_p)
+        out_dict = {
+            'mu': mu, 'logvar': logvar,
+            'z_base': z_base, 'z': z, 'mu_tot': mu_tot,
+            'patch_id_embed': patch_id_embed,
             'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
             'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
             'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
             'kp_p': kp_p, 'var_kp': var_kp,
             'z_base_var': z_base_var, 'total_var': total_var,
             'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
-            'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score
+            'z_base_id': z_base_id,
+            'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score,
         }
+        return out_dict
 
 
 

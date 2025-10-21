@@ -1224,7 +1224,7 @@ class VoxelDLP(nn.Module):
         mu_bg_features  = enc['mu_bg_features']    # [B,Fbg]
         logvar_bg_features = enc['logvar_bg_features']  # [B,Fbg] or None
 
-
+        
 
         # Optional filter key for decoder (sum last dim)
         filter_key = z_base_var.sum(dim=-1)  # [B,K]

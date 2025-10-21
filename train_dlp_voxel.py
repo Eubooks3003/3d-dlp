@@ -27,7 +27,7 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
 from utils.rgbd_utils import get_depth_range, normalize_rgbd
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
-from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly, select_topk_keypoints
+import eval.eval_vox as eval_vox
 import wandb
 
 matplotlib.use("Agg")
@@ -347,7 +347,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 except Exception:
                     return float(default)
 
-            pts_scene = model_output["points_scene"]
             # --- unpack logged losses from calc_static_elbo_pc ---
             loss            = all_losses['loss']
             loss_rec        = all_losses['loss_rec']               # chamfer + color*weight
@@ -368,8 +367,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             obj_on_mean     = _to_float(obj_on)                        # fraction of active objs (roughly)
             mu_scale        = model_output.get('mu_scale', None)       # [B,K,3] or [B,K,1]
             mu_scale_mean   = _to_float(torch.sigmoid(mu_scale) if mu_scale is not None else None)
-            a_mean          = _to_float(model_output.get('obj_on_a', None))
-            b_mean          = _to_float(model_output.get('obj_on_b', None))
 
             # point count sanity
             valid_points    = _to_float(mask.float().sum(dim=1) if mask is not None else None)
@@ -408,18 +405,14 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             pbar.set_postfix(
                 loss=_to_float(loss),
                 rec=_to_float(loss_rec),
-                cham=_to_float(loss_rec_geom),
                 KL=_to_float(loss_kl),
                 kp=_to_float(loss_kl_kp),
                 feat=_to_float(loss_kl_feat),
                 scale=_to_float(loss_kl_scale),
                 obj=_to_float(loss_kl_obj_on),
-                on_l1=_to_float(obj_on_l1),
-                on=_to_float(obj_on),
-                s_mean=mu_scale_mean
             )
 
-            # break  # for debug
+            break  # for debug
         pbar.close()
         # at end of epoch
         losses.append(float(np.mean(batch_losses)))
@@ -456,85 +449,120 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 
-            # GT (filtered by mask)
-            gt_clean = clean_pts(pts[b0], mask[b0] if mask is not None else None)
+            # --- pull GT & REC dense volumes from model_output ---
+            # shapes: [B, C, D, H, W]
+            gt_dense  = model_output.get('dense_target', None)
+            rec_dense = model_output.get('rec_vox', None)    # full reconstruction
+            vox_bg    = model_output.get('vox_bg', None)     # optional (background)
+            vox_obj   = model_output.get('vox_obj', None)    # optional (objects only)
 
-            # REC
-            rec_pts  = model_output.get('points_scene')
-            rec_pts  = clean_pts(rec_pts[b0]) if rec_pts is not None else None
-            rec_cols = model_output.get('rec_colors')
-            rec_cols = rec_cols[b0] if rec_cols is not None else None
-            ids      = model_output.get('assign_ids')
-            ids      = ids[b0] if ids is not None else None
+            # --- keypoints (in [-1,1]^3) ---
+            kp_xyz = model_output.get('kp_p', None)          # [B, K, 3]
 
-            # KPs
-            mu_b = model_output.get('mu') or model_output.get('mu_tot')
-            kp_xyz = model_output['kp_p']
+            # ---------- helpers ----------
+            def _center_slices(x):  # x: [C,D,H,W] -> dict of 3 center slices from channel 0
+                if x is None: return {}
+                if x.dim() == 5: x = x[b0]                   # [C,D,H,W]
+                C,D,H,W = x.shape
+                c = min(0, C-1)                              # plot channel 0 by default
+                d2,h2,w2 = D//2, H//2, W//2
+                # each slice returned as HxW numpy (detach if tensor)
+                def _np(t): 
+                    if t is None: return None
+                    if torch.is_tensor(t): t = t.detach().cpu()
+                    return t.numpy()
+                return {
+                    "xy": _np(x[c, d2, :, :]),
+                    "xz": _np(x[c, :, h2, :]),
+                    "yz": _np(x[c, :, :, w2]),
+                }
 
-            with torch.no_grad():
-                idx, kp_topk, scores_topk = select_topk_keypoints(model_output, topk, prefer_logvar=True)
+            def _log_center_slices(name, x):
+                import matplotlib.pyplot as plt
+                s = _center_slices(x)
+                if not s: return
+                fig, axs = plt.subplots(1, 3, figsize=(9, 3), dpi=120)
+                axs[0].imshow(s["xy"], origin='lower'); axs[0].set_title('XY'); axs[0].axis('off')
+                axs[1].imshow(s["xz"], origin='lower'); axs[1].set_title('XZ'); axs[1].axis('off')
+                axs[2].imshow(s["yz"], origin='lower'); axs[2].set_title('YZ'); axs[2].axis('off')
+                plt.tight_layout()
+                wandb.log({name: wandb.Image(fig)}, step=epoch)
+                plt.close(fig)
 
+            def _mse(a, b):
+                if a is None or b is None: return None
+                a = a[b0:b0+1, :1]  # channel 0
+                b = b[b0:b0+1, :1]
+                return float(torch.mean((a - b)**2).detach().cpu())
 
-            # Interactive logs with adjustable marker size
-            # log_pc_plotly("gt/plotly_pc_with_kp",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
-            # log_pc_plotly("rec/plotly_pc_with_kp", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)
+            def _psnr(a, b, data_range=1.0):
+                mse = _mse(a, b)
+                if mse is None or mse <= 0: return None
+                import math
+                return 20.0 * math.log10(data_range) - 10.0 * math.log10(mse)
+
+            def _iou(a, b, thresh=0.5):
+                # threshold channel 0 as occupancy
+                if a is None or b is None: return None
+                A = (a[b0, 0] > thresh)
+                B = (b[b0, 0] > thresh)
+                inter = (A & B).sum().item()
+                union = (A | B).sum().item()
+                if union == 0: return None
+                return inter / union
+
+            # ---------- images ----------
+            if gt_dense is not None:
+                _log_center_slices("vox/gt_center", gt_dense)
+            if rec_dense is not None:
+                _log_center_slices("vox/rec_center", rec_dense)
+            if vox_bg is not None:
+                _log_center_slices("vox/bg_center", vox_bg)
+            if vox_obj is not None:
+                _log_center_slices("vox/obj_center", vox_obj)
+
+            gt_dense = batch.get("dense", None) or model_output.get("dense_target", None)
+            kps = model_output.get("kp_p", None)
             
-            # print(" Overlay GT with KP")
-            log_pc_overlay_plotly("gt/gt_with_kp", gt_clean, None, kps=kp_xyz,
-                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-            # print("Rec with KP")
-            log_pc_overlay_plotly("rec/rec_with_kp", None, rec_pts, kps=kp_xyz,
-                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-            
-            log_pc_overlay_plotly("gt/gt", gt_clean, None, kps=None,
-                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("rec/rec", None, rec_pts, kps=None,
-                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-            
-            log_pc_overlay_plotly("viz/overlay_source_with_kp", gt_clean, rec_pts, kps=kp_xyz,
-                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=None,
-                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-            
-            if 'kp_topk' in model_output:
+            print("KPS SHAPE: ", kps.shape)
+            print("KPS: ", kps)
+            # --- GT plots (same three modes you used for REC) ---
+            if gt_dense is not None:
+                eval_vox.log_vox_plotly_gt_suite("vox", gt_dense[b0], step=epoch, channel=0, kps=kps)
 
-                # print("GT TOP K")
-                log_pc_overlay_plotly("gt/gt_topk", gt_clean, None, kps=kp_topk,
-                                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-                # print("REC TOP K")
-                log_pc_overlay_plotly("rec/rec_topk", None, rec_pts, kps=kp_topk,
-                                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-                # print("OVERLAY TOP K")
-                log_pc_overlay_plotly("viz/overlay_source_topk", gt_clean, rec_pts, kps=kp_topk,
-                color_mode="source", step=epoch, point_size_gt=2, point_size_rec=2)
-            
+            # --- REC vs GT overlay (pick styles you like) ---
+            if gt_dense is not None and model_output.get("rec_vox", None) is not None:
+                eval_vox.log_vox_plotly_overlay(
+                    "vox/overlay_rec_gt@0.5",
+                    rec_vol=model_output["rec_vox"][b0],
+                    gt_vol=gt_dense[b0],
+                    step=epoch,
+                    channel=0,
+                    rec_mode="isosurface", gt_mode="isosurface",
+                    rec_iso=0.5, gt_iso=0.5,
+                    rec_opacity=0.25, gt_opacity=0.25,
+                    rec_cmap="Oranges", gt_cmap="Blues",
+                    kps=kps
+                )
 
-            # Log mean values before in wandb
+            # ---------- metrics ----------
+            metrics = {}
+            if (gt_dense is not None) and (rec_dense is not None):
+                iou  = _iou(rec_dense, gt_dense, thresh=0.5)
+                mse  = _mse(rec_dense, gt_dense)
+                psnr = _psnr(rec_dense, gt_dense, data_range=1.0)
+                if iou  is not None: metrics["vox/iou@0.5"] = iou
+                if mse  is not None: metrics["vox/mse_c0"]  = mse
+                if psnr is not None: metrics["vox/psnr_c0"] = psnr
 
-            metrics = {
-                "rec/chamfer": mean_chamfer,
-                "rec/color": mean_color,
-                "obj/on_L1": mean_on_l1,
-                "obj/on_prob": mean_on_prob,
-                "obj/scale_mean": mean_s_scale,
-                "reg/repulsion": mean_repulsion,
-                "reg/cov": mean_cov,
-                "reg/norm": mean_norm,
-            }
-            # drop None values so W&B only logs valid scalars
-            metrics = {k: v for k, v in metrics.items() if v is not None}
+            # You can also log reconstruction components if present
+            if "loss_rec_geom" in all_losses and all_losses["loss_rec_geom"] is not None:
+                metrics["rec/geom"] = _to_float(all_losses["loss_rec_geom"])
+            if "loss_rec_color" in all_losses and all_losses["loss_rec_color"] is not None:
+                metrics["rec/color"] = _to_float(all_losses["loss_rec_color"])
 
-            if metrics:  # only log if something to log
-                print("LOGGING METRICS")
-                print(metrics)
+            if metrics:
                 wandb.log(metrics, step=epoch)
-            # # or overlay using REC RGB vs gray GT:
-            # log_pc_overlay_plotly("viz/overlay_rec_rgb", gt_clean, rec_pts, rec_colors=rec_cols, kps=kp_xyz,
-            #                     color_mode="rec_rgb", step=iteration, point_size_gt=2, point_size_rec=2)
-
-            # # or overlay using REC ids vs gray GT:
-            # log_pc_overlay_plotly("viz/overlay_rec_ids", gt_clean, rec_pts, rec_ids=ids, kps=kp_xyz,
-            #                     color_mode="rec_ids", step=iteration, point_size_gt=2, point_size_rec=2)
 
 
     return model

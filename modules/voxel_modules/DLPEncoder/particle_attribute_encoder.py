@@ -242,11 +242,18 @@ class ParticleAttributeEncoder3D(nn.Module):
         if self.with_obj_on and self.obj_on_head is not None:
             l_a_b = self.obj_on_head(feat_flat)                  # [B*K,2]
             l_a, l_b = l_a_b.split(1, dim=-1)
-            gate_a = l_a.sigmoid()
-            gate_b = 1.0 - l_a.sigmoid()
-            a = ((1 - gate_a) * self.obj_on_min + gate_a * self.obj_on_max).exp()
-            b = ((1 - gate_b) * self.obj_on_min + gate_b * self.obj_on_max).exp()
+            gate_a = torch.sigmoid(l_a)
+            gate_b = torch.sigmoid(l_b)  # or keep 1 - sigmoid(l_a) if you prefer coupling
+
+            a = (1.0 - gate_a) * self.obj_on_min + gate_a * self.obj_on_max
+            b = (1.0 - gate_b) * self.obj_on_min + gate_b * self.obj_on_max
+
+            eps = 1e-8
+            a = a.clamp_min(eps)
+            b = b.clamp_min(eps)
+
             beta = torch.distributions.Beta(a, b)
+
             mu_obj_on = beta.mean
             z_obj_on  = mu_obj_on if deterministic else beta.rsample()
         else:

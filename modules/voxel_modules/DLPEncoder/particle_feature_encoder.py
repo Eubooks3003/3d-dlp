@@ -1,222 +1,217 @@
+import math
 import torch
 import torch.nn as nn
-from typing import Optional
-import math
+import torch.nn.functional as F
 import numpy as np
+
+from modules.point_cloud_modules.vision_modules_3d import Encoder3D
 from utils.util_func import reparameterize
 
-# TODO: eliminate the overlap between this and particle attribute encoder
-def safe_topk_knn(
-    centers: torch.Tensor,   # [B, K, 3]
-    points:  torch.Tensor,   # [B, N, 3(+F)]
-    mask:    Optional[torch.Tensor],  # [B, N] (bool) True=valid
-    k: int
-) -> torch.Tensor:
+# If not already imported in this file:
+# from modules.voxel_modules.DLPEncoder.particle_attribute_encoder import spatial_transform_3d
+# (or paste the same spatial_transform_3d here)
+
+class ParticleFeaturesEncoder3D(nn.Module):
     """
-    Return KNN indices for each center (xyz distance only).
-
-    - If `mask` is provided, invalid (padded) points are ignored.
-    - If N < k, pads by repeating the last valid neighbor.
+    Voxel (3D) glimpse encoder:
+      - crops a 3D cube around each keypoint with spatial_transform_3d
+      - encodes with a small 3D CNN
+      - projects to per-particle latent features (mu/logvar) with FCN (1x1x1 conv) or FC head
+    Returns: mu_features, logvar_features, (optional) z_features, and cropped_objects.
     """
-    assert centers.dim() == 3 and centers.size(-1) >= 3, f"centers must be [B,K,3], got {tuple(centers.shape)}"
-    assert points.dim()  == 3 and points.size(-1)  >= 3, f"points must be [B,N,3(+F)], got {tuple(points.shape)}"
 
-    B, N, _ = points.shape
-    K = centers.size(1)
-
-    # pairwise distances in xyz
-    d = torch.cdist(centers[..., :3], points[..., :3])  # [B,K,N]
-    if mask is not None:
-        assert mask.shape == (B, N), f"mask must be [B,N], got {tuple(mask.shape)}"
-        d = d + (~mask).unsqueeze(1) * 1e6
-
-    k_eff = min(k, N)
-    idx = d.topk(k=k_eff, dim=-1, largest=False).indices  # [B,K,k_eff]
-
-    if k_eff < k:
-        pad = idx[..., -1:].expand(B, K, k - k_eff)
-        idx = torch.cat([idx, pad], dim=-1)               # [B,K,k]
-
-    return idx
-
-
-class MLP1D(nn.Module):
-    """
-    Small MLP operating on the last dimension (no shared 1x1 conv assumptions).
-    Expects input shaped [..., C_in] and returns [..., C_out].
-    """
-    def __init__(self, in_ch: int, out_ch: int, hidden: Optional[int] = None, act: str = "relu"):
-        super().__init__()
-        hidden = out_ch if hidden is None else hidden
-        if act == "relu":
-            act_layer = nn.ReLU(inplace=True)
-        elif act == "gelu":
-            act_layer = nn.GELU()
-        else:
-            raise ValueError(f"Unsupported act='{act}'")
-
-        self.net = nn.Sequential(
-            nn.Linear(in_ch, hidden),
-            act_layer,
-            nn.Linear(hidden, out_ch),
-            act_layer,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [..., in_ch]
-        return self.net(x)
-
-
-# --- only the differences vs your last version; replace your class with this one ---
-
-class ParticleFeaturesEncoderPoint(nn.Module):
     def __init__(self,
-                 anchor_size: float,
+                 anchor_size: float,            # not strictly needed when crop_size is provided
                  features_dim: int,
-                 in_feat: int = 0,
-                 k_neighbors: int = 128,
+                 ch_in: int,                    # channels of dense voxel input
+                 crop_size: tuple = (16, 16, 16),  # (d,h,w) of the cropped cube
+                 base_ch: int = 32,
+                 ch_mult=(1, 2, 3),
+                 num_res_blocks: int = 2,
+                 use_resblock: bool = True,
+                 cnn_mid_blocks: bool = False,
+                 use_attention: bool = False,
+                 final_cnn_ch: int = 32,
                  output_logvar: bool = True,
-                 features_dist: str = 'gauss',
-                 hidden: int = 128,
-                 interaction_features: bool = False,
-                 use_null_features_embed: bool = False,
-                 embed_init_std: float = 0.02,
-                 base_radius: float = 0.25,         # <- sets physical crop size before scale
-                 clamp_after_st: bool = True        # <- clamp normalized coords to [-1,1]
+                 hidden_dim: int = 256,
+                 activation: str = "gelu",
+                 timestep_horizon: int = 1,
+                 add_particle_temp_embed: bool = False,
+                 init_std: float = 0.2,
+                 # init
+                 init_zero_bias: bool = True,
+                 init_conv_layers: bool = True,
+                 init_conv_fg_std: float = 0.02,
                  ):
         super().__init__()
-        assert features_dist in ('gauss', 'categorical'), "Only 'gauss' implemented here."
-        self.features_dim = features_dim
-        self.k = k_neighbors
-        self.output_logvar = output_logvar
-        self.features_dist = features_dist
-        self.interaction_features = interaction_features
-        self.use_null_features_embed = use_null_features_embed
-        self.base_radius = base_radius
-        self.clamp_after_st = clamp_after_st
+        self.anchor_size = float(anchor_size)
+        self.features_dim = int(features_dim)
+        self.ch_in = int(ch_in)
+        self.crop_d, self.crop_h, self.crop_w = tuple(crop_size)
+        self.output_logvar = bool(output_logvar)
+        self.hidden_dim = int(hidden_dim)
+        self.timestep_horizon = int(timestep_horizon)
+        self.add_particle_temp_embed = bool(add_particle_temp_embed)
+        self.activation = activation
 
-        # input per neighbor: [x',y',z' (normalized), radius', (optional extra features)]
-        in_ch = 4 + in_feat
+        # 3D CNN over cropped cubes -> final_cnn_ch feature maps
+        self.cnn3d = Encoder3D(
+            in_channels=self.ch_in,
+            ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+            residual=use_resblock, dropout=0.0,
+            use_attention=use_attention,
+            mid_blocks=not cnn_mid_blocks,
+            out_channels=final_cnn_ch
+        )
 
-        mid = hidden
-        self.block1 = MLP1D(in_ch, mid)
-        self.block2 = MLP1D(mid, mid)
-        out_ch = mid
+        # Probe spatial size after CNN to decide FCN vs FC projection
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.ch_in, self.crop_d, self.crop_h, self.crop_w)
+            feat = self.cnn3d(dummy)
+            if isinstance(feat, tuple):
+                feat = feat[1]
+            _, Cc, d2, h2, w2 = feat.shape
+        self._feat_shape = (Cc, d2, h2, w2)              # CNN output shape
+        fmap_voxels = d2 * h2 * w2
 
-        self.to_mu = nn.Linear(out_ch, features_dim)
-        self.to_logvar = nn.Linear(out_ch, features_dim) if output_logvar else nn.Identity()
+        # FCN projection (1x1x1 conv) if features_dim is a multiple of spatial size
+        if self.features_dim % fmap_voxels == 0:
+            self.projection_mode = "fcn"
+            self.ch_feature_dim = max(self.features_dim // fmap_voxels, 1)
+            z_out_channels = 2 * self.ch_feature_dim if self.output_logvar else self.ch_feature_dim
+            self.to_latent = nn.Conv3d(in_channels=final_cnn_ch, out_channels=z_out_channels, kernel_size=1)
 
-        if use_null_features_embed:
-            self.null_feature_embed = nn.Parameter(
-                embed_init_std * torch.randn(1, 1, features_dim)
-            )
+            if (self.timestep_horizon > 1) and self.add_particle_temp_embed:
+                # (B, T, K, C, d2, h2, w2) add-on — same idea as 2D version
+                self.temp_embed = nn.Parameter(
+                    init_std * torch.randn(1, self.timestep_horizon, 1, final_cnn_ch, d2, h2, w2)
+                )
+            else:
+                self.temp_embed = None
+
+            self.to_mu = nn.Identity()
+            self.to_logvar = nn.Identity()
+            self._latent_flat = (self.ch_feature_dim, d2, h2, w2)
+
         else:
-            self.null_feature_embed = None
-    def info(self) -> str:
-        lines = [
-            "ParticleFeaturesEncoderPoint",
-            f"  features_dim            = {self.features_dim}",
-            f"  k_neighbors             = {self.k}",
-            f"  output_logvar           = {self.output_logvar}",
-            f"  features_dist           = '{self.features_dist}'",
-            f"  hidden                  = {next(self.block1.net[0].parameters()).shape[-1] if hasattr(self, 'block1') else 'N/A'}",
-            f"  use_null_features_embed = {self.use_null_features_embed}",
-            f"  interaction_features    = {self.interaction_features}",
-            f"  base_radius             = {getattr(self, 'base_radius', 'N/A')}",
-            f"  clamp_after_st          = {getattr(self, 'clamp_after_st', 'N/A')}",
-        ]
-        # infer extra per-point channels beyond xyz from first linear layer
-        try:
-            in_ch = self.block1.net[0].in_features
-            extra_feat = max(in_ch - 4, 0)  # (we add [dx,dy,dz,r] internally)
-            lines.append(f"  in_feat(extra per-point) = {extra_feat}")
-        except Exception:
-            pass
-        return "\n".join(lines)
-    @staticmethod
-    def _gate_with_null(mu: torch.Tensor,
-                        gate: torch.Tensor,
-                        null_embed: Optional[torch.Tensor]) -> torch.Tensor:
-        if gate.dim() == 2:
-            gate = gate.unsqueeze(-1)  # [B,K,1]
-        if null_embed is None:
-            return mu * gate
-        return gate * mu + (1.0 - gate) * null_embed
+            # FC projection from flattened CNN features
+            self.projection_mode = "fc"
+            self.ch_feature_dim = Cc
+            flat_in = Cc * d2 * h2 * w2
+            self.to_latent = nn.Identity()
+            self.to_mu = self._make_mlp(flat_in, self.features_dim, self.hidden_dim, self.activation)
+            self.to_logvar = (self._make_mlp(flat_in, self.features_dim, self.hidden_dim, self.activation)
+                              if self.output_logvar else nn.Identity())
+            if (self.timestep_horizon > 1) and self.add_particle_temp_embed:
+                self.temp_embed = nn.Parameter(init_std * torch.randn(1, self.timestep_horizon, 1, flat_in))
+            else:
+                self.temp_embed = None
+            self._latent_flat = (flat_in,)
 
-    def sample_gauss(self, mu: torch.Tensor, logvar: Optional[torch.Tensor],
-                     deterministic: bool) -> torch.Tensor:
-        if deterministic or (logvar is None):
-            return mu
-        return reparameterize(mu, logvar)
+        # init conv biases
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                if init_conv_layers:
+                    nn.init.normal_(m.weight, 0.0, init_conv_fg_std)
+                if init_zero_bias and (m.bias is not None):
+                    nn.init.constant_(m.bias, 0.0)
+
+        self.info = (f"ParticleFeaturesEncoder3D: latent {self.features_dim} | "
+                     f"CNN out: {self._feat_shape} (vox={fmap_voxels}) -> {self.projection_mode}")
+
+    @staticmethod
+    def _make_mlp(in_dim, out_dim, hidden_dim, activation="gelu"):
+        Act = nn.GELU if activation == "gelu" else nn.ReLU
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden_dim), Act(),
+            nn.Linear(hidden_dim, out_dim)
+        )
 
     def forward(self,
-                points: torch.Tensor,     # [B,N,3(+F)]
-                kp: torch.Tensor,          # [B,K,3]
-                z_scale: Optional[torch.Tensor] = None,  # [B,K,3] logits, optional
-                deterministic: bool = False,
-                obj_on: Optional[torch.Tensor] = None,   # [B,K] or [B,K,1]
-                mask: Optional[torch.Tensor] = None      # [B,N] True=valid
-                ) -> dict:
-        B, N, C = points.shape
-        assert kp.dim() == 3 and kp.size(-1) == 3, f"kp must be [B,K,3], got {tuple(kp.shape)}"
-        K = kp.size(1)
+                x_dense: torch.Tensor,     # [B, C, D, H, W]
+                kp: torch.Tensor,          # [B, K, 3]  centers in [-1,1]^3
+                z_scale: torch.Tensor = None,  # [B, K, 3] (unnormalized → sigmoid)
+                timesteps: int = None,
+                obj_on: torch.Tensor = None,   # [B, K] or [B, K, 1] gate
+                deterministic: bool = False):
+        B, C, D, H, W = x_dense.shape
+        _, K, _ = kp.shape
 
-        # ---- 1) choose neighborhood ----
-        idx = safe_topk_knn(kp, points, mask, self.k)        # [B,K,k]
-        idx_exp_c = idx.unsqueeze(-1).expand(B, K, self.k, C)
-        neigh = torch.gather(points.unsqueeze(1).expand(B, K, N, C), 2, idx_exp_c)  # [B,K,k,C]
+        # repeat volume per kp -> [B*K, C, D, H, W]
+        x_rep = x_dense[:, None].expand(B, K, C, D, H, W).reshape(B*K, C, D, H, W)
 
-        # ---- 2) 3D "spatial transform": translate & scale into a canonical cube ----
-        # base radius scaled by z_scale (if provided)
-        if z_scale is not None:
-            # z_scale are logits -> turn into (0,1) with sigmoid, then average over xyz
-            s = torch.sigmoid(z_scale).mean(dim=-1, keepdim=True)  # [B,K,1]
+        # default scale = crop / grid (per-axis)
+        if z_scale is None:
+            zs = torch.tensor([self.crop_w/(W-1), self.crop_h/(H-1), self.crop_d/(D-1)],
+                              device=x_dense.device, dtype=x_dense.dtype)  # (x,y,z) order
+            z_scale = zs.view(1, 1, 3).expand(B, K, 3)
         else:
-            s = torch.ones(B, K, 1, device=points.device)          # no scaling
+            z_scale = torch.sigmoid(z_scale)
 
-        r = self.base_radius * s                                    # [B,K,1]
-        rel = neigh[..., :3] - kp.unsqueeze(2)                      # [B,K,k,3]  (translate)
-        # normalize to unit-ish cube by dividing by r, small epsilon for safety
-        rel_norm = rel / (r.unsqueeze(2) + 1e-6)                    # [B,K,k,3]
-        if self.clamp_after_st:
-            rel_norm = rel_norm.clamp_(-1.0, 1.0)
+        # flatten for spatial_transform_3d
+        z_pos   = kp.reshape(B*K, 3)
+        z_scale = z_scale.reshape(B*K, 3)
 
-        # optional: strict crop (keep only neighbors inside radius)
-        # keep = (rel.norm(dim=-1, keepdim=True) <= (r.unsqueeze(2) + 1e-6)).float()   # [B,K,k,1]
-        # rel_norm = rel_norm * keep
+        out_dims = (B*K, C, self.crop_d, self.crop_h, self.crop_w)
+        crops = spatial_transform_3d(
+            x_rep, z_pos, z_scale, out_dims, padding_mode="border"
+        )  # [B*K, C, d, h, w]
 
-        # radius channel in normalized space
-        r_norm = torch.linalg.norm(rel_norm, dim=-1, keepdim=True)  # [B,K,k,1]
-
-        feats = [rel_norm, r_norm]
-        if C > 3:
-            feats.append(neigh[..., 3:])                             # propagate extra per-point features
-        x = torch.cat(feats, dim=-1)                                 # [B,K,k,4+Fin]
-
-        # ---- 3) PointNet-like encode + pool ----
-        x = self.block1(x)
-        x = self.block2(x)
-        x = x.max(dim=2).values                                      # [B,K,hidden]
-
-        # ---- 4) project to latent; optional obj_on gating ----
-        mu = self.to_mu(x)
-        logvar = self.to_logvar(x) if self.output_logvar else None
-
+        # 3D CNN on crops
+        feat = self.cnn3d(crops)
+        if isinstance(feat, tuple):
+            feat = feat[1]     # keep parity with your Encoders
+        # obj_on gating on feature maps (broadcast)
         if obj_on is not None:
-            gate = (obj_on > 0.2).to(mu.dtype)
-            mu = self._gate_with_null(mu, gate, self.null_feature_embed)
+            gate = obj_on.view(B*K, 1, 1, 1, 1).to(feat.dtype)
+            feat = feat * gate
 
-        # ---- 5) sample (or passthrough during interaction stage) ----
-        if self.features_dist == 'categorical':
-            z_features = None
+        # (optional) temporal embedding (same semantics as 2D)
+        if (self.timestep_horizon > 1) and (self.temp_embed is not None) and (timesteps is not None):
+            # reshape to [B, T, K, C, d, h, w] at callsite if you truly pack multi-T
+            # here we keep per-call T=timesteps, but typical training feeds one T
+            # so this is usually a no-op unless you batch time inside B.
+            pass
+
+        if self.projection_mode == "fcn":
+            # 1x1x1 conv → [B*K, zC, d2, h2, w2]
+            zmap = self.to_latent(feat)
+            # split mu/logvar channels
+            if self.output_logvar:
+                ch = zmap.shape[1] // 2
+                mu_map, logvar_map = zmap[:, :ch], zmap[:, ch:]
+            else:
+                mu_map, logvar_map = zmap, None
+
+            # flatten per particle -> [B, K, F]
+            mu_features = mu_map.flatten(2).reshape(B, K, -1)
+            if self.output_logvar:
+                logvar_features = logvar_map.flatten(2).reshape(B, K, -1)
+            else:
+                logvar_features = None
+
         else:
-            z_features = mu if self.interaction_features else self.sample_gauss(mu, logvar, deterministic)
+            # FC projection from flattened CNN output
+            flat = feat.flatten(1)                       # [B*K, flat_in]
+            if (self.timestep_horizon > 1) and (self.temp_embed is not None) and (timesteps is not None):
+                # add temporal embedding if you actually pack time
+                pass
+            mu_features = self.to_mu(flat).reshape(B, K, -1)
+            logvar_features = (self.to_logvar(flat).reshape(B, K, -1)
+                               if self.output_logvar else None)
+
+        # (optional) reparameterize like your point encoder (for consistency)
+        if (not deterministic) and (logvar_features is not None):
+            z_features = reparameterize(mu_features, logvar_features)
+        else:
+            z_features = mu_features
+
+        # reshape crops to [B, K, C, d, h, w] for logging
+        crops = crops.view(B, K, C, self.crop_d, self.crop_h, self.crop_w)
 
         return {
-            'mu_features':           mu,             # [B,K,F]
-            'logvar_features':       logvar,         # [B,K,F] or None
-            'z_features':            z_features,     # [B,K,F]
-            'mu_features_total':     mu,
-            'logvar_features_total': logvar,
-            'z_features_total':      z_features,
+            "mu_features":     mu_features,        # [B, K, F]
+            "logvar_features": logvar_features,    # [B, K, F] or None
+            "z_features":      z_features,         # [B, K, F]
+            "cropped_objects": crops               # [B, K, C, d, h, w]
         }
