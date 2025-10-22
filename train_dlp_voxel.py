@@ -324,7 +324,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # iteration counter
     iteration = 0
     
-    run_name = f"{decoder_point_mode}-{points_per_object}"
+    run_name = f"{voxel_mode}-{voxel_grid_whd[0]}"
     wandb.init(
         name=run_name,
         config=config,
