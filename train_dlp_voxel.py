@@ -25,6 +25,7 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
                              create_segmentation_map, get_config, LinearWithWarmupScheduler, format_epoch_summary,
                              plot_training_metrics, save_metrics_data, save_code_backup, depth_to_rgb)
 from utils.rgbd_utils import get_depth_range, normalize_rgbd
+from utils.log_utils import save_checkpoint, load_checkpoint
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
 import eval.eval_vox as eval_vox
@@ -140,6 +141,10 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     points_per_scale = config["points_per_scale"]
     points_bg = config["points_bg"]
 
+    # Voxel Stuff
+    voxel_mode = config["voxel_mode"]
+    voxel_grid_whd = config["voxel_grid_whd"]
+
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=pc_collate)
     # model
@@ -213,6 +218,10 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         points_per_object=points_per_object,
         points_per_scale=points_per_scale,
         points_bg=points_bg,
+
+        # Voxel Stuff
+        voxel_mode=voxel_mode,
+        voxel_grid_whd=voxel_grid_whd,
         ).to(device)
         
     model_info = model.info()
@@ -222,6 +231,30 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     log_dir = prepare_logdir(runname=run_name, src_dir='./logs')
     fig_dir = os.path.join(log_dir, 'figures')
     save_dir = os.path.join(log_dir, 'saves')
+
+    # ---- Checkpoint config ----
+    save_every = int(config.get("save_every", 10))   # save epoch snapshot every N epochs
+    monitor = config.get("monitor", "loss")          # which metric to track for "best"
+    mode = config.get("monitor_mode", "min")         # "min" or "max"
+    assert mode in ("min", "max")
+    best_val = float("inf") if mode == "min" else -float("inf")
+
+    # Paths
+    os.makedirs(save_dir, exist_ok=True)
+    ckpt_last = os.path.join(save_dir, "last.pt")
+    ckpt_best = os.path.join(save_dir, "best.pt")
+
+    # ---- Optional resume / preload ----
+    start_epoch = int(config.get('start_epoch', 0))
+    if load_model and pretrained_path is not None:
+        try:
+            resume_info = load_checkpoint(pretrained_path, model, None, None, map_location=device)
+            # if this looks like a full ckpt and user wants true resume, do it after optimizer is created
+            print(f"[ckpt] Loaded weights from {pretrained_path} (full={resume_info['is_full_ckpt']})")
+        except Exception as e:
+            print(f"[ckpt] Failed to load {pretrained_path}: {e}")
+
+
     save_config(log_dir, hparams)
     log_line(log_dir, model_info)
     # save a backup of the code for this run
@@ -246,12 +279,18 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     else:
         scheduler = None
 
+    # If pretrained_path was a full checkpoint and we want to resume optimizer/scheduler
     if load_model and pretrained_path is not None:
         try:
-            model.load_state_dict(torch.load(pretrained_path, map_location=device, weights_only=False))
-            print("loaded model from checkpoint")
-        except:
-            print("model checkpoint not found")
+            resume_info = load_checkpoint(pretrained_path, model, optimizer, scheduler, map_location=device)
+            # carry over epoch/best if start_epoch isn't forced by config
+            if start_epoch == 0 and resume_info.get("epoch", 0) > 0:
+                start_epoch = int(resume_info["epoch"] + 1)
+            best_val = resume_info.get("best_metric", best_val)
+            print(f"[ckpt] Resumed training from epoch {start_epoch}, best={best_val:.6f}")
+        except Exception as e:
+            print(f"[ckpt] Resume skipped: {e}")
+
 
     # log statistics
     losses = []
@@ -446,6 +485,40 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         print(log_str)
         log_line(log_dir, log_str)
 
+        # ---- Decide monitored metric ----
+        # You already have epoch means: losses[-1], losses_rec[-1], etc.
+        if monitor == "loss":
+            monitored = losses[-1]
+        elif monitor == "rec":
+            monitored = losses_rec[-1]
+        elif monitor == "kl":
+            monitored = losses_kl[-1]
+        elif monitor == "vox/psnr_c0":
+            # if you computed metrics dict above (optional)
+            monitored = metrics.get("vox/psnr_c0", None) if "metrics" in locals() else None
+        else:
+            # fallback to total loss
+            monitored = losses[-1]
+
+        # ---- Save "last" every epoch ----
+        save_checkpoint(ckpt_last, model, optimizer, scheduler, epoch, best_val,
+                        extra={"monitored": monitored, "monitor": monitor, "mode": mode})
+
+        # ---- Save "best" if improved ----
+        if monitored is not None:
+            improved = (monitored < best_val) if mode == "min" else (monitored > best_val)
+            if improved:
+                best_val = monitored
+                save_checkpoint(ckpt_best, model, optimizer, scheduler, epoch, best_val,
+                                extra={"monitored": monitored, "best_update": True})
+                print(f"[ckpt] New best ({monitor}={monitored:.6f}) at epoch {epoch:04d} -> saved best.pt")
+
+        # ---- Periodic epoch snapshot ----
+        if save_every and (epoch % save_every == 0 or epoch == num_epochs - 1):
+            snap_path = os.path.join(save_dir, f"epoch_{epoch:04d}.pt")
+            save_checkpoint(snap_path, model, optimizer, scheduler, epoch, best_val,
+                            extra={"monitored": monitored, "snapshot": True})
+
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 
@@ -531,21 +604,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             if model_output.get("rec_vox", None) is not None:
                 eval_vox.log_vox_plotly_rec_suite("vox", model_output["rec_vox"][b0], step=epoch, channel=0, kps=kps)
 
-            print(" REC VOX: ", model_output["rec_vox"][b0].shape)
-            # --- REC vs GT overlay (pick styles you like) ---
-            if gt_dense is not None and model_output.get("rec_vox", None) is not None:
-                eval_vox.log_vox_plotly_overlay(
-                    "vox/overlay_rec_gt@0.5",
-                    rec_vol=model_output["rec_vox"][b0],
-                    gt_vol=gt_dense[b0],
-                    step=epoch,
-                    channel=0,
-                    rec_mode="isosurface", gt_mode="isosurface",
-                    rec_iso=0.5, gt_iso=0.5,
-                    rec_opacity=0.25, gt_opacity=0.25,
-                    rec_cmap="Oranges", gt_cmap="Blues",
-                    kps=kps
-                )
 
             # ---------- metrics ----------
             metrics = {}

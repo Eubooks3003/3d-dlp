@@ -146,6 +146,10 @@ class VoxelDLP(nn.Module):
                  points_per_scale=(32, 64),
                  points_bg=256,
 
+                 # Voxel Stuff
+                 voxel_mode="moments",
+                 voxel_grid_whd=(48, 48, 48)
+
                 ):
         super(VoxelDLP, self).__init__()
         """
@@ -256,7 +260,13 @@ class VoxelDLP(nn.Module):
 
         Note: Patch extraction and stitching use differentiable spatial transformer networks (STN).
         """
-        self.cdim = cdim  # number of input image channels
+
+        if voxel_mode=="moments":
+            self.cdim = 7  # number of input image channels
+        elif voxel_mode in ("occupancy","density"):
+            self.cdim = 1
+        else:
+            self.cdim = 3
         self.image_size = image_size
         self.normalize_rgb = normalize_rgb  # normalize to [-1, 1] or keep [0, 1]
         self.n_views = n_views  # number of input views (e.g., multiple cameras)
@@ -346,6 +356,10 @@ class VoxelDLP(nn.Module):
         self.points_per_object = points_per_object
         self.points_per_scale = points_per_scale
         self.points_bg = points_bg
+
+        # Voxel specific:
+        self.voxel_mode = voxel_mode
+        self.voxel_grid_whd = voxel_grid_whd
 
         self.context_dist = ctx_dist
         assert self.context_dist in ["gauss", "beta", "categorical"], f'ctx distribution {ctx_dist} unrecognized'
@@ -481,6 +495,7 @@ class VoxelDLP(nn.Module):
                                          init_conv_bg_std=init_conv_bg_std,  # std for conv bg normal dist
                                          separate_depth_features=separate_depth_features,
                                          depth_feature_dim=depth_feature_dim,
+                                         voxel_grid_whd=voxel_grid_whd,
                                          )
 
         # prior
@@ -489,46 +504,10 @@ class VoxelDLP(nn.Module):
         # particle_anchors = particle_anchors.unsqueeze(-2).repeat(1, 1, self.n_kp_per_patch, 1).view(1, -1, 2)
         # [1, n_patches * n_kp_per_patch, 2]
 
-        # decoder
-        # self.decoder_module = DLPDecoder(
-        #     # --- essentials / dimensions ---
-        #     cdim=cdim,
-        #     learned_feature_dim=self.learned_feature_dim,
-        #     learned_bg_feature_dim=self.learned_bg_feature_dim,
-        #     n_kp_enc=self.n_kp_dec,
-        #     context_dim=self.context_dim,
-
-        #     # --- init & MLP sizing (kept from 2D) ---
-        #     mlp_hidden_dim=mlp_hidden_dim,
-        #     init_zero_bias=init_zero_bias,
-        #     init_conv_layers=init_conv_layers,
-        #     init_conv_fg_std=init_conv_fg_std,   # used for object MLPs
-        #     init_conv_bg_std=init_conv_bg_std,   # used for background MLPs
-
-        #     # --- rendering / color behavior ---
-        #     normalize_rgb=normalize_rgb,
-        #     color_activation=("tanh" if normalize_rgb else "sigmoid"),
-
-        #     # --- PC-specific knobs ---
-        #     points_per_obj=getattr(self, "points_per_obj", 256),  # M_obj
-        #     points_bg=getattr(self, "points_bg", 2048),           # M_bg
-        #     predict_obj_color=(cdim >= 3),
-        #     predict_bg_color=(cdim >= 3),
-        #     use_context=(self.context_dim > 0),
-
-        #     # --- geometry & blending ---
-        #     sphere_sigma=getattr(self, "sphere_sigma", 0.06),
-        #     depth_blend=getattr(self, "depth_blend", "softmax"),  # {'softmax','alpha'}
-        #     clamp_bounds=True,
-
-        #     # --- background template ---
-        #     bg_template=getattr(self, "bg_template", "sphere"),   # {'sphere','cube','gridxy'}
-        #     learn_bg_template=getattr(self, "learn_bg_template", False),
-        # )
 
         # TODO: Make grid and cdim configurable
         self.decoder_module = DLPDecoder3D(
-            grid_dhw=(48,48,48),         # e.g. (48,48,48)
+            grid_dhw=voxel_grid_whd,         # e.g. (48,48,48)
             cdim_out=7,      # e.g. 7 channels
             learned_feature_dim=self.learned_feature_dim,
             learned_bg_feature_dim=self.learned_bg_feature_dim,
@@ -1183,9 +1162,14 @@ class VoxelDLP(nn.Module):
         grid_whd = getattr(self, "voxel_grid_whd", (48,48,48))
         voxel_mode = getattr(self, "voxel_mode", "moments")   # 'density' | 'occupancy' | 'avg_rgb'
         dense, vg_list, metas = build_voxel_batch(x, grid_whd=grid_whd, mode=voxel_mode)
+
+        # Normalize points
+        span = (metas["pmax"] - metas["pmin"]).clamp_min(1e-9)         # [B,3]
+        pts01 = (x - metas["pmin"].unsqueeze(1)) / span.unsqueeze(1) # [B,N,3] in [0,1]
+        pts_norm = pts01 * 2.0 - 1.0                                   # [-1,1]
         
         print("DENSE SHAPE: ", dense.shape)
-        enc = self.encode_all(x, mask, dense, deterministic=deterministic, warmup=warmup,
+        enc = self.encode_all(pts_norm, mask, dense, deterministic=deterministic, warmup=warmup,
                             actions=actions, actions_mask=actions_mask,
                             lang_embed=lang_embed, x_goal=x_goal)
 

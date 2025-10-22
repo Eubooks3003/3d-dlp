@@ -39,9 +39,10 @@ class VoxelGridXYZ:
 
         # quantize xyz -> (ix,iy,iz)
         p01 = (points_xyz - pmin) / span
-        ix = (p01[:,0]*(self.W-1)).round().clamp(0,self.W-1).long()
-        iy = (p01[:,1]*(self.H-1)).round().clamp(0,self.H-1).long()
-        iz = (p01[:,2]*(self.D-1)).round().clamp(0,self.D-1).long()
+        ix = (p01[:,0]*(self.W-1)).floor().clamp(0,self.W-1).long()
+        iy = (p01[:,1]*(self.H-1)).floor().clamp(0,self.H-1).long()
+        iz = (p01[:,2]*(self.D-1)).floor().clamp(0,self.D-1).long()
+
         lin = self._lin(ix, iy, iz)  # xyz-linear (x fastest)
 
         # CSR-like voxel→points
@@ -170,29 +171,25 @@ def build_voxel_batch(
     metas = {k: torch.stack(v, dim=0) for k,v in metas.items()}
     metas.update({"W": grid_whd[0], "H": grid_whd[1], "D": grid_whd[2]})
     return dense, vg_list, metas
-
-
 @torch.no_grad()
-def points_to_tile_ids(points_xyz: torch.Tensor, grid_DHW, tile_size_DHW) -> torch.Tensor:
+def tile_ids_norm_xyz_to_dhw(xyz_norm: torch.Tensor, grid_DHW, tile_DHW) -> torch.Tensor:
     """
-    points_xyz: [B,N,3] in voxel index space *or* normalized to [-1,1] over the ORIGINAL grid.
-    Assumes your keypoints are normalized to [-1,1] over (D,H,W).
-    Returns: [B,N] linear tile ids (x-fastest), matching DLPPrior’s tiling.
+    xyz_norm: [B,N,3] in normalized prior coords (x,y,z) ∈ [-1,1].
+    grid_DHW: (D,H,W) of the dense prior grid
+    tile_DHW: (tD,tH,tW)
+    Returns: [B,N] linear tile ids (x-fastest).
     """
-    B, N, _ = points_xyz.shape
-    D, H, W = grid_DHW           # ORIGINAL grid from DLPPrior(grid=...)
-    td, th, tw = tile_size_DHW
+    D, H, W = map(int, grid_DHW)
+    tD, tH, tW = map(int, tile_DHW)
+    nZ, nY, nX = D // tD, H // tH, W // tW
 
-    # convert [-1,1] -> [0..D-1/H-1/W-1]
-    p01 = (points_xyz + 1) * 0.5
-    vz = (p01[..., 2] * (D-1)).floor().clamp(0, D-1)  # z
-    vy = (p01[..., 1] * (H-1)).floor().clamp(0, H-1)  # y
-    vx = (p01[..., 0] * (W-1)).floor().clamp(0, W-1)  # x
+    p01 = (xyz_norm + 1.0) * 0.5  # [-1,1] -> [0,1]
+    vx = (p01[..., 0] * (W - 1)).floor().clamp_(0, W - 1)  # x -> W
+    vy = (p01[..., 1] * (H - 1)).floor().clamp_(0, H - 1)  # y -> H
+    vz = (p01[..., 2] * (D - 1)).floor().clamp_(0, D - 1)  # z -> D
 
-    tz = (vz / td).floor().clamp(0, (D-1)//td)  # tile index along D
-    ty = (vy / th).floor().clamp(0, (H-1)//th)
-    tx = (vx / tw).floor().clamp(0, (W-1)//tw)
+    tx = (vx / tW).floor().clamp_(0, nX - 1)
+    ty = (vy / tH).floor().clamp_(0, nY - 1)
+    tz = (vz / tD).floor().clamp_(0, nZ - 1)
 
-    nz, ny, nx = D//td, H//th, W//tw
-    tile_lin = tx + nx * (ty + ny * tz)         # [B,N]
-    return tile_lin.long()
+    return (tx + nX * (ty + nY * tz)).long()

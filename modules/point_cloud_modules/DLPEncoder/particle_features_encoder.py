@@ -181,7 +181,13 @@ class ParticleFeaturesEncoderPoint(nn.Module):
         K = kp.size(1)
         assert point_tile_ids.shape == (B, N), f"point_tile_ids must be [B,N], got {tuple(point_tile_ids.shape)}"
         assert kp_tile_ids.shape == (B, K),    f"kp_tile_ids must be [B,K], got {tuple(kp_tile_ids.shape)}"
+        
 
+        B, K = kp_tile_ids.shape
+        nmatch = (point_tile_ids.unsqueeze(1) == kp_tile_ids.unsqueeze(-1)).sum(-1)  # [B,K]
+        print(f"[route] cand points per kp: min={int(nmatch.min())} "
+            f"mean={float(nmatch.float().mean()):.1f} "
+            f"max={int(nmatch.max())} | empty_kp={(nmatch==0).sum().item()}/{B*K}")
         device, dtype = points.device, points.dtype
 
         # ---- per-KP receptive radius from z_scale (optional) ----
@@ -193,6 +199,23 @@ class ParticleFeaturesEncoderPoint(nn.Module):
 
         # ---- fixed candidate set by tile id (no neighbor switching) ----
         cand_mask = (point_tile_ids.unsqueeze(1) == kp_tile_ids.unsqueeze(-1))    # [B,K,N]
+        # --- diagnostics ---
+        with torch.no_grad():
+            cand_counts = cand_mask.sum(dim=-1)           # [B,K]
+            min_c = int(cand_counts.min().item())
+            max_c = int(cand_counts.max().item())
+            mean_c = float(cand_counts.float().mean().item())
+            n_empty = int((cand_counts == 0).sum().item())
+            print(f"[route] cand points per kp: min={min_c} mean={mean_c:.1f} max={max_c} | empty_kp={n_empty}/{B*K}")
+
+            # sanity on ids
+            assert point_tile_ids.dtype == torch.long and kp_tile_ids.dtype == torch.long
+            # optional: show a tiny sample
+            b0 = 0
+            print("[route] sample kp ids:", kp_tile_ids[b0, :min(8, kp_tile_ids.size(1))].tolist())
+            print("[route] sample point ids (unique):", torch.unique(point_tile_ids[b0])[:12].tolist())
+
+        
         if mask is not None:
             cand_mask = cand_mask & mask.unsqueeze(1)                              # respect padding
         empty = ~cand_mask.any(dim=-1)                                            # [B,K]
@@ -222,7 +245,8 @@ class ParticleFeaturesEncoderPoint(nn.Module):
 
             e = empty.unsqueeze(-1)                                                # [B,K,1]
             logits = torch.where(e, logits_fb, logits)                             # row-wise select
-
+        else:
+            print("KEYPOINT WITH POINTS")
         # ---- soft weights & pooling ----
         w = torch.softmax(logits, dim=-1).unsqueeze(-1)                            # [B,K,N,1]
         r_norm = rel.norm(dim=-1, keepdim=True)                                    # [B,K,N,1]

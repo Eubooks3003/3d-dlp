@@ -11,7 +11,7 @@ import numpy as np
 from modules.voxel_modules.DLPEncoder.DLPPrior.dlp_prior import DLPPrior
 from modules.voxel_modules.DLPEncoder.particle_attribute_encoder import ParticleAttributeEncoder3D
 from modules.point_cloud_modules.DLPEncoder.particle_features_encoder import ParticleFeaturesEncoderPoint
-from modules.voxel_modules.voxel_grid import points_to_tile_ids
+from modules.voxel_modules.voxel_grid import tile_ids_norm_xyz_to_dhw
 
 class ParticleEncoder(nn.Module):
     def __init__(self, cdim=3, image_size=64,
@@ -32,7 +32,9 @@ class ParticleEncoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  separate_depth_features=False,
-                 depth_feature_dim=16,):
+                 depth_feature_dim=16,
+                 # Voxel
+                 voxel_grid_whd=(48,48,48)):
         super(ParticleEncoder, self).__init__()
         """
         DLP Foreground Module – Extracts objects from an image using keypoints and learned features. 
@@ -123,10 +125,9 @@ class ParticleEncoder(nn.Module):
 
         print("Creating DLP Prior with cdim: ", cdim)
         # TODO: Make all parameters configurable if necessary
-        in_channels = 7
         self.prior_encoder = DLPPrior(
-            in_channels=in_channels,
-            grid=(48, 48, 48),           # TODO: Remove this directly query from vox
+            in_channels=self.cdim,
+            grid=voxel_grid_whd,           # TODO: Remove this directly query from vox
             tile_size=(12, 12, 12),      # must divide the padded grid; 48 works perfectly
             base_ch=32,
             ch_mult=(1, 2, 3),
@@ -151,14 +152,15 @@ class ParticleEncoder(nn.Module):
         k_neighbors_feat = 128
 
         extra_feats = 0   # per-point features beyond xyz from the dataset
+        self.voxel_grid_whd = voxel_grid_whd
         # TODO: Make this gettable via the dataloader 
 
         # --- Particle attributes (offset/scale/obj_on/depth) ---
         self.attr_enc_3d = ParticleAttributeEncoder3D(
             anchor_size=0.25,                 # not used since crop_size is given
-            grid_dhw=(48, 48, 48),
+            grid_dhw=voxel_grid_whd,
             n_particles=self.n_kp_prior,      # or self.n_kp_enc — whichever you use downstream
-            ch_in=in_channels,                # was `in_channels`
+            ch_in=self.cdim,                # was `in_channels`
             crop_size=(16, 16, 16),
 
             base_ch=32, ch_mult=(1, 2, 3), num_res_blocks=2,
@@ -455,7 +457,7 @@ class ParticleEncoder(nn.Module):
             * sampling (unless interaction_features=True)
         - We simply standardize the returned dict to mirror the 2D contract.
         """
-        point_tile_ids = points_to_tile_ids(points[...,:3], grid_DHW=(48,48,48), tile_size_DHW=(12,12,12))
+        point_tile_ids = tile_ids_norm_xyz_to_dhw(points[...,:3], grid_DHW=self.voxel_grid_whd, tile_DHW=(12,12,12))
         enc_out = self.particle_features_enc(
             points=points,
             kp=z,
@@ -551,6 +553,7 @@ class ParticleEncoder(nn.Module):
             p_on_app      = p_on[bidx, keep_idx] if p_on is not None else None  # [B,nf,1]
 
             # ---- stage-2: appearance on subset ----
+            # Using normalized points [-1, 1]
             s2 = self.encode_appearance(points, z_app, z_scale_app,
                                         deterministic=deterministic,
                                         obj_on=p_on_app,     # gate with expected presence

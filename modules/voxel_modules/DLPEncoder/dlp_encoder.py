@@ -109,6 +109,8 @@ class DLPEncoder(nn.Module):
                  #RGBD 
                  separate_depth_features=False, # use separate feature encoder for RGB and Depth channels
                  depth_feature_dim=16, # feature dimension for depth channel
+                 # Voxel
+                 voxel_grid_whd=(48,48,48),
                  ):
         """
         DLP Encoder Module
@@ -300,10 +302,10 @@ class DLPEncoder(nn.Module):
                                             depth_feature_dim=depth_feature_dim)
         extra_point_feats = 0 # TODO: link this up with the verison in particle Encoder and make them all come form the same config
         self.prior_encoder = self.particle_enc.prior_encoder
-        in_channels = 7
+        in_channels = self.cdim
         self.bg_encoder = BgEncoder3D(
             in_channels=in_channels,
-            grid_dhw=(48, 48, 48),   # <- set to your voxel grid (D,H,W)
+            grid_dhw=voxel_grid_whd,   
             learned_feature_dim=learned_bg_feature_dim,
             features_dist=('categorical' if self.features_dist == 'categorical' else 'gauss'),
             interaction_features=False,                      # bg is usually not interacted
