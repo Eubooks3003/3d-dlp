@@ -170,3 +170,29 @@ def build_voxel_batch(
     metas = {k: torch.stack(v, dim=0) for k,v in metas.items()}
     metas.update({"W": grid_whd[0], "H": grid_whd[1], "D": grid_whd[2]})
     return dense, vg_list, metas
+
+
+@torch.no_grad()
+def points_to_tile_ids(points_xyz: torch.Tensor, grid_DHW, tile_size_DHW) -> torch.Tensor:
+    """
+    points_xyz: [B,N,3] in voxel index space *or* normalized to [-1,1] over the ORIGINAL grid.
+    Assumes your keypoints are normalized to [-1,1] over (D,H,W).
+    Returns: [B,N] linear tile ids (x-fastest), matching DLPPrior’s tiling.
+    """
+    B, N, _ = points_xyz.shape
+    D, H, W = grid_DHW           # ORIGINAL grid from DLPPrior(grid=...)
+    td, th, tw = tile_size_DHW
+
+    # convert [-1,1] -> [0..D-1/H-1/W-1]
+    p01 = (points_xyz + 1) * 0.5
+    vz = (p01[..., 2] * (D-1)).floor().clamp(0, D-1)  # z
+    vy = (p01[..., 1] * (H-1)).floor().clamp(0, H-1)  # y
+    vx = (p01[..., 0] * (W-1)).floor().clamp(0, W-1)  # x
+
+    tz = (vz / td).floor().clamp(0, (D-1)//td)  # tile index along D
+    ty = (vy / th).floor().clamp(0, (H-1)//th)
+    tx = (vx / tw).floor().clamp(0, (W-1)//tw)
+
+    nz, ny, nx = D//td, H//th, W//tw
+    tile_lin = tx + nx * (ty + ny * tz)         # [B,N]
+    return tile_lin.long()

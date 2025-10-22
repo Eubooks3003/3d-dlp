@@ -215,32 +215,43 @@ class DLPPrior(nn.Module):
         sorted_score, sorted_idx = torch.sort(score, dim=-1, descending=True)
         n_valid = valid_kp.sum(dim=-1)
 
+
+
+        # flatten per-tile tile ids to align with kp_all/cov_all
+        nz, ny, nx = meta["ntiles"]
+        tile_lin = torch.arange(nz*ny*nx, device=vox.device).view(1, -1).expand(B, -1)  # [B,T]
+
+        tile_lin_all = tile_lin.unsqueeze(-1).expand(B, tile_lin.size(1), K).reshape(B, -1)  # [B, T*K]
+
+
         k_target = self.n_kp_prior if k is None else int(k)
-        kp_sel_list, cov_sel_list, mask_sel_list = [], [], []
+        kp_sel_list, cov_sel_list, mask_sel_list, tileid_sel_list = [], [], [], []
         for b in range(B):
             k_eff = int(min(k_target, int(n_valid[b].item())))
             idxb  = sorted_idx[b, :k_eff]
             kpb   = kp_all[b, idxb]
             covb  = cov_all[b, idxb]
+            tileb = tile_lin_all[b, idxb]
             maskb = torch.ones(k_eff, dtype=torch.bool, device=kpb.device)
 
             if k_eff < k_target:  # pad
                 pad = k_target - k_eff
-                kpb  = torch.cat([kpb,  kpb.new_zeros(pad, 3)], dim=0)
-                covb = torch.cat([covb, covb.new_zeros(pad, 3, 3)], dim=0)
+                kpb   = torch.cat([kpb,  kpb.new_zeros(pad, 3)], dim=0)
+                covb  = torch.cat([covb, covb.new_zeros(pad, 3, 3)], dim=0)
+                tileb = torch.cat([tileb, tileb.new_full((pad,), -1)], dim=0)  # -1 for padded
                 maskb = torch.cat([maskb, torch.zeros(pad, dtype=torch.bool, device=kpb.device)], dim=0)
 
             kp_sel_list.append(kpb)
             cov_sel_list.append(covb)
             mask_sel_list.append(maskb)
+            tileid_sel_list.append(tileb)
 
         kp_sel  = torch.stack(kp_sel_list, dim=0)  # [B,k_target,3] (xyz)
         cov_sel = torch.stack(cov_sel_list, dim=0) # [B,k_target,3,3]
         kp_mask = torch.stack(mask_sel_list, dim=0) # [B,k_target]
-        
-        print("KP SEL: ", kp_sel.shape)
-        print("KP SEL: ", kp_sel)
-        return kp_sel, cov_sel
+        kp_tiles = torch.stack(tileid_sel_list, dim=0)
+
+        return kp_sel, cov_sel, kp_tiles
 
     def forward(self, vox: torch.Tensor):
         return self.encode_prior(vox, k=self.n_kp_prior)

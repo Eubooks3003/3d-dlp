@@ -6,38 +6,51 @@ import numpy as np
 from utils.util_func import reparameterize
 
 # TODO: eliminate the overlap between this and particle attribute encoder
-def safe_topk_knn(
-    centers: torch.Tensor,   # [B, K, 3]
-    points:  torch.Tensor,   # [B, N, 3(+F)]
-    mask:    Optional[torch.Tensor],  # [B, N] (bool) True=valid
-    k: int
-) -> torch.Tensor:
+def soft_knn_over_topM(points, kp, mask=None, z_scale=None, M=128, tau=0.2,
+                       base_radius=0.25, clamp_after_st=True):
     """
-    Return KNN indices for each center (xyz distance only).
-
-    - If `mask` is provided, invalid (padded) points are ignored.
-    - If N < k, pads by repeating the last valid neighbor.
+    points:  [B,N,3(+F)]
+    kp:      [B,K,3]
+    mask:    [B,N] (bool) True=valid
+    z_scale: [B,K,3] (optional), scales receptive field via sigmoid mean
+    Returns:
+      x_pool: [B,K,4+Fin] pooled soft neighborhood features (rel, r_norm, extras)
     """
-    assert centers.dim() == 3 and centers.size(-1) >= 3, f"centers must be [B,K,3], got {tuple(centers.shape)}"
-    assert points.dim()  == 3 and points.size(-1)  >= 3, f"points must be [B,N,3(+F)], got {tuple(points.shape)}"
+    B, N, C = points.shape
+    K = kp.shape[1]
 
-    B, N, _ = points.shape
-    K = centers.size(1)
-
-    # pairwise distances in xyz
-    d = torch.cdist(centers[..., :3], points[..., :3])  # [B,K,N]
+    # 1) coarse candidate set (non-diff selection)
+    d = torch.cdist(kp, points[..., :3])                      # [B,K,N]
     if mask is not None:
-        assert mask.shape == (B, N), f"mask must be [B,N], got {tuple(mask.shape)}"
         d = d + (~mask).unsqueeze(1) * 1e6
+    M_eff = min(M, N)
+    cand_idx = d.topk(k=M_eff, dim=-1, largest=False).indices # [B,K,M]
+    # gather candidates
+    idx_exp = cand_idx.unsqueeze(-1).expand(B, K, M_eff, C)
+    neigh = torch.gather(points.unsqueeze(1).expand(B, K, N, C), 2, idx_exp)  # [B,K,M,C]
 
-    k_eff = min(k, N)
-    idx = d.topk(k=k_eff, dim=-1, largest=False).indices  # [B,K,k_eff]
+    # 2) differentiable weighting within candidates
+    if z_scale is not None:
+        s = torch.sigmoid(z_scale).mean(dim=-1, keepdim=True) # [B,K,1]
+    else:
+        s = torch.ones(B, K, 1, device=points.device, dtype=points.dtype)
+    r = base_radius * s                                       # [B,K,1]
 
-    if k_eff < k:
-        pad = idx[..., -1:].expand(B, K, k - k_eff)
-        idx = torch.cat([idx, pad], dim=-1)               # [B,K,k]
+    rel = (neigh[..., :3] - kp.unsqueeze(2)) / (r.unsqueeze(2) + 1e-6)  # [B,K,M,3]
+    if clamp_after_st:
+        rel = rel.clamp_(-1, 1)
 
-    return idx
+    r_norm = rel.norm(dim=-1, keepdim=True)                   # [B,K,M,1]
+    feats = [rel, r_norm]
+    if C > 3:
+        feats.append(neigh[..., 3:])
+    x_all = torch.cat(feats, dim=-1)                          # [B,K,M,4+Fin]
+
+    logits = -(rel.square().sum(-1)) / (tau + 1e-6)           # [B,K,M]
+    w = torch.softmax(logits, dim=-1).unsqueeze(-1)           # [B,K,M,1]
+    x_pool = (w * x_all).sum(dim=2)                           # [B,K,4+Fin]
+    return x_pool
+
 
 
 class MLP1D(nn.Module):
@@ -150,72 +163,94 @@ class ParticleFeaturesEncoderPoint(nn.Module):
         return reparameterize(mu, logvar)
 
     def forward(self,
-                points: torch.Tensor,     # [B,N,3(+F)]
-                kp: torch.Tensor,          # [B,K,3]
-                z_scale: Optional[torch.Tensor] = None,  # [B,K,3] logits, optional
-                deterministic: bool = False,
-                obj_on: Optional[torch.Tensor] = None,   # [B,K] or [B,K,1]
-                mask: Optional[torch.Tensor] = None      # [B,N] True=valid
-                ) -> dict:
+            points: torch.Tensor,           # [B,N,3(+F)]
+            kp: torch.Tensor,               # [B,K,3]  (same normalized frame as tiles)
+            z_scale: Optional[torch.Tensor] = None,  # [B,K,3] logits (optional)
+            deterministic: bool = False,
+            obj_on: Optional[torch.Tensor] = None,   # [B,K] or [B,K,1]
+            mask: Optional[torch.Tensor] = None,     # [B,N] True=valid
+            *,
+            point_tile_ids: torch.Tensor,            # [B,N] linear tile id per point
+            kp_tile_ids: torch.Tensor,               # [B,K] linear tile id per kp
+            tau: float = 0.2) -> dict:
+        """
+        Tile-routed soft pooling with robust empty-tile fallback (soft-topM).
+        """
         B, N, C = points.shape
         assert kp.dim() == 3 and kp.size(-1) == 3, f"kp must be [B,K,3], got {tuple(kp.shape)}"
         K = kp.size(1)
+        assert point_tile_ids.shape == (B, N), f"point_tile_ids must be [B,N], got {tuple(point_tile_ids.shape)}"
+        assert kp_tile_ids.shape == (B, K),    f"kp_tile_ids must be [B,K], got {tuple(kp_tile_ids.shape)}"
 
-        # ---- 1) choose neighborhood ----
-        idx = safe_topk_knn(kp, points, mask, self.k)        # [B,K,k]
-        idx_exp_c = idx.unsqueeze(-1).expand(B, K, self.k, C)
-        neigh = torch.gather(points.unsqueeze(1).expand(B, K, N, C), 2, idx_exp_c)  # [B,K,k,C]
+        device, dtype = points.device, points.dtype
 
-        # ---- 2) 3D "spatial transform": translate & scale into a canonical cube ----
-        # base radius scaled by z_scale (if provided)
+        # ---- per-KP receptive radius from z_scale (optional) ----
         if z_scale is not None:
-            # z_scale are logits -> turn into (0,1) with sigmoid, then average over xyz
-            s = torch.sigmoid(z_scale).mean(dim=-1, keepdim=True)  # [B,K,1]
+            s = torch.sigmoid(z_scale).mean(dim=-1, keepdim=True)   # [B,K,1]
         else:
-            s = torch.ones(B, K, 1, device=points.device)          # no scaling
+            s = torch.ones(B, K, 1, device=device, dtype=dtype)
+        r = self.base_radius * s                                     # [B,K,1]
 
-        r = self.base_radius * s                                    # [B,K,1]
-        rel = neigh[..., :3] - kp.unsqueeze(2)                      # [B,K,k,3]  (translate)
-        # normalize to unit-ish cube by dividing by r, small epsilon for safety
-        rel_norm = rel / (r.unsqueeze(2) + 1e-6)                    # [B,K,k,3]
+        # ---- fixed candidate set by tile id (no neighbor switching) ----
+        cand_mask = (point_tile_ids.unsqueeze(1) == kp_tile_ids.unsqueeze(-1))    # [B,K,N]
+        if mask is not None:
+            cand_mask = cand_mask & mask.unsqueeze(1)                              # respect padding
+        empty = ~cand_mask.any(dim=-1)                                            # [B,K]
+
+        # ---- relative coords (once) ----
+        pts_xyz = points[..., :3].unsqueeze(1).expand(B, K, N, 3)                 # [B,K,N,3]
+        rel = (pts_xyz - kp.unsqueeze(2)) / (r.unsqueeze(2) + 1e-6)               # [B,K,N,3]
         if self.clamp_after_st:
-            rel_norm = rel_norm.clamp_(-1.0, 1.0)
+            rel = rel.clamp_(-1, 1)
 
-        # optional: strict crop (keep only neighbors inside radius)
-        # keep = (rel.norm(dim=-1, keepdim=True) <= (r.unsqueeze(2) + 1e-6)).float()   # [B,K,k,1]
-        # rel_norm = rel_norm * keep
+        # ---- logits for candidates; -inf elsewhere ----
+        logits = -(rel.square().sum(dim=-1)) / (tau + 1e-6)                        # [B,K,N]
+        logits = logits.masked_fill(~cand_mask, float('-inf'))
 
-        # radius channel in normalized space
-        r_norm = torch.linalg.norm(rel_norm, dim=-1, keepdim=True)  # [B,K,k,1]
+        # ---- fallback: if a kp's tile has no points, use soft-topM globally for that (b,k) only ----
+        if empty.any():
+            print("KP WITH NO POINTS")
+            M = min(self.k, N)
+            d2_all = rel.pow(2).sum(dim=-1)                                        # [B,K,N]
+            if mask is not None:
+                d2_all = d2_all.masked_fill(~mask.unsqueeze(1), float('inf'))
+            topM_idx = d2_all.topk(k=M, dim=-1, largest=False).indices             # [B,K,M]
+            vals = (-d2_all / (tau + 1e-6)).gather(-1, topM_idx)                   # [B,K,M]
 
-        feats = [rel_norm, r_norm]
+            logits_fb = logits.new_full((B, K, N), float('-inf'))                  # [B,K,N]
+            logits_fb.scatter_(-1, topM_idx, vals)                                 # fill only top-M
+
+            e = empty.unsqueeze(-1)                                                # [B,K,1]
+            logits = torch.where(e, logits_fb, logits)                             # row-wise select
+
+        # ---- soft weights & pooling ----
+        w = torch.softmax(logits, dim=-1).unsqueeze(-1)                            # [B,K,N,1]
+        r_norm = rel.norm(dim=-1, keepdim=True)                                    # [B,K,N,1]
+        feats = [rel, r_norm]
         if C > 3:
-            feats.append(neigh[..., 3:])                             # propagate extra per-point features
-        x = torch.cat(feats, dim=-1)                                 # [B,K,k,4+Fin]
+            feats.append(points[..., 3:].unsqueeze(1).expand(B, K, N, C-3))
+        x_all = torch.cat(feats, dim=-1)                                           # [B,K,N,4+Fin]
+        x = (w * x_all).sum(dim=2)                                                 # [B,K,4+Fin]
 
-        # ---- 3) PointNet-like encode + pool ----
-        x = self.block1(x)
-        x = self.block2(x)
-        x = x.max(dim=2).values                                      # [B,K,hidden]
-
-        # ---- 4) project to latent; optional obj_on gating ----
-        mu = self.to_mu(x)
+        # ---- MLP heads ----
+        x = self.block1(x)                                                         # [B,K,H]
+        x = self.block2(x)                                                         # [B,K,H]
+        mu = self.to_mu(x)                                                         # [B,K,F]
         logvar = self.to_logvar(x) if self.output_logvar else None
 
         if obj_on is not None:
             gate = (obj_on > 0.2).to(mu.dtype)
             mu = self._gate_with_null(mu, gate, self.null_feature_embed)
 
-        # ---- 5) sample (or passthrough during interaction stage) ----
         if self.features_dist == 'categorical':
             z_features = None
         else:
             z_features = mu if self.interaction_features else self.sample_gauss(mu, logvar, deterministic)
 
         return {
-            'mu_features':           mu,             # [B,K,F]
-            'logvar_features':       logvar,         # [B,K,F] or None
-            'z_features':            z_features,     # [B,K,F]
+            'mu_features':           mu,
+            'logvar_features':       logvar,
+            'z_features':            z_features,
             'mu_features_total':     mu,
             'logvar_features_total': logvar,
             'z_features_total':      z_features,

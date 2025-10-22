@@ -412,7 +412,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 obj=_to_float(loss_kl_obj_on),
             )
 
-            break  # for debug
+            # break  # for debug
         pbar.close()
         # at end of epoch
         losses.append(float(np.mean(batch_losses)))
@@ -524,12 +524,14 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             gt_dense = batch.get("dense", None) or model_output.get("dense_target", None)
             kps = model_output.get("kp_p", None)
             
-            print("KPS SHAPE: ", kps.shape)
-            print("KPS: ", kps)
             # --- GT plots (same three modes you used for REC) ---
             if gt_dense is not None:
                 eval_vox.log_vox_plotly_gt_suite("vox", gt_dense[b0], step=epoch, channel=0, kps=kps)
 
+            if model_output.get("rec_vox", None) is not None:
+                eval_vox.log_vox_plotly_rec_suite("vox", model_output["rec_vox"][b0], step=epoch, channel=0, kps=kps)
+
+            print(" REC VOX: ", model_output["rec_vox"][b0].shape)
             # --- REC vs GT overlay (pick styles you like) ---
             if gt_dense is not None and model_output.get("rec_vox", None) is not None:
                 eval_vox.log_vox_plotly_overlay(

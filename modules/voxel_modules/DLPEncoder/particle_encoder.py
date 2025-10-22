@@ -11,6 +11,7 @@ import numpy as np
 from modules.voxel_modules.DLPEncoder.DLPPrior.dlp_prior import DLPPrior
 from modules.voxel_modules.DLPEncoder.particle_attribute_encoder import ParticleAttributeEncoder3D
 from modules.point_cloud_modules.DLPEncoder.particle_features_encoder import ParticleFeaturesEncoderPoint
+from modules.voxel_modules.voxel_grid import points_to_tile_ids
 
 class ParticleEncoder(nn.Module):
     def __init__(self, cdim=3, image_size=64,
@@ -238,8 +239,9 @@ class ParticleEncoder(nn.Module):
         B = x.shape[0]
 
         # --- prior proposals ---
-        kp_p, var_kp = self.encode_prior(dense)              # kp_p:[B,K,3], var_kp:[B,K,3,3]
+        kp_p, var_kp, kp_tiles = self.encode_prior(dense)              # kp_p:[B,K,3], var_kp:[B,K,3,3]
         K = kp_p.shape[1]
+        
 
         # keep grads, break aliasing exactly like RGB
         mu     = kp_p.clone()                                 # [B,K,3]
@@ -365,6 +367,7 @@ class ParticleEncoder(nn.Module):
             kp_p          = take(kp_p)
             var_kp        = take(var_kp)
             total_var     = take(total_var)
+            kp_tiles   = take(kp_tiles)  
 
             if logvar_scale is not None:
                 logvar_scale = take(logvar_scale)
@@ -393,6 +396,7 @@ class ParticleEncoder(nn.Module):
             'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
             'z_base_id': z_base_id,
             'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score,
+            'kp_tiles': kp_tiles,
         }
         return out_dict
 
@@ -436,7 +440,8 @@ class ParticleEncoder(nn.Module):
                         z_scale,               # [B, K, 3]  (logits; optional – can pass None)
                         deterministic=False,
                         obj_on=None,           # [B, K] or [B, K, 1]
-                        mask_pc=None):         # [B, N] (bool) True=valid
+                        mask_pc=None,
+                        kp_tiles=None ):         # [B, N] (bool) True=valid
 
         """
         Point-cloud wrapper for appearance encoding.
@@ -450,14 +455,16 @@ class ParticleEncoder(nn.Module):
             * sampling (unless interaction_features=True)
         - We simply standardize the returned dict to mirror the 2D contract.
         """
-
+        point_tile_ids = points_to_tile_ids(points[...,:3], grid_DHW=(48,48,48), tile_size_DHW=(12,12,12))
         enc_out = self.particle_features_enc(
             points=points,
             kp=z,
             z_scale=z_scale,
             deterministic=deterministic,
             obj_on=obj_on,
-            mask=mask_pc
+            mask=mask_pc,
+            point_tile_ids=point_tile_ids,  
+            kp_tile_ids=kp_tiles, 
         )
 
         mu_features     = enc_out['mu_features']            # [B,K,F]
@@ -522,6 +529,8 @@ class ParticleEncoder(nn.Module):
         logvar_depth = s1.get('logvar_depth', None)
         z_depth      = s1.get('z_depth', None)
 
+        kp_tiles      = s1.get('kp_tiles', None)
+
         # expected presence (for gating)
         if (obj_on_a is not None) and (obj_on_b is not None):
             p_on = (obj_on_a / (obj_on_a + obj_on_b + 1e-6)).clamp(0, 1)   # [B,K,1]
@@ -545,7 +554,8 @@ class ParticleEncoder(nn.Module):
             s2 = self.encode_appearance(points, z_app, z_scale_app,
                                         deterministic=deterministic,
                                         obj_on=p_on_app,     # gate with expected presence
-                                        mask_pc=mask_pc)
+                                        mask_pc=mask_pc,
+                                        kp_tile_ids=kp_tiles)
 
             # scatter back into full K slots
             Fdim = s2['mu_features'].size(-1)
@@ -581,7 +591,8 @@ class ParticleEncoder(nn.Module):
             s2 = self.encode_appearance(points, z, z_scale,
                                         deterministic=deterministic,
                                         obj_on=p_on,        # may be None -> ungated
-                                        mask_pc=mask_pc)
+                                        mask_pc=mask_pc,
+                                        kp_tiles=kp_tiles)
             mu_features     = s2['mu_features']
             logvar_features = s2['logvar_features']
             z_features      = s2['z_features']

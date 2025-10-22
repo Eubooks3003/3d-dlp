@@ -386,11 +386,9 @@ def log_vox_plotly_volume(
 
     # --- optional KP overlay (in normalized [-1,1] -> index space) ---
     K = _kp_np(kps)
-    print("K SHAPE: ", K.shape)
     if K is not None:
         K_ijk = _denorm_kp_to_index(K, D,H,W)  # [N,3] in (x,y,z) index space
 
-        print("K IJK ", K_ijk)
         fig.add_trace(go.Scatter3d(
             x=K_ijk[:,0], y=K_ijk[:,1], z=K_ijk[:,2],
             mode="markers",
@@ -424,6 +422,21 @@ def log_vox_plotly_gt_suite(prefix, gt_vol, step=None, channel=0, kps=None,
                           channel=channel, mode="isosurface", isovalue=iso, kps=kps)
     log_vox_plotly_volume(f"{prefix}/gt_points@{iso}",  gt_vol, step=step,
                           channel=channel, mode="points", isovalue=iso, kps=kps)
+
+
+def log_vox_plotly_rec_suite(prefix, rec_vol, step=None, channel=0, kps=None,
+                             iso=0.5, vol_opacity=0.15):
+    """
+    Mirrors log_vox_plotly_gt_suite but for reconstructed volumes.
+    Uses the same three modes: volume, isosurface (at `iso`), and points (at `iso`).
+    """
+    log_vox_plotly_volume(f"{prefix}/rec_volume",   rec_vol, step=step,
+                          channel=channel, mode="volume", opacity=vol_opacity, kps=kps)
+    log_vox_plotly_volume(f"{prefix}/rec_isosurf@{iso}", rec_vol, step=step,
+                          channel=channel, mode="isosurface", isovalue=iso, kps=kps)
+    log_vox_plotly_volume(f"{prefix}/rec_points@{iso}",  rec_vol, step=step,
+                          channel=channel, mode="points", isovalue=iso, kps=kps)
+
 
 # --- REC vs GT overlay (two traces, different styles) ---
 import numpy as np, plotly.graph_objects as go
