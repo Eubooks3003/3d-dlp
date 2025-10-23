@@ -11,7 +11,6 @@ class VoxelMetaXYZ:
 
 class VoxelGridXYZ:
     """
-    Public API in (x,y,z). Internal dense tensor is [C, D, H, W] (PyTorch layout).
     Modes: 'occupancy' | 'density' | 'avg_rgb'
     Provides fast voxel->point queries.
     """

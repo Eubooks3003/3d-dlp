@@ -151,6 +151,7 @@ class ParticleEncoder(nn.Module):
         k_neighbors_attr = 128
         k_neighbors_feat = 128
 
+        self.training = True
         extra_feats = 0   # per-point features beyond xyz from the dataset
         self.voxel_grid_whd = voxel_grid_whd
         # TODO: Make this gettable via the dataloader 
@@ -231,6 +232,31 @@ class ParticleEncoder(nn.Module):
     def encode_prior(self, dense):
         return self.prior_encoder(dense)
 
+    def _relaxed_topk_weights(self, score, k, valid_mask, tau=0.3, training=True):
+        """
+        score, valid_mask: [B,K]  (larger score is better)
+        returns:
+        w_keep:  [B,K] in [0,1] (soft in train, hard one-hot in eval)
+        top_idx: [B,k] hard indices for fast paths
+        """
+        score_masked = torch.where(valid_mask, score, score.new_full(score.shape, -1e9))
+        top_idx = torch.topk(score_masked, k, dim=-1).indices
+        if not training:
+            hard = torch.zeros_like(score_masked).scatter(1, top_idx, 1.0)
+            return hard, top_idx
+        w_soft = torch.softmax(score_masked / tau, dim=-1)                   # [B,K]
+        w_soft = w_soft * (k / (w_soft.sum(-1, keepdim=True) + 1e-8))        # sum ≈ k
+        hard  = torch.zeros_like(score_masked).scatter(1, top_idx, 1.0)
+        w_keep = hard + (w_soft - w_soft.detach())                            # STE
+        return w_keep, top_idx
+
+    def _soft_assign(self, points_xyz, kp_xyz, tau=0.07):
+        """
+        Soft point→KP ownership.
+        points_xyz: [B,N,3], kp_xyz: [B,K,3]  →  [B,N,K]
+        """
+        d2 = ((points_xyz[:, :, None, :] - kp_xyz[:, None, :, :])**2).sum(-1)  # [B,N,K]
+        return torch.softmax(-d2 / tau, dim=-1)
 
     def encode_pos_scale_with_prior(self, x, dense, mask=None, deterministic=False, warmup=False, timesteps=None):
         """
@@ -240,156 +266,127 @@ class ParticleEncoder(nn.Module):
         """
         B = x.shape[0]
 
-        # --- prior proposals ---
-        kp_p, var_kp, kp_tiles = self.encode_prior(dense)              # kp_p:[B,K,3], var_kp:[B,K,3,3]
+        # --- prior proposals (train returns relaxed Top-K weights) ---
+        if self.training:
+            kp_p, var_kp, kp_tiles, prior_keep_w = self.encode_prior(dense)
+        else:
+            kp_p, var_kp, kp_tiles = self.encode_prior(dense)
+            prior_keep_w = torch.ones(kp_p.shape[:2], device=kp_p.device, dtype=kp_p.dtype)
         K = kp_p.shape[1]
-        
 
-        # keep grads, break aliasing exactly like RGB
-        mu     = kp_p.clone()                                 # [B,K,3]
-        logvar = torch.zeros_like(mu)                         # [B,K,3]
-        z_base = mu + 0.0 * logvar                            # [B,K,3]
+        # keep grads, break aliasing like RGB
+        mu     = kp_p.clone()                           # [B,K,3]
+        logvar = torch.zeros_like(mu)                   # [B,K,3]
+        z_base = mu + 0.0 * logvar                      # [B,K,3]
 
-        # --- posterior offsets & scales (attribute encoder) ---
+        # --- posterior offsets & scales ---
         particle_stats_dict = self.attr_enc_3d(
             x_dense=dense,
-            kp_xyz=z_base.clone(),                            # keep grads, avoid in-place aliasing
+            kp_xyz=z_base.clone(),                      # avoid in-place aliasing
             z_scale=None,
             timesteps=timesteps,
             deterministic=deterministic
         )
 
-        mu_offset     = particle_stats_dict['mu']             # [B,K,3]
-        logvar_offset = particle_stats_dict['logvar']         # [B,K,3]
+        mu_offset     = particle_stats_dict['mu']                   # [B,K,3]
+        logvar_offset = particle_stats_dict['logvar']               # [B,K,3]
         mu_scale      = particle_stats_dict.get('mu_scale', None)   # [B,K,3] or None
         logvar_scale  = particle_stats_dict.get('logvar_scale', None)
 
         if not self.interaction_obj_on:
-            # match RGB keys/behavior
-            lobj_on_a  = particle_stats_dict.get('lobj_on_a', None) # kept for parity (may be None)
+            lobj_on_a  = particle_stats_dict.get('lobj_on_a', None)
             lobj_on_b  = particle_stats_dict.get('lobj_on_b', None)
-            obj_on_a   = particle_stats_dict.get('obj_on_a',  None) # [B,K,1] or None
+            obj_on_a   = particle_stats_dict.get('obj_on_a',  None) # [B,K,1]
             obj_on_b   = particle_stats_dict.get('obj_on_b',  None)
-            mu_obj_on  = particle_stats_dict.get('mu_obj_on', None) # [B,K,1] or None
-            z_obj_on   = particle_stats_dict.get('z_obj_on',  None) # [B,K,1] or None
+            mu_obj_on  = particle_stats_dict.get('mu_obj_on', None) # [B,K,1]
+            z_obj_on   = particle_stats_dict.get('z_obj_on',  None) # [B,K,1]
         else:
             obj_on_a = obj_on_b = z_obj_on = mu_obj_on = None
 
         if not self.interaction_depth:
-            mu_depth     = particle_stats_dict.get('mu_depth', None)     # [B,K,1] or None
-            logvar_depth = particle_stats_dict.get('logvar_depth', None) # [B,K,1] or None
-            if mu_depth is not None and logvar_depth is not None:
-                z_depth = mu_depth if deterministic else reparameterize(mu_depth, logvar_depth)
-            else:
-                z_depth = None
+            mu_depth     = particle_stats_dict.get('mu_depth', None)     # [B,K,1]
+            logvar_depth = particle_stats_dict.get('logvar_depth', None) # [B,K,1]
+            z_depth = (mu_depth if deterministic or (mu_depth is None or logvar_depth is None)
+                    else reparameterize(mu_depth, logvar_depth))
         else:
             mu_depth = logvar_depth = z_depth = None
 
-        # --- final position & scale (match RGB logic) ---
-        mu_tot    = z_base + mu_offset                         # [B,K,3]
+        # final z, z_scale
+        mu_tot     = z_base + mu_offset
         logvar_tot = logvar_offset
+        if mu_scale is not None and hasattr(self, 'mu_scale_prior') and self.mu_scale_prior is not None:
+            mu_scale = self.mu_scale_prior + mu_scale
+        z_offset = (mu_offset if deterministic else reparameterize(mu_offset, logvar_offset))
+        z_scale  = (mu_scale  if deterministic or (mu_scale is None or logvar_scale is None)
+                    else reparameterize(mu_scale, logvar_scale))
+        z = z_base + z_offset
 
-        if mu_scale is not None:
-            # if you have a learned prior term (parity with RGB)
-            if hasattr(self, 'mu_scale_prior') and self.mu_scale_prior is not None:
-                mu_scale = self.mu_scale_prior + mu_scale
-
-        if deterministic:
-            z_offset = mu_offset
-            z_scale  = mu_scale
-        else:
-            z_offset = reparameterize(mu_offset, logvar_offset)
-            z_scale  = (reparameterize(mu_scale, logvar_scale)
-                        if (mu_scale is not None and logvar_scale is not None) else None)
-
-        z = z_base + z_offset                                  # [B,K,3]
-
-        # --- variance features / scores (match RGB) ---
-        # var_kp: [B,K,3,3] -> [B,K,9]
-        z_base_var = var_kp.reshape(B, K, -1).detach()         # scoring only; safe to detach
-        confidence_score = logvar_offset.detach()              # scoring only; safe to detach
+        # --- variance features / scores (for ranking only) ---
+        z_base_var = var_kp.reshape(B, K, -1).detach()              # [B,K,9]
+        confidence_score = logvar_offset.detach()                   # [B,K,3]
         z_base_var = torch.cat([z_base_var, confidence_score], dim=-1)  # [B,K,12]
+        z_base_id  = torch.arange(K, device=z_base.device)[None, :, None].repeat(B, 1, 1)
 
-        z_base_id = torch.arange(K, device=z_base.device)[None, :, None].repeat(B, 1, 1)  # [B,K,1]
-
-        if getattr(self, 'embed_prior_patch_pos', False):
-            # keep API parity; voxel path typically doesn't use this
-            patch_id_embed = self.patch_id_embed.repeat(mu_tot.shape[0], 1, 1)
-        else:
-            patch_id_embed = None
-
-        mu_score     = (z_base_var.sum(-1, keepdim=True) / 30.0) * 2 - 1  # [B,K,1]
-        logvar_score = torch.full_like(mu_score, math.log(0.2 ** 2))      # [B,K,1]
+        mu_score     = (z_base_var.sum(-1, keepdim=True) / 30.0) * 2 - 1
+        logvar_score = torch.full_like(mu_score, math.log(0.2 ** 2))
         z_score      = mu_score
+        total_var    = z_base_var.sum(-1)                            # [B,K]
 
-        total_var = z_base_var.sum(-1)                                    # [B,K]
-
-        # --- variance filtering (identical structure to RGB) ---
+        # --- optional variance filtering: train-soft / eval-hard ---
         if self.n_kp_enc < self.n_kp_prior:
             n_filter = (self.n_kp_enc if not warmup
                         else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior)))
 
-            # Build a validity mask: mark proposals that are non-empty / meaningful.
-            # Two quick heuristics (use either or both):
-            #  1) position not all-zeros
-            #  2) covariance not (near-)zero
-            pos_valid = (kp_p.abs().sum(dim=-1) > 1e-6)                      # [B,K]
-            cov_diag  = var_kp.diagonal(dim1=-2, dim2=-1)                    # [B,K,3]
-            cov_valid = (cov_diag.sum(dim=-1) > 1e-9)                        # [B,K]
-            valid     = (pos_valid | cov_valid)                              # [B,K]
+            # validity (don’t select degenerate proposals)
+            pos_valid = (kp_p.abs().sum(dim=-1) > 1e-6)               # [B,K]
+            cov_diag  = var_kp.diagonal(dim1=-2, dim2=-1)             # [B,K,3]
+            cov_valid = (cov_diag.sum(dim=-1) > 1e-9)                 # [B,K]
+            valid     = (pos_valid | cov_valid)
 
-            # Penalize invalids so they are NEVER selected as low-variance
-            big = torch.finfo(total_var.dtype).max / 4.0
-            total_var_masked = torch.where(valid, total_var, torch.full_like(total_var, big))
+            # rank by low variance
+            score = -total_var                                        # [B,K]
 
-            # Optional tiny jitter to break ties deterministically across GPUs
-            total_var_masked = total_var_masked + 1e-9 * torch.arange(total_var_masked.shape[-1],
-                                                                    device=total_var_masked.device).float()
+            if self.training:
+                w_var, _ = self._relaxed_topk_weights(
+                    score, n_filter, valid,
+                    tau=getattr(self, "relaxed_topk_tau", 0.3),
+                    training=True
+                )                                                     # [B,K]
+                # combine with prior Top-K softness so both gates contribute
+                keep_w = (w_var * prior_keep_w).clamp_min(0)          # [B,K]
+                # NOTE: we do NOT slice tensors in training; downstream can use keep_w to weight per-K losses.
+            else:
+                # eval: slice hard
+                _, embed_ind = torch.topk(score.masked_fill(~valid, float("-inf")),
+                                        k=n_filter, dim=-1, largest=True)
+                b_idx = torch.arange(B, device=x.device)[:, None]
+                def take(t):
+                    return (t[b_idx, embed_ind] if (t is not None) else None)
+                mu_tot        = take(mu_tot);        z_base        = take(z_base)
+                z_base_var    = take(z_base_var);    z_base_id     = take(z_base_id)
+                mu_offset     = take(mu_offset);     logvar_offset = take(logvar_offset)
+                z             = take(z);             z_offset      = take(z_offset)
+                z_scale       = take(z_scale);       mu_scale      = take(mu_scale)
+                mu_score      = take(mu_score);      logvar_score  = take(logvar_score)
+                z_score       = take(z_score);       kp_p          = take(kp_p)
+                var_kp        = take(var_kp);        total_var     = take(total_var)
+                kp_tiles      = take(kp_tiles)
+                if logvar_scale is not None: logvar_scale = take(logvar_scale)
+                if not self.interaction_obj_on:
+                    obj_on_a   = take(obj_on_a);   obj_on_b   = take(obj_on_b)
+                    mu_obj_on  = take(mu_obj_on);  z_obj_on   = take(z_obj_on)
+                if not self.interaction_depth:
+                    z_depth      = take(z_depth);   mu_depth     = take(mu_depth)
+                    logvar_depth = take(logvar_depth)
+                if getattr(self, 'embed_prior_patch_pos', False):
+                    patch_id_embed = take(patch_id_embed) if 'patch_id_embed' in locals() else None
+        else:
+            keep_w = prior_keep_w  # all K active
 
-            # keep low-var among valid ones
-            _, embed_ind = torch.topk(total_var_masked, k=n_filter, dim=-1, largest=False)
-            b_idx = torch.arange(B, device=x.device)[:, None]
-
-            def take(t):
-                return (t[b_idx, embed_ind] if (t is not None) else None)
-
-            mu_tot        = take(mu_tot)
-            z_base        = take(z_base)
-            z_base_var    = take(z_base_var)
-            z_base_id     = take(z_base_id)
-            mu_offset     = take(mu_offset)
-            logvar_offset = take(logvar_offset)
-            z             = take(z)
-            z_offset      = take(z_offset)
-            z_scale       = take(z_scale)
-            mu_scale      = take(mu_scale)
-            mu_score      = take(mu_score)
-            logvar_score  = take(logvar_score)
-            z_score       = take(z_score)
-            kp_p          = take(kp_p)
-            var_kp        = take(var_kp)
-            total_var     = take(total_var)
-            kp_tiles   = take(kp_tiles)  
-
-            if logvar_scale is not None:
-                logvar_scale = take(logvar_scale)
-            if not self.interaction_obj_on:
-                obj_on_a   = take(obj_on_a)
-                obj_on_b   = take(obj_on_b)
-                mu_obj_on  = take(mu_obj_on)
-                z_obj_on   = take(z_obj_on)
-            if not self.interaction_depth:
-                z_depth      = take(z_depth)
-                mu_depth     = take(mu_depth)
-                logvar_depth = take(logvar_depth)
-            if patch_id_embed is not None:
-                patch_id_embed = take(patch_id_embed)
-
-        # print("KP FROM PARTICLE ENCODER: ", kp_p)
-        out_dict = {
+        out = {
             'mu': mu, 'logvar': logvar,
             'z_base': z_base, 'z': z, 'mu_tot': mu_tot,
-            'patch_id_embed': patch_id_embed,
+            'patch_id_embed': None,
             'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
             'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
             'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
@@ -400,7 +397,11 @@ class ParticleEncoder(nn.Module):
             'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score,
             'kp_tiles': kp_tiles,
         }
-        return out_dict
+        # expose keep weights for downstream weighting (optional)
+        if self.training:
+            out['prior_keep_w'] = keep_w if 'keep_w' in locals() else prior_keep_w
+        return out
+
 
 
 
@@ -438,41 +439,59 @@ class ParticleEncoder(nn.Module):
         return gate * mu + (1.0 - gate) * null_embed
     def encode_appearance(self,
                         points,                # [B, N, 3(+F)]
-                        z,                     # [B, K, 3]  (keypoint centers)
-                        z_scale,               # [B, K, 3]  (logits; optional – can pass None)
+                        z,                     # [B, K, 3]
+                        z_scale,               # [B, K, 3] or None
                         deterministic=False,
-                        obj_on=None,           # [B, K] or [B, K, 1]
+                        obj_on=None,           # [B,K] or [B,K,1]
                         mask_pc=None,
-                        kp_tiles=None ):         # [B, N] (bool) True=valid
+                        kp_tiles=None,         # [B,K] (tile ids) for eval/fast path
+                        soft_weights=None):    # [B,N,K] optional soft ownership (train)
 
         """
         Point-cloud wrapper for appearance encoding.
 
-        - Delegates to self.particle_features_enc (your ParticleFeaturesEncoderPoint).
-        - That module already handles:
-            * KNN neighborhood gathering
-            * 3D "spatial transform" via translate+scale into canonical cube
-            * PointNet-like encoding + pooling
-            * optional obj_on gating (using its own null_feature_embed)
-            * sampling (unless interaction_features=True)
-        - We simply standardize the returned dict to mirror the 2D contract.
+        If soft_weights is provided (training), we pool with soft assignments.
+        Otherwise we fall back to discrete tile/KNN path (eval).
         """
-        point_tile_ids = tile_ids_norm_xyz_to_dhw(points[...,:3], grid_DHW=self.voxel_grid_whd, tile_DHW=(12,12,12))
-        enc_out = self.particle_features_enc(
-            points=points,
-            kp=z,
-            z_scale=z_scale,
-            deterministic=deterministic,
-            obj_on=obj_on,
-            mask=mask_pc,
-            point_tile_ids=point_tile_ids,  
-            kp_tile_ids=kp_tiles, 
-        )
+
+        if soft_weights is None and self.training:
+            # build soft assignment on-the-fly if the caller didn’t pass one
+            tau = getattr(self, 'ownership_tau', 0.10)
+            soft_weights = self._soft_assign(points[..., :3], z, tau=tau)  # [B,N,K]
+
+        if soft_weights is not None:
+            enc_out = self.particle_features_enc(
+                points=points,
+                kp=z,
+                z_scale=z_scale,
+                deterministic=deterministic,
+                obj_on=obj_on,
+                mask=mask_pc,
+                soft_weights=soft_weights,       # NEW: your ParticleFeaturesEncoderPoint should consume this
+                point_tile_ids=None,
+                kp_tile_ids=None,
+            )
+        else:
+            # eval / ablation: discrete fast path
+            point_tile_ids = tile_ids_norm_xyz_to_dhw(
+                points[..., :3],
+                grid_DHW=self.voxel_grid_whd,
+                tile_DHW=(12, 12, 12)
+            )
+            enc_out = self.particle_features_enc(
+                points=points,
+                kp=z,
+                z_scale=z_scale,
+                deterministic=deterministic,
+                obj_on=obj_on,
+                mask=mask_pc,
+                point_tile_ids=point_tile_ids,
+                kp_tile_ids=kp_tiles,
+            )
 
         mu_features     = enc_out['mu_features']            # [B,K,F]
         logvar_features = enc_out['logvar_features']        # [B,K,F] or None
         z_features      = enc_out['z_features']             # [B,K,F]
-
 
         return {
             'mu_features':           mu_features,
@@ -539,55 +558,95 @@ class ParticleEncoder(nn.Module):
         else:
             p_on = None
 
+        # ---------- soft point→KP ownership for training ----------
+        if self.training:
+            tau = getattr(self, "ownership_tau", 0.10)               # you can anneal this
+            soft_w = self._soft_assign(points[..., :3], z, tau=tau)  # [B,N,K]
+            use_tiles = None
+        else:
+            soft_w = None
+            use_tiles = kp_tiles
+
         # ---- (optional) variance filtering if you later shrink K for appearance ----
         if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
             total_var = z_base_var.sum(-1)                                  # [B,K]
             n_filter = self.n_kp_dec if not warmup else min(
                 self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc)
             )
-            _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
-            bidx = torch.arange(B, device=points.device)[:, None]
 
-            z_app         = z[bidx, keep_idx].contiguous()
-            z_scale_app   = z_scale[bidx, keep_idx].contiguous()
-            p_on_app      = p_on[bidx, keep_idx] if p_on is not None else None  # [B,nf,1]
+            if self.training:
+                # train-soft: relaxed Top-K mask (no slicing)
+                # validity mask to avoid degenerate proposals
+                pos_valid = (kp_p.abs().sum(dim=-1) > 1e-6)                 # [B,K]
+                cov_diag  = var_kp.diagonal(dim1=-2, dim2=-1)               # [B,K,3]
+                cov_valid = (cov_diag.sum(dim=-1) > 1e-9)                   # [B,K]
+                valid     = (pos_valid | cov_valid)
+                score     = -total_var                                      # low variance = good
+                keep_w_app, _ = self._relaxed_topk_weights(
+                    score, n_filter, valid,
+                    tau=getattr(self, "relaxed_topk_tau", 0.3),
+                    training=True
+                )                                                           # [B,K]
+                # (Optional) expose for downstream weighting
+                s1['keep_w_app'] = keep_w_app
 
-            # ---- stage-2: appearance on subset ----
-            # Using normalized points [-1, 1]
-            s2 = self.encode_appearance(points, z_app, z_scale_app,
-                                        deterministic=deterministic,
-                                        obj_on=p_on_app,     # gate with expected presence
-                                        mask_pc=mask_pc,
-                                        kp_tile_ids=kp_tiles)
+                # ---- stage-2: appearance for all K proposals (soft ownership) ----
+                s2 = self.encode_appearance(points, z, z_scale,
+                                            deterministic=deterministic,
+                                            obj_on=p_on,
+                                            mask_pc=mask_pc,
+                                            kp_tiles=use_tiles,
+                                            soft_weights=soft_w)
+                mu_features     = s2['mu_features']      # [B,K,F]
+                logvar_features = s2['logvar_features']
+                z_features      = s2['z_features']
 
-            # scatter back into full K slots
-            Fdim = s2['mu_features'].size(-1)
-            mu_features_full = torch.zeros(B, z.shape[1], Fdim, device=points.device, dtype=s2['mu_features'].dtype)
-            z_features_full  = torch.zeros_like(mu_features_full)
-            logvar_features_full = (torch.zeros_like(mu_features_full)
-                                    if s2['logvar_features'] is not None else None)
+            else:
+                # eval-hard: slice to the top-K for speed
+                _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
+                bidx = torch.arange(B, device=points.device)[:, None]
 
-            mu_features_full[bidx, keep_idx] = s2['mu_features']
-            z_features_full[bidx, keep_idx]  = s2['z_features']
-            if logvar_features_full is not None:
-                logvar_features_full[bidx, keep_idx] = s2['logvar_features']
+                z_app         = z[bidx, keep_idx].contiguous()
+                z_scale_app   = z_scale[bidx, keep_idx].contiguous()
+                p_on_app      = p_on[bidx, keep_idx] if p_on is not None else None  # [B,nf,1]
 
-            # reduce stage-1 to the kept subset for consistency
-            z           = z_app
-            z_scale     = z_scale_app
-            z_base      = z_base[bidx, keep_idx]
-            mu_tot      = mu_tot[bidx, keep_idx]
-            kp_p        = kp_p[bidx, keep_idx]
-            var_kp      = var_kp[bidx, keep_idx]
-            z_base_var  = z_base_var[bidx, keep_idx]
-            mu_scale    = mu_scale[bidx, keep_idx] if mu_scale is not None else None
-            if logvar_scale is not None:
-                logvar_scale = logvar_scale[bidx, keep_idx]
-            mu_features     = mu_features_full
-            z_features      = z_features_full
-            logvar_features = logvar_features_full
-            if p_on is not None:
-                p_on = p_on_app
+                # ---- stage-2: appearance on subset ----
+                s2 = self.encode_appearance(points, z_app, z_scale_app,
+                                            deterministic=deterministic,
+                                            obj_on=p_on_app,
+                                            mask_pc=mask_pc,
+                                            kp_tiles=use_tiles,
+                                            soft_weights=soft_w if soft_w is None else soft_w[:, :, keep_idx[0]]  # keep shape if needed
+                                            )
+
+                # scatter back into full K slots
+                Fdim = s2['mu_features'].size(-1)
+                mu_features_full = torch.zeros(B, z.shape[1], Fdim, device=points.device, dtype=s2['mu_features'].dtype)
+                z_features_full  = torch.zeros_like(mu_features_full)
+                logvar_features_full = (torch.zeros_like(mu_features_full)
+                                        if s2['logvar_features'] is not None else None)
+
+                mu_features_full[bidx, keep_idx] = s2['mu_features']
+                z_features_full[bidx, keep_idx]  = s2['z_features']
+                if logvar_features_full is not None:
+                    logvar_features_full[bidx, keep_idx] = s2['logvar_features']
+
+                # reduce stage-1 to the kept subset for consistency
+                z           = z_app
+                z_scale     = z_scale_app
+                z_base      = z_base[bidx, keep_idx]
+                mu_tot      = mu_tot[bidx, keep_idx]
+                kp_p        = kp_p[bidx, keep_idx]
+                var_kp      = var_kp[bidx, keep_idx]
+                z_base_var  = z_base_var[bidx, keep_idx]
+                mu_scale    = mu_scale[bidx, keep_idx] if mu_scale is not None else None
+                if logvar_scale is not None:
+                    logvar_scale = logvar_scale[bidx, keep_idx]
+                mu_features     = mu_features_full
+                z_features      = z_features_full
+                logvar_features = logvar_features_full
+                if p_on is not None:
+                    p_on = p_on_app
 
         else:
             # ---- stage-2: appearance for all K proposals ----
@@ -595,7 +654,8 @@ class ParticleEncoder(nn.Module):
                                         deterministic=deterministic,
                                         obj_on=p_on,        # may be None -> ungated
                                         mask_pc=mask_pc,
-                                        kp_tiles=kp_tiles)
+                                        kp_tiles=use_tiles,
+                                        soft_weights=soft_w)
             mu_features     = s2['mu_features']
             logvar_features = s2['logvar_features']
             z_features      = s2['z_features']
@@ -655,9 +715,12 @@ class ParticleEncoder(nn.Module):
             'logvar_depth': logvar_depth,
             'z_depth':      z_depth,
 
-            # no kp_mask anymore
+            # keep-weights for training (optional; helps weight per-KP losses downstream)
+            **({'keep_w_app': s1.get('keep_w_app')} if self.training and 'keep_w_app' in s1 else {}),
+
             'patch_id_embed': None,
         }
+
 
 
 

@@ -508,7 +508,7 @@ class VoxelDLP(nn.Module):
         # TODO: Make grid and cdim configurable
         self.decoder_module = DLPDecoder3D(
             grid_dhw=voxel_grid_whd,         # e.g. (48,48,48)
-            cdim_out=7,      # e.g. 7 channels
+            cdim_out=self.cdim,      # e.g. 7 channels
             learned_feature_dim=self.learned_feature_dim,
             learned_bg_feature_dim=self.learned_bg_feature_dim,
             n_kp_enc=self.n_kp_enc,
@@ -1275,7 +1275,7 @@ class VoxelDLP(nn.Module):
             if num_static is None:
                 num_static = self.n_static_frames
                 loss_dict = self.calc_elbo(
-                    x, output_dict,
+                    pts_norm, output_dict,
                     warmup=warmup,
                     beta_kl=beta_kl,
                     beta_dyn=beta_dyn,
@@ -1869,8 +1869,7 @@ class VoxelDLP(nn.Module):
         # choose loss by mode/types
         if recon_loss_type.lower() == "bce" or voxel_mode == "occupancy":
             # assume rec_vox are logits; if they are probs, wrap with clamp and use BCE
-            loss_fn = torch.nn.BCEWithLogitsLoss(reduction="mean")
-            loss_rec = loss_fn(rec_vox, dense_gt)
+            loss_rec = self.bce_balanced(rec_vox, dense_gt)
         else:
             # mse or l1; allow color weighting if first 3 channels are RGB-like
             if recon_loss_type.lower() == "l1":
@@ -1981,8 +1980,16 @@ class VoxelDLP(nn.Module):
         obj_on_l1 = z_obj_on.squeeze(-1).abs().sum(-1).mean()
         loss_obj_reg = (z_obj_on.squeeze(-1).sum(-1) ** 2).mean()
 
+
+        with torch.no_grad():
+            pred_prob = torch.sigmoid(rec_vox)
+        gt_mass   = dense_gt.sum(dim=(1,2,3,4))
+        pred_mass = pred_prob.sum(dim=(1,2,3,4))
+        loss_mass = ((pred_mass - gt_mass).abs() / (gt_mass.clamp_min(1.0))).mean()
         # final loss
-        loss = beta_rec * loss_rec + beta_kl * kl_static + beta_obj * loss_obj_reg
+        lambda_mass = 1e-3
+        loss = beta_rec * loss_rec + beta_kl * kl_static + beta_obj * loss_obj_reg + lambda_mass * loss_mass
+        
         # keep same scale factor you used before, if desired:
         loss *= (0.1 if recon_loss_type == 'mse' else 0.01)
 
@@ -2008,6 +2015,20 @@ class VoxelDLP(nn.Module):
             for p, p_other in zip(params, other_param):
                 p.data.lerp_(p_other.data, 1.0 - betta)
 
+    def bce_balanced(self, logits, target, eps=1e-8):
+        # logits, target: [B,1,D,H,W] (target in {0,1})
+        B = logits.size(0)
+        pos = target.sum(dim=(1,2,3,4)) + eps
+        neg = target.numel()//B - pos + eps
+        # one scalar per batch element
+        pw = (neg / pos).clamp(1.0, 200.0)                       # cap to keep stable
+        loss = 0.0
+        for b in range(B):
+            loss_b = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits[b], target[b], pos_weight=pw[b]
+            )
+            loss = loss + loss_b
+        return loss / B
 
 """
 JIT scripts

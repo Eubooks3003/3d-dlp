@@ -164,94 +164,105 @@ class ParticleFeaturesEncoderPoint(nn.Module):
 
     def forward(self,
             points: torch.Tensor,           # [B,N,3(+F)]
-            kp: torch.Tensor,               # [B,K,3]  (same normalized frame as tiles)
+            kp: torch.Tensor,               # [B,K,3]
             z_scale: Optional[torch.Tensor] = None,  # [B,K,3] logits (optional)
             deterministic: bool = False,
             obj_on: Optional[torch.Tensor] = None,   # [B,K] or [B,K,1]
             mask: Optional[torch.Tensor] = None,     # [B,N] True=valid
             *,
-            point_tile_ids: torch.Tensor,            # [B,N] linear tile id per point
-            kp_tile_ids: torch.Tensor,               # [B,K] linear tile id per kp
-            tau: float = 0.2) -> dict:
-        """
-        Tile-routed soft pooling with robust empty-tile fallback (soft-topM).
-        """
+            point_tile_ids: Optional[torch.Tensor] = None,  # [B,N] or None if soft path
+            kp_tile_ids: Optional[torch.Tensor] = None,      # [B,K] or None if soft path
+            tau: float = 0.2,
+            soft_weights: Optional[torch.Tensor] = None,     # [B,N,K] (training soft-ownership)
+            keep_w: Optional[torch.Tensor] = None,           # [B,K] relaxed Top-K weights
+            eps_tile_bleed: float = 0.02) -> dict:
+
         B, N, C = points.shape
         assert kp.dim() == 3 and kp.size(-1) == 3, f"kp must be [B,K,3], got {tuple(kp.shape)}"
         K = kp.size(1)
-        assert point_tile_ids.shape == (B, N), f"point_tile_ids must be [B,N], got {tuple(point_tile_ids.shape)}"
-        assert kp_tile_ids.shape == (B, K),    f"kp_tile_ids must be [B,K], got {tuple(kp_tile_ids.shape)}"
-        
 
-        B, K = kp_tile_ids.shape
-        nmatch = (point_tile_ids.unsqueeze(1) == kp_tile_ids.unsqueeze(-1)).sum(-1)  # [B,K]
-        print(f"[route] cand points per kp: min={int(nmatch.min())} "
-            f"mean={float(nmatch.float().mean()):.1f} "
-            f"max={int(nmatch.max())} | empty_kp={(nmatch==0).sum().item()}/{B*K}")
         device, dtype = points.device, points.dtype
 
-        # ---- per-KP receptive radius from z_scale (optional) ----
+        # per-KP receptive radius
         if z_scale is not None:
             s = torch.sigmoid(z_scale).mean(dim=-1, keepdim=True)   # [B,K,1]
         else:
             s = torch.ones(B, K, 1, device=device, dtype=dtype)
         r = self.base_radius * s                                     # [B,K,1]
 
-        # ---- fixed candidate set by tile id (no neighbor switching) ----
-        cand_mask = (point_tile_ids.unsqueeze(1) == kp_tile_ids.unsqueeze(-1))    # [B,K,N]
-        if mask is not None:
-            cand_mask = cand_mask & mask.unsqueeze(1)                              # respect padding
-        empty = ~cand_mask.any(dim=-1)                                            # [B,K]
-
-        # ---- relative coords (once) ----
-        pts_xyz = points[..., :3].unsqueeze(1).expand(B, K, N, 3)                 # [B,K,N,3]
-        rel = (pts_xyz - kp.unsqueeze(2)) / (r.unsqueeze(2) + 1e-6)               # [B,K,N,3]
+        # relative coords (vectorized)
+        pts_xyz = points[..., :3].unsqueeze(1).expand(B, K, N, 3)    # [B,K,N,3]
+        rel = (pts_xyz - kp.unsqueeze(2)) / (r.unsqueeze(2) + 1e-6)  # [B,K,N,3]
         if self.clamp_after_st:
             rel = rel.clamp_(-1, 1)
 
-        # ---- logits for candidates; -inf elsewhere ----
-        logits = -(rel.square().sum(dim=-1)) / (tau + 1e-6)                        # [B,K,N]
-        logits = logits.masked_fill(~cand_mask, float('-inf'))
-
-        # ---- fallback: if a kp's tile has no points, use soft-topM globally for that (b,k) only ----
-        if empty.any():
-            print("KP WITH NO POINTS")
-            M = min(self.k, N)
-            d2_all = rel.pow(2).sum(dim=-1)                                        # [B,K,N]
-            if mask is not None:
-                d2_all = d2_all.masked_fill(~mask.unsqueeze(1), float('inf'))
-            topM_idx = d2_all.topk(k=M, dim=-1, largest=False).indices             # [B,K,M]
-            vals = (-d2_all / (tau + 1e-6)).gather(-1, topM_idx)                   # [B,K,M]
-
-            logits_fb = logits.new_full((B, K, N), float('-inf'))                  # [B,K,N]
-            logits_fb.scatter_(-1, topM_idx, vals)                                 # fill only top-M
-
-            e = empty.unsqueeze(-1)                                                # [B,K,1]
-            logits = torch.where(e, logits_fb, logits)                             # row-wise select
-
-        # ---- soft weights & pooling ----
-        w = torch.softmax(logits, dim=-1).unsqueeze(-1)                            # [B,K,N,1]
-        r_norm = rel.norm(dim=-1, keepdim=True)                                    # [B,K,N,1]
+        # base per-point features
+        r_norm = rel.norm(dim=-1, keepdim=True)                      # [B,K,N,1]
         feats = [rel, r_norm]
         if C > 3:
             feats.append(points[..., 3:].unsqueeze(1).expand(B, K, N, C-3))
-        x_all = torch.cat(feats, dim=-1)                                           # [B,K,N,4+Fin]
-        x = (w * x_all).sum(dim=2)                                                 # [B,K,4+Fin]
+        x_all = torch.cat(feats, dim=-1)                             # [B,K,N,4+Fin]
 
-        # ---- MLP heads ----
-        x = self.block1(x)                                                         # [B,K,H]
-        x = self.block2(x)                                                         # [B,K,H]
-        mu = self.to_mu(x)                                                         # [B,K,F]
+        # valid points
+        if mask is not None:
+            valid_pts = mask.unsqueeze(1)                             # [B,1,N]
+        else:
+            valid_pts = torch.ones(B, 1, N, device=device, dtype=torch.bool)
+
+        # ---------------- weighting ----------------
+        if soft_weights is not None:
+            # TRAIN-SOFT: use provided [B,N,K] ownership
+            assert soft_weights.shape == (B, N, K), f"soft_weights must be [B,N,K], got {tuple(soft_weights.shape)}"
+            w = soft_weights.permute(0, 2, 1).unsqueeze(-1)           # [B,K,N,1]
+            w = w * valid_pts.unsqueeze(-1)
+            denom = w.sum(dim=2, keepdim=True).clamp_min(1e-6)
+            w = w / denom
+        else:
+            # TILE ROUTING (eval/fast) + tiny global bleed for gradient health
+            assert point_tile_ids is not None and kp_tile_ids is not None, \
+                "point_tile_ids/kp_tile_ids required when soft_weights is None"
+
+            cand_mask = (point_tile_ids.unsqueeze(1) == kp_tile_ids.unsqueeze(-1))  # [B,K,N]
+            cand_mask = cand_mask & valid_pts
+
+            logits_local = -(rel.square().sum(dim=-1)) / (tau + 1e-6)               # [B,K,N]
+            logits_local = logits_local.masked_fill(~cand_mask, float('-inf'))
+
+            logits_global = -(rel.square().sum(dim=-1)) / (tau + 1e-6)
+            logits_global = logits_global.masked_fill(~valid_pts, float('-inf'))
+
+            w_local  = torch.softmax(logits_local, dim=-1).unsqueeze(-1)            # [B,K,N,1]
+            w_global = torch.softmax(logits_global, dim=-1).unsqueeze(-1)           # [B,K,N,1]
+
+            empty = ~cand_mask.any(dim=-1)                                          # [B,K]
+            alpha = (~empty).float().unsqueeze(-1).unsqueeze(-1)                    # [B,K,1,1]
+            w = alpha * ((1.0 - eps_tile_bleed) * w_local + eps_tile_bleed * w_global) \
+                + (1.0 - alpha) * w_global
+
+        # --------------- pooling & heads ---------------
+        x = (w * x_all).sum(dim=2)                                                  # [B,K,4+Fin]
+        x = self.block1(x)
+        x = self.block2(x)
+        mu = self.to_mu(x)                                                          # [B,K,F]
         logvar = self.to_logvar(x) if self.output_logvar else None
 
+        # continuous gating for presence / relaxed Top-K
+        gate = None
         if obj_on is not None:
-            gate = (obj_on > 0.2).to(mu.dtype)
+            g = obj_on
+            if g.dim() == 3 and g.size(-1) == 1: g = g[..., 0]
+            gate = g.to(mu.dtype).clamp(0, 1)
+        if keep_w is not None:
+            gate = keep_w.to(mu.dtype) if gate is None else (gate * keep_w.to(mu.dtype))
+        if gate is not None:
             mu = self._gate_with_null(mu, gate, self.null_feature_embed)
 
         if self.features_dist == 'categorical':
             z_features = None
         else:
-            z_features = mu if self.interaction_features else self.sample_gauss(mu, logvar, deterministic)
+            z_features = mu if self.interaction_features else (
+                mu if (logvar is None or deterministic) else reparameterize(mu, logvar)
+            )
 
         return {
             'mu_features':           mu,

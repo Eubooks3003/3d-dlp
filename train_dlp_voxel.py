@@ -25,7 +25,7 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
                              create_segmentation_map, get_config, LinearWithWarmupScheduler, format_epoch_summary,
                              plot_training_metrics, save_metrics_data, save_code_backup, depth_to_rgb)
 from utils.rgbd_utils import get_depth_range, normalize_rgbd
-from utils.log_utils import save_checkpoint, load_checkpoint
+from utils.log_utils import save_checkpoint, load_checkpoint, log_block_grads, log_param_updates, plot_grad_flow
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
 import eval.eval_vox as eval_vox
@@ -146,7 +146,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     voxel_grid_whd = config["voxel_grid_whd"]
 
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4, collate_fn=pc_collate)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=pc_collate)
+
+    
     # model
 
     model = VoxelDLP(
@@ -233,7 +235,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     save_dir = os.path.join(log_dir, 'saves')
 
     # ---- Checkpoint config ----
-    save_every = int(config.get("save_every", 10))   # save epoch snapshot every N epochs
+    save_every = int(config.get("save_every", 1))   # save epoch snapshot every N epochs
     monitor = config.get("monitor", "loss")          # which metric to track for "best"
     mode = config.get("monitor_mode", "min")         # "min" or "max"
     assert mode in ("min", "max")
@@ -365,15 +367,53 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
                                  beta_obj=beta_obj)
+            
+            # --- pick tensors inside model_output to watch gradient flow through ---
+            watch_tensors = {}
+            for name in ["kp_p", "z", "z_scale", "mu_offset", "mu_scale",
+                        "z_features", "z_obj_on", "z_depth"]:
+                t = model_output.get(name, None)
+                if t is not None and t.requires_grad:
+                    t.retain_grad()                # allow reading .grad on non-leaf tensors
+                    watch_tensors[name] = t
+
             # calculate loss
             all_losses = model_output['loss_dict']
             loss = all_losses['loss']
 
             optimizer.zero_grad()
             loss.backward()
+
+            # --- log per-tensor grad magnitudes (mean and max) ---
+            for k, v in watch_tensors.items():
+                gm = (v.grad.abs().mean().item() if v.grad is not None else 0.0)
+                gM = (v.grad.abs().max().item()  if v.grad is not None else 0.0)
+                wandb.log({f"grad/{k}_mean": gm, f"grad/{k}_max": gM}, step=iteration)
+            log_block_grads(model, iteration)
+            plot_grad_flow(list(model.named_parameters()), iteration)
+
             optimizer.step()
 
+            log_param_updates(model, iteration)
+
             iteration += 1
+
+            # keypoint spread / motion
+            kp = model_output.get("kp_p")                          # [B,K,3] in [-1,1]
+            obj_on = model_output.get("obj_on")                    # [B,K,1] or [B,K]
+            if kp is not None:
+                spread = kp.std(dim=1).mean().item()              # avg spatial spread
+                wandb.log({"kp/spread": spread}, step=iteration)
+                if hasattr(model, "_kp_prev"):
+                    drift = (kp - model._kp_prev).pow(2).sum(-1).sqrt().mean().item()
+                    wandb.log({"kp/drift_per_step": drift}, step=iteration)
+                model._kp_prev = kp.detach().clone()
+
+            # how many are "on"
+            if obj_on is not None:
+                on_frac = obj_on.sigmoid().mean().item() if obj_on.dim()==3 else obj_on.mean().item()
+                wandb.log({"kp/on_frac": on_frac}, step=iteration)
+
 
             # --- helpers ---
             def _to_float(x, default=0.0):
@@ -522,6 +562,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 
+            print("SAVING TO WANDB")
+
             # --- pull GT & REC dense volumes from model_output ---
             # shapes: [B, C, D, H, W]
             gt_dense  = model_output.get('dense_target', None)
@@ -599,11 +641,21 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             
             # --- GT plots (same three modes you used for REC) ---
             if gt_dense is not None:
-                eval_vox.log_vox_plotly_gt_suite("vox", gt_dense[b0], step=epoch, channel=0, kps=kps)
+                print("SAVING GT")
+                eval_vox.log_vox_plotly_gt_suite("vox", gt_dense[b0], step=iteration, channel=0, kps=kps)
 
             if model_output.get("rec_vox", None) is not None:
-                eval_vox.log_vox_plotly_rec_suite("vox", model_output["rec_vox"][b0], step=epoch, channel=0, kps=kps)
+                print("SAVING REC")
+                rec = model_output["rec_vox"]
+                coarse = [i / 10 for i in range(0, 11)]          # 0.0, 0.1, ..., 1.0
+                fine   = [i / 100 for i in range(2, 11, 2)]      # 0.02, 0.04, ..., 0.10
 
+                iso_values = sorted({round(x, 3) for x in (coarse + fine) if 0.0 <= x <= 1.0})
+
+                for iso in iso_values:
+                    eval_vox.log_vox_plotly_rec_suite(
+                        "vox", rec[b0], iso=iso, step=iteration, channel=0, kps=kps
+                    )
 
             # ---------- metrics ----------
             metrics = {}

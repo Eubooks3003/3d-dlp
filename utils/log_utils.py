@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import os
 
+import wandb
+
 def _rng_state_pack():
     return {
         "python_random_state": random.getstate(),
@@ -57,3 +59,54 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, map_location="c
         # weights-only file
         model.load_state_dict(obj, strict=False)
         return {"epoch": 0, "best_metric": float("inf"), "extra": {}, "is_full_ckpt": False}
+
+
+def grad_norm(module):
+    sq = 0.0
+    has = False
+    for p in module.parameters():
+        if p.grad is not None:
+            sq += p.grad.detach().float().norm()**2
+            has = True
+    return (sq.sqrt().item() if has else 0.0)
+
+def log_block_grads(model, step):
+    groups = {
+        "prior": getattr(model, "prior", None),
+        "obj_dec": getattr(model, "decoder", None) and getattr(model.decoder, "obj_dec", None),
+        "bg_dec": getattr(model, "decoder", None) and getattr(model.decoder, "bg_dec", None),
+        "pint": getattr(model, "pint_enc", None),
+        "feat_enc": getattr(model, "feat_enc_point", None),
+    }
+    for name, blk in groups.items():
+        if blk is None: continue
+        wandb.log({f"gradnorm/{name}": grad_norm(blk)}, step=step)
+
+def log_param_updates(model, step, every=50):
+    if step % every: return
+    for name, p in model.named_parameters():
+        if not p.requires_grad: continue
+        if not hasattr(p, "_prev"):
+            p._prev = p.detach().clone()
+            continue
+        denom = p._prev.norm().clamp_min(1e-12)
+        drel  = (p.detach() - p._prev).norm() / denom
+        # log a few aggregates to avoid spam:
+        if ("obj_dec" in name) or ("prior" in name) or ("bg_dec" in name):
+            wandb.log({f"update/{name.split('.')[0]}": drel.item()}, step=step)
+        p._prev.copy_(p.detach())
+
+import matplotlib.pyplot as plt
+
+def plot_grad_flow(named_params, step):
+    ave_grads, layers = [], []
+    for n, p in named_params:
+        if p.requires_grad and ("bias" not in n) and (p.grad is not None):
+            layers.append(n[:30])
+            ave_grads.append(p.grad.detach().abs().mean().item())
+    if not ave_grads: return
+    plt.figure(figsize=(9,3))
+    plt.plot(ave_grads); plt.yscale("log"); plt.title("grad flow (mean abs)")
+    plt.xlabel("layers"); plt.tight_layout()
+    wandb.log({"debug/grad_flow": wandb.Image(plt)}, step=step)
+    plt.close()

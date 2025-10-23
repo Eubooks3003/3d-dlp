@@ -146,23 +146,59 @@ class DLPPrior(nn.Module):
         # [-1,1] -> [0, td/th/tw - 1] within tile
         lo, hi = self.kp_range
         p01 = (kp_local_zyx - lo) / (hi - lo)
+        # allow a little overflow then softly clip; factor 4 sharpens slope
+        p01 = self._soft_clip01((p01 - 0.5) * 4.0)
         scale_zyx = kp_local_zyx.new_tensor([td-1, th-1, tw-1]).view(1,1,1,3)
-        kp_vox_zyx = starts_zyx + p01 * scale_zyx  # absolute voxel indices on *padded* grid
+        kp_vox_zyx = starts_zyx + p01 * scale_zyx
 
-        # clamp to ORIGINAL extents
-        kp_vox_zyx[..., 0].clamp_(0, D-1)
-        kp_vox_zyx[..., 1].clamp_(0, H-1)
-        kp_vox_zyx[..., 2].clamp_(0, W-1)
-
-        # normalize to [-1,1] over ORIGINAL
+        # no hard clamp here; normalization below already keeps us in-range
         full_zyx = kp_local_zyx.new_tensor([D-1, H-1, W-1]).view(1,1,1,3)
         kp_glob_zyx = (kp_vox_zyx / full_zyx) * (hi - lo) + lo
         return self._as_xyz(kp_glob_zyx)
+    
+    def _soft_clip01(self, u, eps=1e-3):
+        # maps ℝ -> (0,1) with gradient at edges
+        return (1 - 2*eps) * torch.sigmoid(u) + eps
 
-    # ---- main ----
-    def encode_prior(self, vox: torch.Tensor, k: Optional[int] = None):
+    # --- helper: relaxed Top-K with STE (train-time), hard Top-K (eval) ---
+    def relaxed_topk_weights(self,score: torch.Tensor,
+                            k_target: int,
+                            valid_mask: torch.Tensor,
+                            tau: float = 0.3,
+                            training: bool = True):
+        """
+        score, valid_mask: [B, K_tot]  (larger score is better)
+        returns:
+            w_keep:  [B, K_tot] mask in [0,1] (soft in train, hard in eval)
+            top_idx: [B, k_target] hard top-k indices
+        """
+        score_masked = torch.where(valid_mask, score, score.new_full(score.shape, -1e9))
+        # hard indices for both train/eval fast path
+        top_idx = torch.topk(score_masked, k_target, dim=-1).indices  # [B,k]
+
+        if not training:
+            # eval: strictly hard mask
+            hard = torch.zeros_like(score_masked).scatter(1, top_idx, 1.0)
+            return hard, top_idx
+
+        # train: soft weights spread some mass to non-selected for gradient flow
+        w_soft = torch.softmax(score_masked / tau, dim=-1)              # [B,K_tot]
+        # normalize so sum ≈ k_target
+        w_soft = w_soft * (k_target / (w_soft.sum(-1, keepdim=True) + 1e-8))
+        hard = torch.zeros_like(score_masked).scatter(1, top_idx, 1.0)
+        # STE: hard forward, soft backward
+        w_keep = hard + (w_soft - w_soft.detach())
+        return w_keep, top_idx
+
+    def encode_prior(self,
+                    vox: torch.Tensor,
+                    k: Optional[int] = None,
+                    return_keep_weights: bool = True):
         """
         vox: [B,C,D,H,W] aligned to ORIGINAL grid (D,H,W) provided at init
+        return_keep_weights:
+            False -> (kp_sel, cov_sel, kp_tiles)
+            True  -> (kp_sel, cov_sel, kp_tiles, w_keep_full) where w_keep_full is [B, K_tot]
         """
         assert vox.dim()==5, f"vox must be [B,C,D,H,W], got {vox.shape}"
         B, C, D, H, W = vox.shape
@@ -172,7 +208,7 @@ class DLPPrior(nn.Module):
         tiles, meta = VoxTiler.pad_to_tiles(vox, self.tile_size)    # [B,C,T,td,th,tw]
         B, Cg, T, td, th, tw = tiles.shape
 
-        # 2) validity per tile (use a "density" channel if provided; else sum all)
+        # 2) validity per tile
         if self.density_channel_idx is not None and 0 <= self.density_channel_idx < Cg:
             den_tiles = tiles[:, self.density_channel_idx:self.density_channel_idx+1]    # [B,1,T,td,th,tw]
         else:
@@ -185,8 +221,9 @@ class DLPPrior(nn.Module):
         tiles_bt = tiles.permute(0,2,1,3,4,5).reshape(B*T, Cg, td, th, tw)  # [B*T,C,td,th,tw]
         logits = self.enc3d(tiles_bt)                                       # [B*T, K, d', h', w']
 
-        # guard SSM on empty tiles
-        logits = torch.where(valid_bt, logits, logits.new_full(logits.shape, -1e9))
+        # softened guard SSM on empty tiles (keeps tiny grad paths)
+        dead = (~valid_bt).float()
+        logits = logits + dead * (-20.0)
 
         # 4) SSM -> local zyx mean + covariance
         kp_local, cov_local = self.ssm3d(logits, probs=False, variance=True) # [B*T,K,3], [B*T,K,3,3]
@@ -198,60 +235,50 @@ class DLPPrior(nn.Module):
         kp_glob_xyz = self._local_to_global_xyz(kp_local, meta)      # [B,T,K,3]
         cov_glob_xyz = self._cov_zyx_to_xyz(cov_local)               # [B,T,K,3,3]
 
-        kp_all  = kp_glob_xyz.reshape(B, T*K, 3)
-        cov_all = cov_glob_xyz.reshape(B, T*K, 3, 3)
-        valid_kp = valid_tile.unsqueeze(-1).expand(B, T, K).reshape(B, T*K)   # [B,K_tot]
+        kp_all  = kp_glob_xyz.reshape(B, T*K, 3)        # [B, K_tot, 3]
+        cov_all = cov_glob_xyz.reshape(B, T*K, 3, 3)    # [B, K_tot, 3,3]
+        valid_kp = valid_tile.unsqueeze(-1).expand(B, T, K).reshape(B, T*K)   # [B, K_tot]
 
-        # 6) select top-k proposals per batch
+        # 6) score + relaxed Top-K (train), hard (eval)
         if self.filtering_heuristic == 'variance':
-            tr = cov_all[..., 0,0] + cov_all[..., 1,1] + cov_all[..., 2,2]  # [B,K_tot]
+            # negative trace (low variance = good)
+            tr = cov_all[..., 0,0] + cov_all[..., 1,1] + cov_all[..., 2,2]  # [B, K_tot]
             score = -tr
         elif self.filtering_heuristic == 'random':
             score = torch.rand_like(valid_kp.float())
         else:
             score = torch.zeros_like(valid_kp.float())
 
-        score = torch.where(valid_kp, score, score.new_full(score.shape, float('-inf')))
-        sorted_score, sorted_idx = torch.sort(score, dim=-1, descending=True)
-        n_valid = valid_kp.sum(dim=-1)
+        k_target = self.n_kp_prior if k is None else int(k)
+        w_keep_full, top_idx = self.relaxed_topk_weights(
+            score=score,
+            k_target=k_target,
+            valid_mask=valid_kp,
+            tau=getattr(self, 'relaxed_topk_tau', 0.3),
+            training=self.training
+        )  # w_keep_full: [B, K_tot], top_idx: [B, k]
 
-
-
-        # flatten per-tile tile ids to align with kp_all/cov_all
+        # 7) gather selected subset for the fast path (keeps your existing behavior)
+        # build linear tile ids aligned with kp_all/cov_all (optional, for downstream)
         nz, ny, nx = meta["ntiles"]
         tile_lin = torch.arange(nz*ny*nx, device=vox.device).view(1, -1).expand(B, -1)  # [B,T]
+        tile_lin_all = tile_lin.unsqueeze(-1).expand(B, tile_lin.size(1), K).reshape(B, -1)  # [B, K_tot]
 
-        tile_lin_all = tile_lin.unsqueeze(-1).expand(B, tile_lin.size(1), K).reshape(B, -1)  # [B, T*K]
-
-
-        k_target = self.n_kp_prior if k is None else int(k)
-        kp_sel_list, cov_sel_list, mask_sel_list, tileid_sel_list = [], [], [], []
+        kp_sel_list, cov_sel_list, tileid_sel_list = [], [], []
         for b in range(B):
-            k_eff = int(min(k_target, int(n_valid[b].item())))
-            idxb  = sorted_idx[b, :k_eff]
-            kpb   = kp_all[b, idxb]
-            covb  = cov_all[b, idxb]
-            tileb = tile_lin_all[b, idxb]
-            maskb = torch.ones(k_eff, dtype=torch.bool, device=kpb.device)
+            idxb = top_idx[b]                                # [k_target]
+            kp_sel_list.append(kp_all[b, idxb])
+            cov_sel_list.append(cov_all[b, idxb])
+            tileid_sel_list.append(tile_lin_all[b, idxb])
 
-            if k_eff < k_target:  # pad
-                pad = k_target - k_eff
-                kpb   = torch.cat([kpb,  kpb.new_zeros(pad, 3)], dim=0)
-                covb  = torch.cat([covb, covb.new_zeros(pad, 3, 3)], dim=0)
-                tileb = torch.cat([tileb, tileb.new_full((pad,), -1)], dim=0)  # -1 for padded
-                maskb = torch.cat([maskb, torch.zeros(pad, dtype=torch.bool, device=kpb.device)], dim=0)
+        kp_sel   = torch.stack(kp_sel_list,  dim=0)          # [B, k_target, 3]
+        cov_sel  = torch.stack(cov_sel_list, dim=0)          # [B, k_target, 3,3]
+        kp_tiles = torch.stack(tileid_sel_list, dim=0)       # [B, k_target]
 
-            kp_sel_list.append(kpb)
-            cov_sel_list.append(covb)
-            mask_sel_list.append(maskb)
-            tileid_sel_list.append(tileb)
-
-        kp_sel  = torch.stack(kp_sel_list, dim=0)  # [B,k_target,3] (xyz)
-        cov_sel = torch.stack(cov_sel_list, dim=0) # [B,k_target,3,3]
-        kp_mask = torch.stack(mask_sel_list, dim=0) # [B,k_target]
-        kp_tiles = torch.stack(tileid_sel_list, dim=0)
-
-        return kp_sel, cov_sel, kp_tiles
+        if return_keep_weights:
+            return kp_sel, cov_sel, kp_tiles, w_keep_full    # w_keep_full is over ALL proposals
+        else:
+            return kp_sel, cov_sel, kp_tiles
 
     def forward(self, vox: torch.Tensor):
         return self.encode_prior(vox, k=self.n_kp_prior)

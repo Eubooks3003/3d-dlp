@@ -5,6 +5,15 @@ import torch.nn.functional as F
 
 from modules.voxel_modules.DLPDecoder.decoder_utils import ResBlock3D, UpBlock3D
 
+import torch.nn.functional as F
+
+def _safe_trilinear_interpolate(x: torch.Tensor, size):
+    # PyTorch often lacks bf16 support for trilinear; cast to fp32 just for the op.
+    if x.dtype == torch.bfloat16:
+        return F.interpolate(x.to(torch.float32), size=size, mode='trilinear', align_corners=False).to(torch.bfloat16)
+    return F.interpolate(x, size=size, mode='trilinear', align_corners=False)
+
+
 class ObjectDecoderCNN3D(nn.Module):
     """
     Takes per-particle bottleneck (B*N, F) and outputs a 3D patch (alpha + payload channels).
@@ -62,9 +71,13 @@ class ObjectDecoderCNN3D(nn.Module):
         x = self.fc(z_feat).view(Bn, -1, self.res0, self.res0, self.res0)
         x = self.ups(x)
 
-        # if spatial size is smaller than patch size, upsample (nearest)
+        # upsample features to patch size if needed
         _, _, d, h, w = x.shape
         D, H, W = self.ps
         if (d, h, w) != (D, H, W):
-            x = F.interpolate(x, size=(D, H, W), mode='trilinear', align_corners=False)
-        return x  # [B*N, 1+num_chans_out, D, H, W]
+            x = _safe_trilinear_interpolate(x, size=(D, H, W))
+
+        # *** THIS WAS MISSING: map features -> [alpha(1) + payload(cdim_out)] ***
+        x = self.head(x)  # now x is [B*N, 1 + num_chans_out, D, H, W]
+
+        return x

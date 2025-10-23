@@ -416,10 +416,10 @@ def log_vox_plotly_volume(
 # --- GT logging: same API as rec ---
 def log_vox_plotly_gt_suite(prefix, gt_vol, step=None, channel=0, kps=None,
                             iso=0.5, vol_opacity=0.15):
-    log_vox_plotly_volume(f"{prefix}/gt_volume",   gt_vol, step=step,
-                          channel=channel, mode="volume", opacity=vol_opacity, kps=kps)
-    log_vox_plotly_volume(f"{prefix}/gt_isosurf@{iso}", gt_vol, step=step,
-                          channel=channel, mode="isosurface", isovalue=iso, kps=kps)
+    # log_vox_plotly_volume(f"{prefix}/gt_volume",   gt_vol, step=step,
+    #                       channel=channel, mode="volume", opacity=vol_opacity, kps=kps)
+    # log_vox_plotly_volume(f"{prefix}/gt_isosurf@{iso}", gt_vol, step=step,
+    #                       channel=channel, mode="isosurface", isovalue=iso, kps=kps)
     log_vox_plotly_volume(f"{prefix}/gt_points@{iso}",  gt_vol, step=step,
                           channel=channel, mode="points", isovalue=iso, kps=kps)
 
@@ -430,9 +430,9 @@ def log_vox_plotly_rec_suite(prefix, rec_vol, step=None, channel=0, kps=None,
     Mirrors log_vox_plotly_gt_suite but for reconstructed volumes.
     Uses the same three modes: volume, isosurface (at `iso`), and points (at `iso`).
     """
-    log_vox_plotly_volume(f"{prefix}/rec_volume",   rec_vol, step=step,
-                          channel=channel, mode="volume", opacity=vol_opacity, kps=kps)
-    log_vox_plotly_volume(f"{prefix}/rec_isosurf@{iso}", rec_vol, step=step,
-                          channel=channel, mode="isosurface", isovalue=iso, kps=kps)
+    # log_vox_plotly_volume(f"{prefix}/rec_volume",   rec_vol, step=step,
+    #                       channel=channel, mode="volume", opacity=vol_opacity, kps=kps)
+    # log_vox_plotly_volume(f"{prefix}/rec_isosurf@{iso}", rec_vol, step=step,
+    #                       channel=channel, mode="isosurface", isovalue=iso, kps=kps)
     log_vox_plotly_volume(f"{prefix}/rec_points@{iso}",  rec_vol, step=step,
                           channel=channel, mode="points", isovalue=iso, kps=kps)
