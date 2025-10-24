@@ -742,6 +742,121 @@ def density_aware_chamfer(pred, gt, tau=None, freq_temp=1.0, eps=1e-6):
     term_gp = (w_gp * c_gp).mean(dim=1)                             # [B]
     return 0.5 * (term_pg + term_gp)                                # [B]
 
+        # ---------- weighted DCD ----------
+def weighted_dcd(pred, gt, w_pred=None, tau=None, freq_temp=1.0, eps=1e-8):
+        """
+        pred:  [B, M_p, 3]
+        gt:    [B, N, 3]
+        w_pred:[B, M_p, 1] in [0,1] (weights for pred points). If None -> unweighted DCD.
+        Returns per-batch scalar [B].
+        """
+        if w_pred is None:
+            return density_aware_chamfer(pred=pred, gt=gt, tau=tau, freq_temp=freq_temp)
+
+        # distances
+        d = torch.cdist(pred, gt, p=2)  # [B, M_p, N]
+
+        # pred -> gt : min over gt, then **weighted** mean over pred
+        dmin_p = d.min(dim=-1).values                  # [B, M_p]
+        term_p = (dmin_p * w_pred.squeeze(-1)).sum(dim=1)  # [B]
+
+        # gt -> pred : we approximate a weight-aware "soft-min over pred"
+        # Use pred weights as an attention over pred points.
+        att = (w_pred.squeeze(-1) / (w_pred.squeeze(-1).sum(dim=1, keepdim=True).clamp_min(eps)))  # [B,M_p]
+        dmin_q = (att.unsqueeze(-1) * d).sum(dim=1)   # [B, N]
+        term_q = dmin_q.mean(dim=1)                   # [B] plain mean over gt
+
+        return 0.5 * (term_p + term_q)
+
+@torch.no_grad()
+def _tile_ranges(n, tile):
+    i = 0
+    while i < n:
+        j = min(i + tile, n)
+        yield i, j
+        i = j
+def repulsion_loss_weighted_knn(P, w=None, k=6, r=0.03, tile=4096, stopgrad_w=True):
+    B, M, _ = P.shape
+    if w is None:
+        w = P.new_ones(B, M, 1)
+    if stopgrad_w:
+        w = w.detach()
+
+    total = P.new_zeros(())
+    count = 0
+    BIG = 1e6
+
+    for b in range(B):
+        X = P[b]                       # [M,3]
+        W = w[b].clamp(0, 1)          # [M,1]
+
+        keep = (W.squeeze(-1) > 1e-3)
+        X = X[keep]
+        W = W[keep]
+        Me = X.shape[0]
+        if Me <= 1:
+            continue
+
+        acc = X.new_zeros(Me, k)      # store k nn distances
+
+        for i0 in range(0, Me, tile):
+            i1 = min(i0 + tile, Me)
+            Q = X[i0:i1]                              # [Ti,3]
+            D = torch.cdist(Q, X, p=2)               # [Ti, Me]
+
+            # DO NOT modify D in place. Create a new tensor with big values at (near-)self entries.
+            # self pairs show up as ~0 distance; push them out before topk:
+            D_masked = torch.where(D <= 1e-12, D.new_full(D.shape, BIG), D)
+
+            vals, _ = torch.topk(D_masked, k=k, largest=False, dim=-1)  # [Ti,k]
+            acc[i0:i1] = vals
+
+        rep = torch.relu(r - acc)         # [Me,k]
+        rep = rep * W                     # weight each point
+        total = total + rep.mean()
+        count += 1
+
+    return total / max(count, 1)
+
+
+# utils/loss_functions.py
+def coverage_loss_weighted(P_pred, W_pred, P_gt, max_pred=12000, max_gt=12000, stopgrad_w=True):
+    """
+    P_pred : [B, M, 3]
+    W_pred : [B, M, 1] (soft top-k point weights) — will downweight inactive points
+    P_gt   : [B, N, 3]
+    """
+    B, M, _ = P_pred.shape
+    if stopgrad_w:
+        W_pred = W_pred.detach()
+    out = P_pred.new_zeros(B)
+
+    for b in range(B):
+        X = P_pred[b]
+        W = W_pred[b].clamp(0,1)
+        Y = P_gt[b]
+
+        # sample proportional to weights to focus on effective points
+        m = X.shape[0]
+        n = Y.shape[0]
+
+        if m > max_pred:
+            probs = (W.squeeze(-1) + 1e-6)
+            idx = torch.multinomial(probs, num_samples=max_pred, replacement=False)
+            X = X[idx]; W = W[idx]
+
+        if n > max_gt:
+            # uniform subsample gt is fine
+            jdx = torch.randperm(n, device=Y.device)[:max_gt]
+            Y = Y[jdx]
+
+        D = torch.cdist(X, Y, p=2)       # [Mp, Ng]
+        dmin, _ = D.min(dim=1)           # [Mp]
+        # weight by W and average
+        out[b] = (dmin * W.squeeze(-1)).sum() / (W.sum().clamp_min(1.0))
+
+    return out.mean()
+
 
 def repulsion_loss(pts, h=0.02):
     """

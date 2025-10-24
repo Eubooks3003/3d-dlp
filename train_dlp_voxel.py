@@ -30,7 +30,8 @@ from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, 
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
 import eval.eval_vox as eval_vox
-from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly, select_topk_keypoints
+from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly, select_topk_keypoints, \
+    extract_effective_points_from_pointweights, summarize_points_plus
 import wandb
 
 matplotlib.use("Agg")
@@ -494,7 +495,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             )
 
 
-            break  # for debug
+            # break  # for debug
         pbar.close()
         # at end of epoch
         losses.append(float(np.mean(batch_losses)))
@@ -609,6 +610,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 log_pc_overlay_plotly("viz/overlay_source_topk", gt_clean, rec_pts, kps=kp_topk,
                                     color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
+
+            eff_pts = extract_effective_points_from_pointweights(model_output, thresh=0.5)
+            print("EFFECTIVE POINTS: ", eff_pts.shape)
+            summarize_points_plus(eff_pts, name="eff_pts", norm_bounds=(-1,1), bins=24)
+            log_pc_overlay_plotly("rec/rec_topk_effective", None, eff_pts, kps=kp_topk,
+                                color_mode="source", step=iteration, point_size_rec=2)
+
             # --- scalar metrics to W&B (only if computed) ---
             metrics = {
                 "rec/dcd":        mean_dcd,
@@ -619,7 +627,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             }
             metrics = {k: v for k, v in metrics.items() if v is not None}
             if metrics:
-                wandb.log(metrics, step=epoch)
+                wandb.log(metrics, step=iteration)
 
 
 

@@ -276,12 +276,19 @@ class DLPDecoder(nn.Module):
         tau    = getattr(self, "topk_tau", 0.5)
         m, _   = self.soft_topk_mask(logits, k=k, tau=tau, hard=True)  # STE
 
+        # after: m, _ = self.soft_topk_mask(...)
+        with torch.no_grad():
+            # hard-ish count: how many objects are ~selected
+            sel_frac = (m.squeeze(-1) > 0.5).float().mean().item()
+            print(f"[decode_all] k={k}  ~selected-obj frac={sel_frac:.3f}  (tau={tau})")
+
+
         print("k: ", k)
         # 3) pass the mask to the object decoder (it already multiplies with obj_on)
         obj = self.decode_objects_pc(
             z_kp=z,
             z_features=z_features,
-            obj_on=obj_on,c
+            obj_on=obj_on,
             z_scale=z_scale,
             z_depth=z_depth,
             kp_mask=m.squeeze(-1)  # <--- USE THE MASK
@@ -312,6 +319,18 @@ class DLPDecoder(nn.Module):
             .expand(B, K, M, 1)                    # [B,K,M,1]
             .reshape(B, K*M, 1)                    # [B,K*M,1]
         ).to(obj["points_obj"].dtype)
+
+
+        with torch.no_grad():
+            B,K = m.shape[:2]
+            M   = obj["points_obj"].shape[2]
+            # Effective number of object points (soft)
+            eff_obj_pts_per_batch = obj_weights_per_point.sum(dim=1).squeeze(-1)  # [B]
+            # Raw object points generated per batch (unmasked)
+            raw_obj_pts = torch.full((B,), K*M, device=m.device, dtype=eff_obj_pts_per_batch.dtype)
+            print(f"[decode_all] raw_obj_pts={int(raw_obj_pts[0].item())}  "
+                f"eff_obj_pts≈{eff_obj_pts_per_batch[0].item():.1f}  "
+                f"(per batch example 0)")
 
         return {
             "points_scene": pts_scene,

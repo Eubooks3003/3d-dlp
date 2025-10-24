@@ -278,11 +278,13 @@ def log_pc_overlay_plotly(
         ))
 
     if R is not None and R.size:
+        npts = R.shape[0] if hasattr(R, "shape") else len(R)
+        print(f"Plotting REC points: {npts} (array size={R.size})")
         fig.add_trace(go.Scatter3d(
             x=R[:,0], y=R[:,1], z=R[:,2],
             mode="markers",
-            marker=dict(size=point_size_rec, opacity=opacity_rec, color=rec_color),
-            name="REC"
+            marker=dict(size=4, opacity=1.0, color=rec_color),  # bigger & opaque to see them
+            name=f"REC (N={npts})"
         ))
 
     if K is not None and K.size:
@@ -359,3 +361,140 @@ def select_topk_keypoints(model_output, topk, prefer_logvar=True, eps=1e-8):
     model_output['kp_topk'] = kp_topk
     model_output['kp_scores_topk'] = scores_topk
     return idx, kp_topk, scores_topk
+
+
+def _as_cpu_np(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().float().cpu()
+        return x
+    return torch.tensor(x, dtype=torch.float32)
+
+import numpy as np
+
+def summarize_points(pts: torch.Tensor, name="eff_pts", norm_bounds=(-1, 1)):
+    if pts is None or pts.numel() == 0:
+        print(f"[{name}] EMPTY")
+        return
+
+    A = pts.detach().float().cpu().numpy()   # [N,3]
+    finite_rows = np.isfinite(A).all(axis=1)
+    A = A[finite_rows]
+
+    if A.size == 0:
+        print(f"[{name}] no finite rows")
+        return
+
+    N = A.shape[0]
+    pmin = np.nanmin(A, axis=0)
+    pmax = np.nanmax(A, axis=0)
+    pmean = np.nanmean(A, axis=0)
+    pstd  = np.nanstd(A, axis=0)
+    q01, q25, q50, q75, q99 = np.nanpercentile(A, [1, 25, 50, 75, 99], axis=0)
+
+    lo, hi = norm_bounds
+    outside = np.mean((A < lo).any(axis=1) | (A > hi).any(axis=1))
+    extent = (pmax - pmin)
+    bbox_vol = float(np.prod(extent))
+
+    print(f"[{name}] N={N} (finite rows)")
+    print(f"[{name}] min      : {pmin}")
+    print(f"[{name}] max      : {pmax}")
+    print(f"[{name}] mean     : {pmean}")
+    print(f"[{name}] std      : {pstd}")
+    print(f"[{name}] q01/q25  : {q01} / {q25}")
+    print(f"[{name}] q50/q75  : {q50} / {q75}")
+    print(f"[{name}] q99      : {q99}")
+    print(f"[{name}] extent   : {extent}  bbox_vol≈{bbox_vol:.4f}")
+    print(f"[{name}] frac outside {norm_bounds}: {outside:.3f}")
+
+def extract_effective_points_from_pointweights(model_output, b=0, thresh=0.5, include_bg=False):
+    pts_scene = model_output["points_scene"]      # [B, Mtot, 3]
+    w_points  = model_output["point_weights"]     # [B, K*M, 1]  (obj-only)
+
+    B, Mtot, _ = pts_scene.shape
+    KM = w_points.shape[1]
+    Mbg = Mtot - KM
+
+    obj_pts_scene = pts_scene[b, -KM:, :]                  # [KM,3]
+    keep = (w_points[b].squeeze(-1).detach() > thresh)     # [KM]
+
+    if include_bg:
+        bg_pts = pts_scene[b, :Mbg, :]
+        eff_pts = torch.cat([bg_pts, obj_pts_scene[keep]], dim=0)
+    else:
+        eff_pts = obj_pts_scene[keep]
+
+    # finite-only for summaries
+    mask_finite = torch.isfinite(eff_pts).all(dim=1)
+    eff_f = eff_pts[mask_finite]
+
+    print(f"[viz] b={b}: Mbg={Mbg}, KM={KM}, kept={keep.sum().item()}, "
+          f"finite={mask_finite.sum().item()}, out={tuple(eff_pts.shape)}")
+
+    return eff_pts
+
+
+def _nn_dists(a: torch.Tensor, k=4, max_sample=5000):
+    """
+    Return per-point distances to 1st..kth nearest neighbors (excluding self).
+    Subsample if too many points to keep it cheap.
+    """
+    if a.numel() == 0:
+        return None
+    x = a
+    if x.shape[0] > max_sample:
+        idx = torch.randperm(x.shape[0], device=x.device)[:max_sample]
+        x = x[idx]
+    with torch.no_grad():
+        # [m,m]
+        D = torch.cdist(x, x, p=2)
+        D[torch.arange(D.shape[0], device=D.device), torch.arange(D.shape[0], device=D.device)] = float('inf')
+        # sort along neighbors
+        vals, _ = torch.topk(D, k=k, largest=False, dim=1)
+    return vals  # [m,k]
+
+def _grid_occupancy(a: torch.Tensor, bounds=(-1,1), bins=20):
+    """
+    Count how many voxels are occupied by at least 1 point.
+    """
+    if a.numel() == 0:
+        return 0, 0
+    lo, hi = bounds
+    x = a.clamp(lo, hi)  # keep inside for indexing
+    # map to [0,bins)
+    g = ((x - lo) / (hi - lo) * bins).floor().clamp_min(0).clamp_max(bins-1).long()  # [N,3]
+    # unique voxels
+    uniq = torch.unique(g, dim=0)
+    return int(uniq.shape[0]), int(bins**3)
+
+def summarize_points_plus(pts: torch.Tensor, name="eff_pts", norm_bounds=(-1,1), bins=20):
+    # your original summary:
+    summarize_points(pts, name=name, norm_bounds=norm_bounds)
+
+    # extra: NN distances & occupancy
+    if pts is None or pts.numel() == 0:
+        return
+    mask_f = torch.isfinite(pts).all(dim=1)
+    X = pts[mask_f]
+    if X.numel() == 0:
+        print(f"[{name}] no finite rows for extras")
+        return
+
+    # kNN distances
+    knn = _nn_dists(X, k=4)
+    if knn is not None:
+        d1 = knn[:,0].cpu().numpy()
+        d2 = knn[:,1].cpu().numpy()
+        print(f"[{name}/kNN] N={len(d1)} | d1: mean={d1.mean():.4f}, med={np.median(d1):.4f}, "
+              f"p1={np.percentile(d1,1):.4f}, p99={np.percentile(d1,99):.4f}")
+        print(f"[{name}/kNN] d2: mean={d2.mean():.4f}, med={np.median(d2):.4f}")
+
+        # crude “are they piled up?” signal
+        tiny = (d1 < 1e-2).mean()
+        small = (d1 < 5e-2).mean()
+        print(f"[{name}/kNN] frac d1<1e-2: {tiny:.3f}, d1<5e-2: {small:.3f}")
+
+    # occupancy
+    occ, total = _grid_occupancy(X, bounds=norm_bounds, bins=bins)
+    print(f"[{name}/occ] occupied voxels: {occ}/{total} "
+          f"({occ/total:.3f}) at {bins}^3 grid")

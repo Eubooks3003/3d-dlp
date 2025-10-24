@@ -20,7 +20,8 @@ from modules.modules import DLPDynamics
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \
-    ChamferLossKL, estimate_curvature, kp_separation_loss, coverage_loss, repulsion_loss, chamfer_l2_weighted, estimate_normals_pca, density_aware_chamfer
+    ChamferLossKL, estimate_curvature, kp_separation_loss, coverage_loss, repulsion_loss, chamfer_l2_weighted, \
+                estimate_normals_pca, density_aware_chamfer, weighted_dcd, repulsion_loss_weighted_knn, coverage_loss_weighted
 from utils.pc_utils import downsample_points_fixed
 from modules.vision_modules import rgb_to_minusoneone, minusoneone_to_rgb
 
@@ -1270,6 +1271,9 @@ class VoxelDLP(nn.Module):
         # vox_obj  = dec.get('obj_vols', None)  # e.g. [B,K,C,D,H,W] if you expose per-object volumes
 
         points_scene = dec.get('points_scene', None)
+        points_obj = dec.get('points_obj', None)
+        obj_weights = dec.get('obj_weights', None)
+        points_weights = dec.get('point_weights', None)
 
         # -------- Pack outputs --------
         output_dict = {
@@ -1298,7 +1302,10 @@ class VoxelDLP(nn.Module):
 
             # 'rec_vox': rec_vox,
             'points_scene': points_scene,
+            'points_obj': points_obj,
             'pts_norm': pts_norm,
+            'point_weights': points_weights,
+            'obj_weights': obj_weights,
             # 'vox_bg':  vox_bg,
             # 'vox_obj': vox_obj,
             # give the loss direct access to the GT dense voxel grid:
@@ -1872,61 +1879,71 @@ class VoxelDLP(nn.Module):
         return loss_dict
     def calc_static_elbo_pc(
         self,
-        x,                           # [B, N, 3(+C)]
-        model_output,                # forward() dict
-        mask_pc=None,                # [B, N] bool
+        x,                              # [B, N, 3(+C)]
+        model_output,                   # forward() dict
+        mask_pc=None,                   # [B, N] bool
         warmup=False,
-        beta_kl=0.05,                # keep old default
+        beta_kl=0.05,
         beta_rec=1.0,
         beta_obj=0.0,
         use_kl_mask=True,
         apply_mask_on_obj_on=False,
-        balance=0.5,                 # kept for categorical KL if you use it elsewhere
+        balance=0.5,
         color_weight=0.0,
-        obj_weights=None,
 
-        # DCD controls (new)
-        dcd_scale=1.0,               # replaces hard 10x; anneal this in the loop if desired
-        dcd_tau=None,                # None => auto tau
-        dcd_freq_temp=1.0,           # 1.0 is standard
+        # DCD controls
+        dcd_scale=1.0,
+        dcd_tau=None,
+        dcd_freq_temp=1.0,
 
-        # optional smoothers (same as old; you can set their weights inline below)
-        use_repulsion=False,
-        use_coverage=False,
+        # optional extras
+        use_repulsion=True,
+        use_coverage=True,
         use_normals=False,
+
+        # weighting controls
+        rec_weight_stopgrad=True,       # detach point/object weights in recon 
+        eps=1e-8,
     ):
         import torch
         import torch.nn.functional as F
 
-        # ---- unpack (names kept from old) ----
-        kp_p             = model_output['kp_p']              # [B,K,3]
-        z_base           = model_output['z_base']            # [B,K,3]
-        z                = model_output['z']                 # [B,K,3]
-        mu_tot           = model_output.get('mu_tot', z)     # fallback if not provided
-        z_base_var       = model_output.get('z_base_var', None)
+        # ---------- unpack ----------
+        B = x.size(0)
+        kp_p            = model_output['kp_p']                 # [B,K,3]
+        z               = model_output['z']                    # [B,K,3]
+        mu_tot          = model_output.get('mu_tot', z)
+        z_base          = model_output['z_base']               # [B,K,3]
+        z_base_var      = model_output.get('z_base_var', None)
 
-        mu_scale         = model_output['mu_scale']          # [B,K,3]
-        logvar_scale     = model_output.get('logvar_scale', None)
-        mu_features      = model_output.get('feat_mu', model_output['mu_features'])
-        logvar_features  = model_output.get('feat_logvar', model_output.get('logvar_features', None))
-        mu_bg            = model_output.get('mu_bg_features', None)
-        logvar_bg        = model_output.get('logvar_bg_features', None)
+        mu_scale        = model_output['mu_scale']             # [B,K,3]
+        logvar_scale    = model_output.get('logvar_scale', None)
+        mu_features     = model_output.get('feat_mu', model_output['mu_features'])
+        logvar_features = model_output.get('feat_logvar', model_output.get('logvar_features', None))
+        mu_bg           = model_output.get('mu_bg_features', None)
+        logvar_bg       = model_output.get('logvar_bg_features', None)
 
-        obj_on           = model_output.get('obj_on', model_output.get('z_obj_on', None))  # [B,K,1] or None
-        kp_mask_bool     = model_output.get('kp_mask', None) # [B,K] bool
+        obj_on          = model_output.get('obj_on', model_output.get('z_obj_on', None))  # [B,K,1] or None
+        kp_mask_bool    = model_output.get('kp_mask', None)       # [B,K] bool from encoder (optional)
 
-        pts_scene        = model_output['points_scene']      # [B,M,3]
-        rgb_scene        = model_output.get('rgb_scene', None)
+        pts_scene       = model_output['points_scene']           # [B, M_tot, 3]
+        pts_bg          = model_output.get('points_bg', None)    # [B, M_bg, 3]
+        pts_obj         = model_output.get('points_obj', None)   # [B, K, M, 3]
+        rgb_scene       = model_output.get('rgb_scene', None)
 
-        # ---- inputs ----
+        # soft selection weights from decoder
+        m_obj           = model_output.get('obj_weights', None)      # [B,K,1] (values in [0,1])
+        w_points_obj    = model_output.get('point_weights', None)    # [B,K*M,1] per-point weights for objects
+
+        # ---------- inputs ----------
         if x.size(-1) < 3:
             raise ValueError(f"x[..., :3] expected coords, got last dim={x.size(-1)}")
         x_pts = x[..., :3]
         if mask_pc is None:
             mask_pc = torch.ones(x_pts.shape[:2], dtype=torch.bool, device=x.device)
 
-        # ---- gates & denom (from old loss) ----
-        def denom(m):  # normalize by active count (per-batch)
+        # ---------- helper gates ----------
+        def denom(m):                                # normalize by active count
             return m.sum(dim=-1).clamp_min(1.0)
 
         if kp_mask_bool is None:
@@ -1939,14 +1956,52 @@ class VoxelDLP(nn.Module):
         else:
             obj_on_s = torch.ones_like(w_kp)
 
+        # KL gate starts as encoder's kp-mask * obj_on (if requested)
         kl_gate = w_kp * (obj_on_s if use_kl_mask else 1.0)  # [B,K]
 
-        # ---- Reconstruction (DCD, mask-aware normalization like old) ----
-        # We compute a DCD per-batch value (returns [B]) and mean it, mirroring your old reduction.
-        dcd_batch = density_aware_chamfer(pts_scene, x_pts, tau=dcd_tau, freq_temp=dcd_freq_temp)  # [B]
+        # Also gate KLs by the decoder's soft top-k (DETACHED for stability)
+        if m_obj is not None:
+            m_det = m_obj.squeeze(-1).detach() if rec_weight_stopgrad else m_obj.squeeze(-1)
+            # rescale to [0,1], keep shape [B,K]
+            kl_gate = kl_gate * m_det
+
+        # ---------- reconstruction weighting (soft top-k) ----------
+        # Build per-predicted-point weights for the *scene*:
+        #   - background points always have weight 1
+        #   - object points use provided soft weights
+        if w_points_obj is not None and pts_bg is not None:
+            ones_bg = torch.ones(pts_bg.shape[:2] + (1,), device=pts_bg.device, dtype=pts_bg.dtype)  # [B,M_bg,1]
+            w_pred_points = torch.cat([ones_bg, w_points_obj], dim=1)  # [B, M_tot, 1]
+        elif w_points_obj is not None:
+            w_pred_points = w_points_obj
+        else:
+            w_pred_points = torch.ones(pts_scene.shape[:2] + (1,), device=pts_scene.device, dtype=pts_scene.dtype)
+
+        if rec_weight_stopgrad:
+            w_pred_points = w_pred_points.detach()
+
+        # Normalize weights per-batch so the overall scale stays comparable across k
+        w_norm = w_pred_points.sum(dim=1, keepdim=True).clamp_min(1.0)   # [B,1,1]
+        w_pred_points_n = w_pred_points / w_norm                         # sum to ~1.0
+
+        B, Mtot, _ = pts_scene.shape
+        KM = w_points_obj.shape[1] if (w_points_obj is not None) else 0
+        Mbg = Mtot - KM
+        device = pts_scene.device
+        dtype  = pts_scene.dtype
+
+        if w_points_obj is None:
+            # no per-point weights provided → default to ones on the whole scene
+            w_pred = torch.ones(B, Mtot, 1, device=device, dtype=dtype)
+        else:
+            # bg points come first in pts_scene; give them weight=1 (or smaller if you want to downweight bg)
+            w_bg = torch.ones(B, Mbg, 1, device=device, dtype=dtype)
+            w_pred_points_n = torch.cat([w_bg, w_pred_points_n], dim=1)        # [B, Mtot, 1]
+
+        dcd_batch = weighted_dcd(pts_scene, x_pts, w_pred=w_pred_points_n, tau=dcd_tau, freq_temp=dcd_freq_temp, eps=eps)  # [B]
         loss_rec_geom = (dcd_scale * dcd_batch).mean()
 
-        # optional color (same logic as old)
+        # ---------- optional color ----------
         loss_rec_color = torch.tensor(0.0, device=x.device)
         if color_weight > 0.0 and rgb_scene is not None and x.size(-1) >= 6:
             x_rgb = x[..., 3:6]
@@ -1954,18 +2009,45 @@ class VoxelDLP(nn.Module):
                 d = torch.cdist(pts_scene, x_pts, p=2)      # [B,M,N]
                 nn_idx = d.argmin(dim=-1)                   # [B,M]
             nn_rgb = torch.gather(x_rgb, dim=1, index=nn_idx.unsqueeze(-1).expand(-1, -1, 3))
-            loss_rec_color = F.mse_loss(rgb_scene, nn_rgb, reduction='mean')
+            # weight the RGB error per predicted point as well
+            rgb_err = (rgb_scene - nn_rgb).pow(2).mean(-1, keepdim=True)  # [B,M,1]
+            rgb_err = (rgb_err * w_pred_points_n).sum(dim=1).mean()       # scalar
+            loss_rec_color = rgb_err
 
-        # (optional) extras from old loss — wire in only if requested
+        # ---------- extras ----------
         loss_repulsion = torch.tensor(0.0, device=x.device)
         loss_cov       = torch.tensor(0.0, device=x.device)
         loss_norm      = torch.tensor(0.0, device=x.device)
 
-        if use_repulsion and 'repulsion_loss' in globals():
-            loss_repulsion = repulsion_loss(pts_scene, k=8, r_frac=0.01)
+        # unpack
+        pts_scene   = model_output['points_scene']          # [B, Mtot, 3]
+        pts_obj     = model_output['points_obj']            # [B, K, M, 3]
+        w_point     = model_output.get('point_weights', None)  # [B, K*M, 1]
 
-        if use_coverage and 'coverage_loss' in globals():
-            loss_cov = coverage_loss(pts_scene, x_pts, mask_pc, tau=0.01).mean()
+        # ===== repulsion =====
+        if use_repulsion:
+            # work on OBJ points only, flattened
+            B,K,M,_ = pts_obj.shape
+            P = pts_obj.reshape(B, K*M, 3)
+            if w_point is None:
+                W = None
+            else:
+                W = w_point                                   # [B, K*M, 1]
+            loss_repulsion = repulsion_loss_weighted_knn(
+                P, w=W, k=6, r=0.03, tile=4096, stopgrad_w=True
+            )
+        else:
+            loss_repulsion = torch.tensor(0.0, device=x.device)
+
+        # ===== coverage =====
+        if use_coverage:
+            # coverage should compare to GT points x_pts
+            loss_cov = coverage_loss_weighted(
+                P_pred=P, W_pred=W, P_gt=x_pts,
+                max_pred=12000, max_gt=12000, stopgrad_w=True
+            )
+        else:
+            loss_cov = torch.tensor(0.0, device=x.device)
 
         if use_normals and 'estimate_normals_pca' in globals():
             with torch.no_grad():
@@ -1976,7 +2058,7 @@ class VoxelDLP(nn.Module):
             n_in  = estimate_normals_pca(x_pts, k=16)
             loss_norm = (1.0 - (n_in * n_tgt).sum(dim=-1).abs()).mean()
 
-        # weights for the geom bundle (keep your old vibe; start modest)
+        # modest weights
         w_repulsion = 0.01
         w_cov       = 0.2
         w_norm      = 0.1
@@ -1988,66 +2070,59 @@ class VoxelDLP(nn.Module):
 
         loss_rec = loss_geom_total + color_weight * loss_rec_color
 
-        # ---- Priors/buffers (same names as old) ----
+        # ---------- Priors / KLs (gate by selection) ----------
         logvar_kp      = getattr(self, 'logvar_kp', None)
         obj_on_a_prior = getattr(self, 'obj_on_a_p', None)
         obj_on_b_prior = getattr(self, 'obj_on_b_p', None)
         mu_scale_prior = getattr(self, 'mu_scale_prior', None)
         logvar_scale_p = getattr(self, 'logvar_scale_p', None)
 
-        # ---- KL: positions (same gating/normalization as old) ----
         loss_kl_kp = torch.tensor(0.0, device=x.device)
         if logvar_kp is not None:
-            mu_post = mu_tot                                      # [B,K,3]
-            mu_prior_full     = kp_p                              # [B,K,3]
-            logvar_prior_full = logvar_kp.expand_as(mu_prior_full)
-
-            # align K if needed (old rule)
-            if mu_prior_full.shape[1] != mu_post.shape[1]:
+            mu_post = mu_tot
+            mu_prior = kp_p
+            logvar_prior = logvar_kp.expand_as(mu_prior)
+            if mu_prior.shape[1] != mu_post.shape[1]:
                 K_post = mu_post.shape[1]
-                if (z_base_var is not None) and (z_base_var.shape[1] == mu_prior_full.shape[1]):
-                    total_var = z_base_var.sum(-1)               # [B,K]
+                if (z_base_var is not None) and (z_base_var.shape[1] == mu_prior.shape[1]):
+                    total_var = z_base_var.sum(-1)
                     _, keep_idx = torch.topk(total_var, k=K_post, dim=-1, largest=False)
-                    b = torch.arange(mu_prior_full.size(0), device=mu_prior_full.device)[:, None]
-                    mu_prior     = mu_prior_full[b, keep_idx]
-                    logvar_prior = logvar_prior_full[b, keep_idx]
+                    b = torch.arange(mu_prior.size(0), device=mu_prior.device)[:, None]
+                    mu_prior     = mu_prior[b, keep_idx]
+                    logvar_prior = logvar_prior[b, keep_idx]
                     kl_gate_use  = kl_gate[b, keep_idx] if kl_gate.shape[1] != K_post else kl_gate
                 else:
-                    mu_prior     = mu_prior_full[:, :K_post]
-                    logvar_prior = logvar_prior_full[:, :K_post]
+                    mu_prior     = mu_prior[:, :K_post]
+                    logvar_prior = logvar_prior[:, :K_post]
                     kl_gate_use  = kl_gate[:, :K_post]
             else:
-                mu_prior     = mu_prior_full
-                logvar_prior = logvar_prior_full
-                kl_gate_use  = kl_gate
+                kl_gate_use = kl_gate
 
             logvar_post = torch.zeros_like(mu_post)
             kl_kp = 0.5 * (
                 (mu_post - mu_prior) ** 2 / torch.exp(logvar_prior)
                 + torch.exp(logvar_post - logvar_prior)
                 + (logvar_prior - logvar_post) - 1.0
-            ).sum(dim=-1)                                        # [B,K]
-
-            kl_kp = (kl_kp * kl_gate_use).sum(dim=-1) / denom(kl_gate_use)  # [B]
+            ).sum(dim=-1)  # [B,K]
+            kl_kp = (kl_kp * kl_gate_use).sum(dim=-1) / denom(kl_gate_use)
             loss_kl_kp = kl_kp.mean()
 
-        # ---- KL: scale (mask + normalize) ----
         loss_kl_scale = torch.tensor(0.0, device=x.device)
         if (logvar_scale is not None) and (logvar_scale_p is not None) and (mu_scale_prior is not None):
             kl_scale = 0.5 * (
                 (mu_scale - mu_scale_prior) ** 2 / torch.exp(logvar_scale_p)
                 + torch.exp(logvar_scale) / torch.exp(logvar_scale_p)
                 - (logvar_scale - logvar_scale_p) - 1.0
-            ).sum(dim=-1)                                        # [B,K]
-            kl_scale = (kl_scale * kl_gate).sum(dim=-1) / denom(kl_gate)     # [B]
+            ).sum(dim=-1)  # [B,K]
+            kl_scale = (kl_scale * kl_gate).sum(dim=-1) / denom(kl_gate)
             loss_kl_scale = kl_scale.mean()
 
-        # ---- KL: features (FG+BG), mask-aware like old ----
+        # FG/BG feature KLs
         if logvar_features is None:
             kl_feat_obj = 0.5 * (mu_features ** 2).sum(dim=-1)              # [B,K]
         else:
             kl_feat_obj = 0.5 * ((mu_features ** 2) + torch.exp(logvar_features) - logvar_features - 1.0).sum(dim=-1)
-        kl_feat_obj = (kl_feat_obj * kl_gate).sum(dim=-1) / denom(kl_gate)  # [B]
+        kl_feat_obj = (kl_feat_obj * kl_gate).sum(dim=-1) / denom(kl_gate)
         kl_feat_obj = kl_feat_obj.mean()
 
         if mu_bg is None:
@@ -2060,27 +2135,26 @@ class VoxelDLP(nn.Module):
 
         loss_kl_feat = kl_feat_obj + kl_feat_bg
 
-        # ---- KL: obj_on (Beta) ----
+        # obj_on (Beta) KL — gate if requested
         loss_kl_obj_on = torch.tensor(0.0, device=x.device)
-        if (obj_on_a_prior is not None) and (obj_on_b_prior is not None) and \
+        if (getattr(self, 'obj_on_a_p', None) is not None) and (getattr(self, 'obj_on_b_p', None) is not None) and \
         ('obj_on_a' in model_output) and ('obj_on_b' in model_output):
             a_post = model_output['obj_on_a']   # [B,K,1]
             b_post = model_output['obj_on_b']   # [B,K,1]
-            kl_beta = calc_kl_beta_dist(a_post, b_post, obj_on_a_prior, obj_on_b_prior).squeeze(-1)  # [B,K]
+            kl_beta = calc_kl_beta_dist(a_post, b_post, self.obj_on_a_p, self.obj_on_b_p).squeeze(-1)  # [B,K]
             if apply_mask_on_obj_on:
-                kl_beta = (kl_beta * kl_gate).sum(dim=-1) / denom(kl_gate)  # [B]
+                kl_beta = (kl_beta * kl_gate).sum(dim=-1) / denom(kl_gate)
             else:
                 kl_beta = kl_beta.mean(dim=-1)
             loss_kl_obj_on = kl_beta.mean()
 
-        # ---- presence regularizers (mask-aware; same as old) ----
+        # presence regularizer (as before)
         active_count = (obj_on_s * w_kp).sum(dim=-1)  # [B]
-        obj_on_l1 = (obj_on_s * w_kp).sum(dim=-1) / denom(w_kp)  # [B]
+        obj_on_l1 = (obj_on_s * w_kp).sum(dim=-1) / denom(w_kp)
         obj_on_l1 = obj_on_l1.mean()
+        loss_obj_reg = (active_count ** 2).mean()
 
-        loss_obj_reg = (active_count ** 2).mean()  # + (tiny kp-sep if you want)
-
-        # ---- total ----
+        # ---------- total ----------
         loss_kl_total = loss_kl_kp + loss_kl_scale + loss_kl_feat + loss_kl_obj_on
         loss = beta_rec * loss_rec + beta_kl * loss_kl_total + beta_obj * loss_obj_reg
 
