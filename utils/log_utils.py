@@ -110,3 +110,88 @@ def plot_grad_flow(named_params, step):
     plt.xlabel("layers"); plt.tight_layout()
     wandb.log({"debug/grad_flow": wandb.Image(plt)}, step=step)
     plt.close()
+
+
+
+def wandb_log_iter_losses(all_losses, iteration):
+    """Log per-iteration scalar losses to wandb."""
+    flat = {}
+    for k, v in all_losses.items():
+        if v is None: 
+            continue
+        try:
+            flat[f"loss/{k}"] = float(v.detach().mean().item())
+        except Exception:
+            pass
+    if flat:
+        wandb.log(flat, step=iteration)
+
+
+def topk_indices_from_output(model_output, k):
+    """
+    Choose top-k particles per batch using (in order of preference):
+      obj_on (expected presence) → mu_score → z_score → fallback uniform.
+    Returns LongTensor [B, k] of indices.
+    """
+    # obj_on can be probs/logits depending on your encoder; we accept either.
+    obj_on = model_output.get("obj_on", None)      # [B,K,1] or [B,K]
+    mu_score = model_output.get("mu_score", None)  # [B,K,1]
+    z_score  = model_output.get("z_score", None)   # [B,K,1]
+    B, K = None, None
+
+    def _shape2(x):
+        if x is None: return None
+        return x.squeeze(-1) if x.dim() == 3 and x.size(-1) == 1 else x
+
+    cand = None
+    for s in (_shape2(obj_on), _shape2(mu_score), _shape2(z_score)):
+        if s is not None:
+            cand = s
+            break
+
+    if cand is None:
+        # fallback: all equal scores
+        K = model_output["z"].size(1)
+        B = model_output["z"].size(0)
+        return torch.arange(K, device=model_output["z"].device).unsqueeze(0).repeat(B, 1)[:, :k]
+
+    B, K = cand.shape
+    k = min(k, K)
+    vals, idx = torch.topk(cand, k=k, dim=1, largest=True)
+    return idx
+
+
+def render_kp_projections(kp_xyz, topk_idx=None, title="kps", step=None):
+    """
+    kp_xyz: [B,K,3] in [-1,1].
+    If topk_idx=[B,k], highlights top-k per batch.
+    Logs a matplotlib figure to wandb (one per batch element).
+    """
+    import matplotlib.pyplot as plt
+
+    B, K, _ = kp_xyz.shape
+    for b in range(B):
+        xy = kp_xyz[b, :, [0,1]].detach().cpu().numpy()
+        xz = kp_xyz[b, :, [0,2]].detach().cpu().numpy()
+        yz = kp_xyz[b, :, [1,2]].detach().cpu().numpy()
+
+        sel = None
+        if topk_idx is not None:
+            sel = topk_idx[b].detach().cpu().numpy()
+
+        fig, axs = plt.subplots(1, 3, figsize=(9, 3), dpi=120)
+        for ax, pts, axlbl in zip(
+            axs,
+            [xy, xz, yz],
+            ["XY", "XZ", "YZ"]
+        ):
+            ax.scatter(pts[:,0], pts[:,1], s=8, alpha=0.6)
+            if sel is not None and sel.size > 0:
+                ax.scatter(pts[sel,0], pts[sel,1], s=18, marker="x")
+            ax.set_xlim([-1,1]); ax.set_ylim([-1,1])
+            ax.set_aspect("equal")
+            ax.set_title(axlbl)
+            ax.axis("off")
+        plt.suptitle(title)
+        wandb.log({f"viz/{title}_b{b}": wandb.Image(fig)}, step=step)
+        plt.close(fig)

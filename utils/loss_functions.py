@@ -655,6 +655,161 @@ def chamfer_l2_weighted(p, q, q_mask=None, q_weights=None):
     term_qp = (d_qp * qw).sum(dim=-1)                            # [B]
     return 0.5 * (term_pq + term_qp)
 
+import torch
+import torch.nn.functional as F
+
+def _nn_assign(a, b):
+    """
+    a: [B,Na,3], b: [B,Nb,3]
+    Returns:
+      idx: [B,Na]   nearest neighbor index in b for each a_i
+      d   : [B,Na]  L2 distance (not squared)
+    """
+    # pairwise squared distances
+    a2 = (a*a).sum(-1, keepdim=True)                   # [B,Na,1]
+    b2 = (b*b).sum(-1).unsqueeze(1)                    # [B,1,Nb]
+    ab = a @ b.transpose(1, 2)                         # [B,Na,Nb]
+    d2 = (a2 + b2 - 2*ab).clamp_min(0.0)
+    idx = d2.argmin(dim=2)                             # [B,Na]
+    d = d2.gather(2, idx.unsqueeze(-1)).sqrt().squeeze(-1)  # [B,Na]
+    return idx, d
+
+def _query_frequency(idx, Nb):
+    """
+    idx: [B,Na] (indices in [0..Nb-1])
+    Returns:
+      q: [B,Nb] counts per target point
+    """
+    B, Na = idx.shape
+    q = torch.zeros(B, Nb, device=idx.device, dtype=torch.float32)
+    q.scatter_add_(1, idx, torch.ones_like(idx, dtype=torch.float32))
+    # avoid zero for points never queried (kept as 0; we won't index them then)
+    return q.clamp_min(1.0)
+
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def _batch_tau_from_medians(pred, gt):
+    # robust per-batch scale from NN dists (both directions), floored
+    # pred:[B,Np,3], gt:[B,Ng,3]
+    d_pg = torch.cdist(pred, gt, p=2).min(dim=2).values   # [B,Np]
+    d_gp = torch.cdist(gt, pred, p=2).min(dim=2).values   # [B,Ng]
+    med = 0.5 * (d_pg.median(dim=1).values + d_gp.median(dim=1).values)  # [B]
+    med = torch.nan_to_num(med, nan=1e-2, posinf=1.0, neginf=1e-4)
+    return med.clamp_min(1e-3).unsqueeze(-1)  # [B,1]
+
+def density_aware_chamfer(pred, gt, tau=None, freq_temp=1.0, eps=1e-6):
+    """
+    Stable DCD (Wu et al., NeurIPS'21) with clamps/nan guards.
+    pred, gt: [B,N,3] (already downsampled)
+    tau: None -> per-batch auto; else float or [B,1]
+    """
+    # sanitize inputs
+    pred = torch.nan_to_num(pred, nan=0.0, posinf=1e3, neginf=-1e3).clamp_(-2.0, 2.0)
+    gt   = torch.nan_to_num(gt,   nan=0.0, posinf=1e3, neginf=-1e3).clamp_(-2.0, 2.0)
+
+    B, Np, _ = pred.shape
+    Ng       = gt.shape[1]
+
+    # NN assignments (both directions)
+    d_pg = torch.cdist(pred, gt, p=2)                    # [B,Np,Ng]
+    d_gp = torch.cdist(gt, pred, p=2)                    # [B,Ng,Np]
+    dp  = d_pg.min(dim=2).values                         # [B,Np]
+    dg  = d_gp.min(dim=2).values                         # [B,Ng]
+    idx_pg = d_pg.argmin(dim=2)                          # [B,Np]
+    idx_gp = d_gp.argmin(dim=2)                          # [B,Ng]
+
+    # query frequency
+    qg = torch.zeros(B, Ng, device=gt.device, dtype=gt.dtype)
+    qp = torch.zeros(B, Np, device=pred.device, dtype=pred.dtype)
+    qg.scatter_add_(1, idx_pg, torch.ones_like(idx_pg, dtype=gt.dtype))
+    qp.scatter_add_(1, idx_gp, torch.ones_like(idx_gp, dtype=pred.dtype))
+    w_pg = 1.0 / (torch.pow(qg.gather(1, idx_pg), freq_temp) + eps)  # [B,Np]
+    w_gp = 1.0 / (torch.pow(qp.gather(1, idx_gp), freq_temp) + eps)  # [B,Ng]
+
+    # tau
+    if tau is None:
+        tau_val = _batch_tau_from_medians(pred, gt)                 # [B,1]
+    else:
+        tau_val = torch.as_tensor(tau, device=pred.device, dtype=pred.dtype).view(1, 1).clamp_min(1e-3)
+
+    # bounded cost
+    c_pg = 1.0 - torch.exp(-dp / (tau_val + eps))                   # [B,Np]
+    c_gp = 1.0 - torch.exp(-dg / (tau_val + eps))                   # [B,Ng]
+
+    term_pg = (w_pg * c_pg).mean(dim=1)                             # [B]
+    term_gp = (w_gp * c_gp).mean(dim=1)                             # [B]
+    return 0.5 * (term_pg + term_gp)                                # [B]
+
+
+def repulsion_loss(pts, h=0.02):
+    """
+    Light repulsion to prevent clumping (optional).
+    pts: [B,N,3]
+    """
+    B, N, _ = pts.shape
+    if N < 2: return pts.sum()*0.0
+    # quick block-wise approximation: sample K neighbors via random shuffle
+    idx = torch.randperm(N, device=pts.device)
+    nbr = pts[:, idx, :]
+    d2 = ((pts - nbr)**2).sum(-1)
+    return F.relu(h*h - d2).mean()
+
+def calc_pc_dcd_loss(model_output,
+                     pts_gt,                 # [B, N, 3] (you said you’ll pre-downsample to N)
+                     *,
+                     use_color=False,
+                     rgb_gt=None,            # [B, N, 3] if use_color
+                     w_color=0.0,
+                     w_repulsion=0.05,
+                     tau=None,
+                     freq_temp=1.0,
+                     kl_static=None, w_kl=0.0,
+                     loss_obj_reg=None, w_obj=0.0):
+    """
+    Returns: total_loss, dict_of_terms
+    Expects in model_output:
+      - 'points_scene': [B, N, 3]
+      - optional 'rgb_scene': [B, N, 3]
+    """
+    pts_pred = model_output["points_scene"]            # [B, N, 3]
+
+    # DCD recon
+    loss_rec = density_aware_chamfer(pts_pred, pts_gt, tau=tau, freq_temp=freq_temp)
+
+    # Optional: color via NN from pred->gt (uses same NN as inside DCD semantics)
+    loss_color = pts_pred.sum()*0.0
+    if use_color and (rgb_gt is not None) and ("rgb_scene" in model_output):
+        # reuse NN by recomputing pred->gt indices once (cheap)
+        idx_pg, _ = _nn_assign(pts_pred, pts_gt)      # [B, N]
+        rgb_pred = model_output["rgb_scene"]          # [B, N, 3]
+        rgb_match = pts_gt.new_empty(rgb_pred.shape)  # [B, N, 3]
+        rgb_match.scatter_(1, torch.arange(rgb_pred.size(1), device=pts_pred.device)[None, :, None].expand_as(rgb_pred),
+                           rgb_gt.gather(1, idx_pg.unsqueeze(-1).expand(-1, -1, 3)))
+        loss_color = F.l1_loss(rgb_pred, rgb_match)
+
+    # Optional: repulsion (keeps spawned points from collapsing)
+    loss_rep = repulsion_loss(pts_pred) if w_repulsion > 0 else pts_pred.sum()*0.0
+
+    # KL / object regs (pass from your forward)
+    loss_kl  = kl_static   if (kl_static   is not None) else pts_pred.sum()*0.0
+    loss_obj = loss_obj_reg if (loss_obj_reg is not None) else pts_pred.sum()*0.0
+
+    total = loss_rec + w_color*loss_color + w_repulsion*loss_rep + w_kl*loss_kl + w_obj*loss_obj
+
+    logs = {
+        "rec_dcd": loss_rec.detach(),
+        "color":   loss_color.detach(),
+        "repulsion": loss_rep.detach(),
+        "KL": (loss_kl.detach() if torch.is_tensor(loss_kl) else torch.tensor(0.0, device=pts_pred.device)),
+        "obj_reg": (loss_obj.detach() if torch.is_tensor(loss_obj) else torch.tensor(0.0, device=pts_pred.device)),
+        "loss_total": total.detach(),
+    }
+    return total, logs
+
+
+
 
 def repulsion_loss(P, k=8, r_frac=0.01):
     # P: [B,M,3]; radius r as % of scene diagonal (assuming coords in [-1,1])

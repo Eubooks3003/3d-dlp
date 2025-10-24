@@ -25,10 +25,12 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
                              create_segmentation_map, get_config, LinearWithWarmupScheduler, format_epoch_summary,
                              plot_training_metrics, save_metrics_data, save_code_backup, depth_to_rgb)
 from utils.rgbd_utils import get_depth_range, normalize_rgbd
-from utils.log_utils import save_checkpoint, load_checkpoint, log_block_grads, log_param_updates, plot_grad_flow
+from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, log_param_updates, plot_grad_flow,
+                            topk_indices_from_output, wandb_log_iter_losses)
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
 import eval.eval_vox as eval_vox
+from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly, select_topk_keypoints
 import wandb
 
 matplotlib.use("Agg")
@@ -148,7 +150,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=pc_collate)
 
-    
+
     # model
 
     model = VoxelDLP(
@@ -326,7 +328,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # iteration counter
     iteration = 0
     
-    run_name = f"{voxel_mode}-{voxel_grid_whd[0]}"
+    run_name = f"{voxel_mode}-{voxel_grid_whd[0]}-{decoder_point_mode}"
     wandb.init(
         name=run_name,
         config=config,
@@ -340,18 +342,16 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         batch_losses_kl_kp = []
         batch_losses_kl_feat = []
         batch_losses_kl_scale = []
-        batch_losses_kl_depth = []
         batch_losses_kl_obj_on = []
-        batch_psnrs = []
-        
-        losses_rec_geom = []
-        losses_rec_color = []
-        losses_cov = []
-        losses_norm = []
-        losses_repulsion = []
+
+        # recon components (DCD & optional weighted CD)
+        losses_rec_dcd = []
+        losses_rec_cd_w = []
+
         obj_on_l1_list = []
         obj_on_mean_list = []
         mu_scale_mean_list = []
+
         
 
         pbar = tqdm(iterable=dataloader)
@@ -395,6 +395,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             optimizer.step()
 
             log_param_updates(model, iteration)
+            wandb_log_iter_losses(all_losses, iteration)
 
             iteration += 1
 
@@ -428,12 +429,10 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
             # --- unpack logged losses from calc_static_elbo_pc ---
             loss            = all_losses['loss']
-            loss_rec        = all_losses['loss_rec']               # chamfer + color*weight
-            loss_rec_geom   = all_losses.get('loss_rec_geom', None)
-            loss_rec_color  = all_losses.get('loss_rec_color', None)
-            loss_repulsion = all_losses.get('loss_repulsion', None)
-            loss_cov = all_losses.get('loss_cov', None)
-            loss_norm = all_losses.get('loss_norm', None)
+            loss_rec        = all_losses['loss_rec']                 # combined recon (DCD + weighted CD * weight)
+            rec_dcd         = all_losses.get('rec_dcd', None)        # pure DCD term
+            rec_cd_weighted = all_losses.get('rec_cd_weighted', None)# optional weighted CD term
+
             loss_kl         = all_losses['kl']
             loss_kl_kp      = all_losses.get('loss_kl_kp', None)
             loss_kl_scale   = all_losses.get('loss_kl_scale', None)
@@ -460,15 +459,18 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             batch_losses_kl_scale.append(_to_float(loss_kl_scale))
             batch_losses_kl_obj_on.append(_to_float(loss_kl_obj_on))
 
-            # optional: track geometry/color separately
-            if loss_rec_geom is not None:
-                # you can create these lists outside the loop: losses_rec_geom, losses_rec_color
-                losses_rec_geom.append(_to_float(loss_rec_geom))
-            if loss_rec_color is not None:
-                losses_rec_color.append(_to_float(loss_rec_color))
-            losses_repulsion.append(_to_float(loss_repulsion))
-            losses_cov.append(_to_float(loss_cov))
-            losses_norm.append(_to_float(loss_norm))
+            # recon components
+            if rec_dcd is not None:
+                losses_rec_dcd.append(_to_float(rec_dcd))
+            if rec_cd_weighted is not None:
+                losses_rec_cd_w.append(_to_float(rec_cd_weighted))
+
+            # obj_on stats
+            obj_on_l1_list.append(_to_float(obj_on_l1))
+            obj_on_mean_list.append(obj_on_mean)
+            mu_scale_mean_list.append(mu_scale_mean)
+
+
 
             # optional: track obj_on stats
             obj_on_l1_list.append(_to_float(obj_on_l1))
@@ -491,6 +493,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 obj=_to_float(loss_kl_obj_on),
             )
 
+
             # break  # for debug
         pbar.close()
         # at end of epoch
@@ -502,26 +505,24 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         losses_kl_scale.append(float(np.mean(batch_losses_kl_scale)))
         losses_kl_obj_on.append(float(np.mean(batch_losses_kl_obj_on)))
 
-        mean_chamfer = float(np.mean(losses_rec_geom)) if len(losses_rec_geom) else None
-        mean_color   = float(np.mean(losses_rec_color)) if len(losses_rec_color) else None
-        mean_on_l1   = float(np.mean(obj_on_l1_list)) if len(obj_on_l1_list) else None
-        mean_on_prob = float(np.mean(obj_on_mean_list)) if len(obj_on_mean_list) else None
-        mean_s_scale = float(np.mean(mu_scale_mean_list)) if len(mu_scale_mean_list) else None
-        mean_repulsion = float(np.mean(losses_repulsion)) if len(losses_repulsion) else None
-        mean_cov = float(np.mean(losses_cov)) if len(losses_cov) else None
-        mean_norm = float(np.mean(losses_norm)) if len(losses_norm) else None
+        mean_dcd   = float(np.mean(losses_rec_dcd)) if len(losses_rec_dcd) else None
+        mean_cdw   = float(np.mean(losses_rec_cd_w)) if len(losses_rec_cd_w) else None
+        mean_on_l1 = float(np.mean(obj_on_l1_list)) if len(obj_on_l1_list) else None
+        mean_on_p  = float(np.mean(obj_on_mean_list)) if len(obj_on_mean_list) else None
+        mean_s     = float(np.mean(mu_scale_mean_list)) if len(mu_scale_mean_list) else None
 
         log_str = (
             f"epoch {epoch:04d} | "
             f"loss {losses[-1]:.4f} | rec {losses_rec[-1]:.4f}"
-            f"{'' if mean_chamfer is None else f' (cham {mean_chamfer:.4f})'}"
-            f"{'' if mean_color   is None else f' + color {mean_color:.4f}'} | "
+            f"{'' if mean_dcd is None else f' (dcd {mean_dcd:.4f}'}"
+            f"{'' if mean_cdw is None else f', cdw {mean_cdw:.4f})' if mean_dcd is not None else f' (cdw {mean_cdw:.4f})'} | "
             f"KL {losses_kl[-1]:.4f} [kp {losses_kl_kp[-1]:.3f}, feat {losses_kl_feat[-1]:.3f}, "
             f"scale {losses_kl_scale[-1]:.3f}, obj {losses_kl_obj_on[-1]:.3f}] | "
-            f"on_L1 {mean_on_l1 if mean_on_l1 is not None else 0:.3f} | "
-            f"on̄ {mean_on_prob if mean_on_prob is not None else 0:.3f} | "
-            f"s̄ {mean_s_scale if mean_s_scale is not None else 0:.3f}"
+            f"on_L1 {0.0 if mean_on_l1 is None else mean_on_l1:.3f} | "
+            f"on̄ {0.0 if mean_on_p is None else mean_on_p:.3f} | "
+            f"s̄ {0.0 if mean_s is None else mean_s:.3f}"
         )
+
         print(log_str)
         log_line(log_dir, log_str)
 
@@ -562,119 +563,63 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 
-            print("SAVING TO WANDB")
+            # --- GT (mask-filtered) ---
+            # gt_clean = clean_pts(pts[b0], mask[b0] if mask is not None else None)  # [Ng,3]
+            gt_clean = model_output.get('pts_norm', None)
 
-            # --- pull GT & REC dense volumes from model_output ---
-            # shapes: [B, C, D, H, W]
-            gt_dense  = model_output.get('dense_target', None)
-            rec_dense = model_output.get('rec_vox', None)    # full reconstruction
-            vox_bg    = model_output.get('vox_bg', None)     # optional (background)
-            vox_obj   = model_output.get('vox_obj', None)    # optional (objects only)
+            # --- REC ---
+            rec_pts  = model_output.get('points_scene', None)
+            rec_pts  = clean_pts(rec_pts[b0]) if rec_pts is not None else None
+            rec_cols = model_output.get('rec_colors', None)
+            rec_cols = rec_cols[b0] if rec_cols is not None else None
+            ids      = model_output.get('assign_ids', None)
+            ids      = ids[b0] if ids is not None else None
 
-            # --- keypoints (in [-1,1]^3) ---
-            kp_xyz = model_output.get('kp_p', None)          # [B, K, 3]
+            # --- KPs ---
+            kp_xyz = model_output.get('kp_p', None)  # [B,K,3] in [-1,1]
+            if kp_xyz is not None:
+                with torch.no_grad():
+                    idx, kp_topk, scores_topk = select_topk_keypoints(model_output, topk, prefer_logvar=True)
+            else:
+                kp_topk = None
 
-            # ---------- helpers ----------
-            def _center_slices(x):  # x: [C,D,H,W] -> dict of 3 center slices from channel 0
-                if x is None: return {}
-                if x.dim() == 5: x = x[b0]                   # [C,D,H,W]
-                C,D,H,W = x.shape
-                c = min(0, C-1)                              # plot channel 0 by default
-                d2,h2,w2 = D//2, H//2, W//2
-                # each slice returned as HxW numpy (detach if tensor)
-                def _np(t): 
-                    if t is None: return None
-                    if torch.is_tensor(t): t = t.detach().cpu()
-                    return t.numpy()
-                return {
-                    "xy": _np(x[c, d2, :, :]),
-                    "xz": _np(x[c, :, h2, :]),
-                    "yz": _np(x[c, :, :, w2]),
-                }
+            # --- Plotly logs (GT / REC / overlays) ---
+            log_pc_overlay_plotly("gt/gt_with_kp", gt_clean, None, kps=kp_xyz,
+                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+            log_pc_overlay_plotly("rec/rec_with_kp", None, rec_pts, kps=kp_xyz,
+                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
-            def _log_center_slices(name, x):
-                import matplotlib.pyplot as plt
-                s = _center_slices(x)
-                if not s: return
-                fig, axs = plt.subplots(1, 3, figsize=(9, 3), dpi=120)
-                axs[0].imshow(s["xy"], origin='lower'); axs[0].set_title('XY'); axs[0].axis('off')
-                axs[1].imshow(s["xz"], origin='lower'); axs[1].set_title('XZ'); axs[1].axis('off')
-                axs[2].imshow(s["yz"], origin='lower'); axs[2].set_title('YZ'); axs[2].axis('off')
-                plt.tight_layout()
-                wandb.log({name: wandb.Image(fig)}, step=epoch)
-                plt.close(fig)
+            log_pc_overlay_plotly("gt/gt", gt_clean, None, kps=None,
+                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+            log_pc_overlay_plotly("rec/rec", None, rec_pts, kps=None,
+                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
-            def _mse(a, b):
-                if a is None or b is None: return None
-                a = a[b0:b0+1, :1]  # channel 0
-                b = b[b0:b0+1, :1]
-                return float(torch.mean((a - b)**2).detach().cpu())
+            log_pc_overlay_plotly("viz/overlay_source_with_kp", gt_clean, rec_pts, kps=kp_xyz,
+                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+            log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=None,
+                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
-            def _psnr(a, b, data_range=1.0):
-                mse = _mse(a, b)
-                if mse is None or mse <= 0: return None
-                import math
-                return 20.0 * math.log10(data_range) - 10.0 * math.log10(mse)
+            if kp_topk is not None:
+                log_pc_overlay_plotly("gt/gt_topk", gt_clean, None, kps=kp_topk,
+                                    color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+                log_pc_overlay_plotly("rec/rec_topk", None, rec_pts, kps=kp_topk,
+                                    color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+                log_pc_overlay_plotly("viz/overlay_source_topk", gt_clean, rec_pts, kps=kp_topk,
+                                    color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
-            def _iou(a, b, thresh=0.5):
-                # threshold channel 0 as occupancy
-                if a is None or b is None: return None
-                A = (a[b0, 0] > thresh)
-                B = (b[b0, 0] > thresh)
-                inter = (A & B).sum().item()
-                union = (A | B).sum().item()
-                if union == 0: return None
-                return inter / union
-
-            # ---------- images ----------
-            if gt_dense is not None:
-                _log_center_slices("vox/gt_center", gt_dense)
-            if rec_dense is not None:
-                _log_center_slices("vox/rec_center", rec_dense)
-            if vox_bg is not None:
-                _log_center_slices("vox/bg_center", vox_bg)
-            if vox_obj is not None:
-                _log_center_slices("vox/obj_center", vox_obj)
-
-            gt_dense = batch.get("dense", None) or model_output.get("dense_target", None)
-            kps = model_output.get("kp_p", None)
-            
-            # --- GT plots (same three modes you used for REC) ---
-            if gt_dense is not None:
-                print("SAVING GT")
-                eval_vox.log_vox_plotly_gt_suite("vox", gt_dense[b0], step=iteration, channel=0, kps=kps)
-
-            if model_output.get("rec_vox", None) is not None:
-                print("SAVING REC")
-                rec = model_output["rec_vox"]
-                coarse = [i / 10 for i in range(0, 11)]          # 0.0, 0.1, ..., 1.0
-                fine   = [i / 100 for i in range(2, 11, 2)]      # 0.02, 0.04, ..., 0.10
-
-                iso_values = sorted({round(x, 3) for x in (coarse + fine) if 0.0 <= x <= 1.0})
-
-                for iso in iso_values:
-                    eval_vox.log_vox_plotly_rec_suite(
-                        "vox", rec[b0], iso=iso, step=iteration, channel=0, kps=kps
-                    )
-
-            # ---------- metrics ----------
-            metrics = {}
-            if (gt_dense is not None) and (rec_dense is not None):
-                iou  = _iou(rec_dense, gt_dense, thresh=0.5)
-                mse  = _mse(rec_dense, gt_dense)
-                psnr = _psnr(rec_dense, gt_dense, data_range=1.0)
-                if iou  is not None: metrics["vox/iou@0.5"] = iou
-                if mse  is not None: metrics["vox/mse_c0"]  = mse
-                if psnr is not None: metrics["vox/psnr_c0"] = psnr
-
-            # You can also log reconstruction components if present
-            if "loss_rec_geom" in all_losses and all_losses["loss_rec_geom"] is not None:
-                metrics["rec/geom"] = _to_float(all_losses["loss_rec_geom"])
-            if "loss_rec_color" in all_losses and all_losses["loss_rec_color"] is not None:
-                metrics["rec/color"] = _to_float(all_losses["loss_rec_color"])
-
+            # --- scalar metrics to W&B (only if computed) ---
+            metrics = {
+                "rec/dcd":        mean_dcd,
+                "rec/cd_weighted": mean_cdw,
+                "obj/on_L1":      mean_on_l1,
+                "obj/on_prob":    mean_on_p,
+                "obj/scale_mean": mean_s,
+            }
+            metrics = {k: v for k, v in metrics.items() if v is not None}
             if metrics:
                 wandb.log(metrics, step=epoch)
+
+
 
 
     return model

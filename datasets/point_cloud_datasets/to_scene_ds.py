@@ -32,6 +32,7 @@ class TODataset(Dataset):
         max_points: int = 4096,
         normalize_to_unit_cube: bool = True,
         include_rgb: bool = False,
+        proportion: float = 0.4,
     ):
         self.root = os.path.abspath(root)
         self.split = split
@@ -48,6 +49,19 @@ class TODataset(Dataset):
         if len(self.files) == 0:
             raise RuntimeError(f"No .ply files found in {self.split_dir}")
 
+
+        proportion = float(proportion)
+        if not (0.0 < proportion <= 1.0):
+            raise ValueError(f"proportion must be in (0,1], got {proportion}")
+
+        n_total = len(self.files)
+        n_keep = max(1, int(round(n_total * proportion)))
+
+
+        if n_keep < n_total:
+            self.files = self.files[:n_keep]
+        else:
+            self.files = self.files
         self._o3d = None  # lazy
 
     # ------------- helpers -------------
