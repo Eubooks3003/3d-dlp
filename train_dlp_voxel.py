@@ -494,7 +494,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             )
 
 
-            # break  # for debug
+            break  # for debug
         pbar.close()
         # at end of epoch
         losses.append(float(np.mean(batch_losses)))
@@ -574,6 +574,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             rec_cols = rec_cols[b0] if rec_cols is not None else None
             ids      = model_output.get('assign_ids', None)
             ids      = ids[b0] if ids is not None else None
+
+            print("REc points: ", rec_pts.shape)
 
             # --- KPs ---
             kp_xyz = model_output.get('kp_p', None)  # [B,K,3] in [-1,1]

@@ -195,6 +195,32 @@ class DLPDecoder(nn.Module):
         _init_module_linear_gauss(self.bg_dec, self.init_conv_bg_std)
         if hasattr(self.bg_dec, "init_weights"):
             self.bg_dec.init_weights()
+    def soft_topk_mask(self, logits, k, tau=0.5, hard=True):
+        """
+        logits: [B,K] scores for each kp
+        k:      integer
+        tau:    temperature for soft relaxation (lower => sharper)
+        hard:   if True, forward uses hard k-hot; backward uses soft (STE)
+
+        Returns:
+        m: [B,K,1] mask in [0,1] (hard 0/1 in forward if hard=True), with STE gradients to logits
+        probs: [B,K] soft assignment (useful for logging/weighting)
+        """
+        B, K = logits.shape
+        # Soft scores (any monotone works; softmax across K is a good default)
+        probs = torch.softmax(logits / tau, dim=-1)  # [B,K]
+
+        if not hard:
+            return probs.unsqueeze(-1), probs
+
+        # Hard k-hot for forward:
+        topk_idx = torch.topk(logits, k=k, dim=-1).indices  # [B,k]
+        hard_mask = torch.zeros_like(logits)                # [B,K]
+        hard_mask.scatter_(1, topk_idx, 1.0)                # 1 for top-k, else 0
+
+        # Straight-through: forward uses hard, backward uses soft
+        m = hard_mask + (probs - probs.detach())            # STE trick
+        return m.unsqueeze(-1), probs
 
     # ----------------- object decode -----------------
     def decode_objects_pc(self, z_kp, z_features, obj_on, z_scale=None, z_depth=None, kp_mask=None):
@@ -242,34 +268,62 @@ class DLPDecoder(nn.Module):
 
     # ----------------- full decode -----------------
     def decode_all(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, kp_mask, warmup: bool = False):
-        # Objects
+        # 1) scores for selection (use obj_on logits)
+        logits = obj_on.squeeze(-1) if obj_on is not None else torch.zeros(z.shape[:2], device=z.device)
+
+        # 2) soft top-k mask with STE  -> m: [B,K,1] in [0,1]
+        k      = getattr(self, "n_kp_dec", 10)
+        tau    = getattr(self, "topk_tau", 0.5)
+        m, _   = self.soft_topk_mask(logits, k=k, tau=tau, hard=True)  # STE
+
+        print("k: ", k)
+        # 3) pass the mask to the object decoder (it already multiplies with obj_on)
         obj = self.decode_objects_pc(
-            z_kp=z, z_features=z_features, obj_on=obj_on, z_scale=z_scale, z_depth=z_depth,  kp_mask=kp_mask
+            z_kp=z,
+            z_features=z_features,
+            obj_on=obj_on,c
+            z_scale=z_scale,
+            z_depth=z_depth,
+            kp_mask=m.squeeze(-1)  # <--- USE THE MASK
         )
+
+        # 4) flatten objects
         pts_obj_flat = obj["points_obj_flat"]   # [B, K*M, 3]
         rgb_obj_flat = obj["rgb_obj_flat"]      # [B, K*M, 3] or None
 
-        # Background
-        bg = self.decode_bg_pc(z_bg_features)
-        pts_bg = bg["bg_points"]                # [B, M_bg, 3]
-        rgb_bg = bg.get("bg_rgb", None)         # [B, M_bg, 3] or None
+        print("pts_obj_flat: ", pts_obj_flat.shape)
 
-        # Scene concat
-        pts_scene = torch.cat([pts_bg, pts_obj_flat], dim=1)  # [B, M_total, 3]
-        if (rgb_bg is not None) and (rgb_obj_flat is not None):
-            rgb_scene = torch.cat([rgb_bg, rgb_obj_flat], dim=1)
-        else:
-            rgb_scene = None
+        # 5) background
+        bg     = self.decode_bg_pc(z_bg_features)
+        pts_bg = bg["bg_points"]                # [B, M_bg, 3]
+        rgb_bg = bg.get("bg_rgb", None)
+
+        # 6) concat scene
+        pts_scene = torch.cat([pts_bg, pts_obj_flat], dim=1)
+        rgb_scene = torch.cat([rgb_bg, rgb_obj_flat], dim=1) if (rgb_bg is not None and rgb_obj_flat is not None) else None
+
+        # 7) also expose per-object weights to let the loss weight points if you want
+        #    (each object has weight m[b,k]; broadcast to its M points)
+        B, K = m.shape[:2]
+        M    = obj["points_obj"].shape[2]          # points per object
+        # [B,K,1] -> [B,K,1,1] -> [B,K,M,1] -> [B,K*M,1]
+        obj_weights_per_point = (
+            m.unsqueeze(2)                          # [B,K,1,1]
+            .expand(B, K, M, 1)                    # [B,K,M,1]
+            .reshape(B, K*M, 1)                    # [B,K*M,1]
+        ).to(obj["points_obj"].dtype)
 
         return {
             "points_scene": pts_scene,
             "points_bg":    pts_bg,
-            "points_obj":   obj["points_obj"],   # [B,K,M,3]
+            "points_obj":   obj["points_obj"],    # [B,K,M,3]
             "rgb_scene":    rgb_scene,
             "rgb_bg":       rgb_bg,
-            "rgb_obj":      rgb_obj_flat,        # flattened K*M to match scene concat
-            "obj_weights":  obj["obj_weights"],  # [B,K,1]
+            "rgb_obj":      rgb_obj_flat,         # [B,K*M,3] or None
+            "obj_weights":  m,                    # [B,K,1] (per object)
+            "point_weights": obj_weights_per_point,  # [B,K*M,1] (optional for loss)
         }
+
 
     def forward(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, kp_mask, warmup: bool = False):
         return self.decode_all(z, z_scale, z_features, obj_on, z_depth, z_bg_features, kp_mask, warmup)
