@@ -586,28 +586,30 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             else:
                 kp_topk = None
 
+            eff_pts = extract_effective_points_from_pointweights(model_output, thresh=0.5)
+
             # --- Plotly logs (GT / REC / overlays) ---
             log_pc_overlay_plotly("gt/gt_with_kp", gt_clean, None, kps=kp_xyz,
                                 color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("rec/rec_with_kp", None, rec_pts, kps=kp_xyz,
+            log_pc_overlay_plotly("rec/rec_with_kp", None, eff_pts, kps=kp_xyz,
                                 color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
             log_pc_overlay_plotly("gt/gt", gt_clean, None, kps=None,
                                 color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("rec/rec", None, rec_pts, kps=None,
+            log_pc_overlay_plotly("rec/rec", None, eff_pts, kps=None,
                                 color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
-            log_pc_overlay_plotly("viz/overlay_source_with_kp", gt_clean, rec_pts, kps=kp_xyz,
+            log_pc_overlay_plotly("viz/overlay_source_with_kp", gt_clean, eff_pts, kps=kp_xyz,
                                 color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("viz/overlay_source", gt_clean, rec_pts, kps=None,
+            log_pc_overlay_plotly("viz/overlay_source", gt_clean, eff_pts, kps=None,
                                 color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
             if kp_topk is not None:
                 log_pc_overlay_plotly("gt/gt_topk", gt_clean, None, kps=kp_topk,
                                     color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-                log_pc_overlay_plotly("rec/rec_topk", None, rec_pts, kps=kp_topk,
+                log_pc_overlay_plotly("rec/rec_topk", None, eff_pts, kps=kp_topk,
                                     color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-                log_pc_overlay_plotly("viz/overlay_source_topk", gt_clean, rec_pts, kps=kp_topk,
+                log_pc_overlay_plotly("viz/overlay_source_topk", gt_clean, eff_pts, kps=kp_topk,
                                     color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
 

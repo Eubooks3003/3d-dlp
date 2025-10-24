@@ -698,75 +698,74 @@ def _batch_tau_from_medians(pred, gt):
     med = 0.5 * (d_pg.median(dim=1).values + d_gp.median(dim=1).values)  # [B]
     med = torch.nan_to_num(med, nan=1e-2, posinf=1.0, neginf=1e-4)
     return med.clamp_min(1e-3).unsqueeze(-1)  # [B,1]
-
 def density_aware_chamfer(pred, gt, tau=None, freq_temp=1.0, eps=1e-6):
-    """
-    Stable DCD (Wu et al., NeurIPS'21) with clamps/nan guards.
-    pred, gt: [B,N,3] (already downsampled)
-    tau: None -> per-batch auto; else float or [B,1]
-    """
-    # sanitize inputs
     pred = torch.nan_to_num(pred, nan=0.0, posinf=1e3, neginf=-1e3).clamp_(-2.0, 2.0)
     gt   = torch.nan_to_num(gt,   nan=0.0, posinf=1e3, neginf=-1e3).clamp_(-2.0, 2.0)
 
     B, Np, _ = pred.shape
-    Ng       = gt.shape[1]
+    Ng = gt.shape[1]
 
-    # NN assignments (both directions)
-    d_pg = torch.cdist(pred, gt, p=2)                    # [B,Np,Ng]
-    d_gp = torch.cdist(gt, pred, p=2)                    # [B,Ng,Np]
-    dp  = d_pg.min(dim=2).values                         # [B,Np]
-    dg  = d_gp.min(dim=2).values                         # [B,Ng]
-    idx_pg = d_pg.argmin(dim=2)                          # [B,Np]
-    idx_gp = d_gp.argmin(dim=2)                          # [B,Ng]
+    d_pg = torch.cdist(pred, gt, p=2)               # [B,Np,Ng]
+    d_gp = torch.cdist(gt, pred, p=2)               # [B,Ng,Np]
+    dp   = d_pg.min(dim=2).values                   # [B,Np]
+    dg   = d_gp.min(dim=2).values                   # [B,Ng]
+    idx_pg = d_pg.argmin(dim=2)                     # [B,Np]
+    idx_gp = d_gp.argmin(dim=2)                     # [B,Ng]
 
-    # query frequency
+    # frequency weights
     qg = torch.zeros(B, Ng, device=gt.device, dtype=gt.dtype)
     qp = torch.zeros(B, Np, device=pred.device, dtype=pred.dtype)
     qg.scatter_add_(1, idx_pg, torch.ones_like(idx_pg, dtype=gt.dtype))
     qp.scatter_add_(1, idx_gp, torch.ones_like(idx_gp, dtype=pred.dtype))
-    w_pg = 1.0 / (torch.pow(qg.gather(1, idx_pg), freq_temp) + eps)  # [B,Np]
-    w_gp = 1.0 / (torch.pow(qp.gather(1, idx_gp), freq_temp) + eps)  # [B,Ng]
+    w_pg = 1.0 / (qg.gather(1, idx_pg).pow(freq_temp) + eps)  # [B,Np]
+    w_gp = 1.0 / (qp.gather(1, idx_gp).pow(freq_temp) + eps)  # [B,Ng]
 
-    # tau
+    # tau: scalar or per-batch
     if tau is None:
-        tau_val = _batch_tau_from_medians(pred, gt)                 # [B,1]
+        tau_val = _batch_tau_from_medians(pred, gt)              # [B,1]
     else:
-        tau_val = torch.as_tensor(tau, device=pred.device, dtype=pred.dtype).view(1, 1).clamp_min(1e-3)
+        tau_t = torch.as_tensor(tau, device=pred.device, dtype=pred.dtype)
+        tau_val = tau_t if tau_t.ndim > 0 else tau_t.view(1, 1)  # [B,1] or [1,1]
+        if tau_val.ndim == 1: tau_val = tau_val.view(-1, 1)      # [B,1] if B provided
 
-    # bounded cost
-    c_pg = 1.0 - torch.exp(-dp / (tau_val + eps))                   # [B,Np]
-    c_gp = 1.0 - torch.exp(-dg / (tau_val + eps))                   # [B,Ng]
-
-    term_pg = (w_pg * c_pg).mean(dim=1)                             # [B]
-    term_gp = (w_gp * c_gp).mean(dim=1)                             # [B]
-    return 0.5 * (term_pg + term_gp)                                # [B]
+    c_pg = 1.0 - torch.exp(-dp / (tau_val + eps))                # [B,Np]
+    c_gp = 1.0 - torch.exp(-dg / (tau_val + eps))                # [B,Ng]
+    return 0.5 * ((w_pg * c_pg).mean(dim=1) + (w_gp * c_gp).mean(dim=1))
 
         # ---------- weighted DCD ----------
 def weighted_dcd(pred, gt, w_pred=None, tau=None, freq_temp=1.0, eps=1e-8):
-        """
-        pred:  [B, M_p, 3]
-        gt:    [B, N, 3]
-        w_pred:[B, M_p, 1] in [0,1] (weights for pred points). If None -> unweighted DCD.
-        Returns per-batch scalar [B].
-        """
-        if w_pred is None:
-            return density_aware_chamfer(pred=pred, gt=gt, tau=tau, freq_temp=freq_temp)
+    if w_pred is None:
+        return density_aware_chamfer(pred, gt, tau=tau, freq_temp=freq_temp)
 
-        # distances
-        d = torch.cdist(pred, gt, p=2)  # [B, M_p, N]
+    B, Mp, _ = pred.shape
+    _, Ng, _ = gt.shape
 
-        # pred -> gt : min over gt, then **weighted** mean over pred
-        dmin_p = d.min(dim=-1).values                  # [B, M_p]
-        term_p = (dmin_p * w_pred.squeeze(-1)).sum(dim=1)  # [B]
+    # normalize weights per batch (sum≈1), floor to avoid 0/0
+    w = w_pred.squeeze(-1)
+    w = w / w.sum(dim=1, keepdim=True).clamp_min(1.0)            # [B,Mp]
 
-        # gt -> pred : we approximate a weight-aware "soft-min over pred"
-        # Use pred weights as an attention over pred points.
-        att = (w_pred.squeeze(-1) / (w_pred.squeeze(-1).sum(dim=1, keepdim=True).clamp_min(eps)))  # [B,M_p]
-        dmin_q = (att.unsqueeze(-1) * d).sum(dim=1)   # [B, N]
-        term_q = dmin_q.mean(dim=1)                   # [B] plain mean over gt
+    d = torch.cdist(pred, gt, p=2)                                # [B,Mp,Ng]
 
-        return 0.5 * (term_p + term_q)
+    # pred -> gt (weighted mean of NN distances over pred points)
+    dmin_p = d.min(dim=-1).values                                 # [B,Mp]
+    term_p = (dmin_p * w).sum(dim=1)                              # [B]
+
+    # gt -> pred (weighted soft-min with temperature tau)
+    if tau is None:
+        # reuse a small default; you can pass per-batch tau from caller if desired
+        tau_val = 0.02
+    else:
+        tau_val = float(tau) if not torch.is_tensor(tau) else tau
+
+    # logits over pred: -d/τ + log w  (broadcast to Ng)
+    logw = (w + eps).log().unsqueeze(-1)                          # [B,Mp,1]
+    logits = (-d / (tau_val + eps)) + logw                        # [B,Mp,Ng]
+    # softmin expectancy of distance
+    att = torch.softmax(logits, dim=1)                            # [B,Mp,Ng]
+    d_softmin = (att * d).sum(dim=1)                              # [B,Ng]
+    term_q = d_softmin.mean(dim=1)                                # [B]
+
+    return 0.5 * (term_p + term_q)
 
 @torch.no_grad()
 def _tile_ranges(n, tile):
@@ -775,85 +774,78 @@ def _tile_ranges(n, tile):
         j = min(i + tile, n)
         yield i, j
         i = j
-def repulsion_loss_weighted_knn(P, w=None, k=6, r=0.03, tile=4096, stopgrad_w=True):
-    B, M, _ = P.shape
-    if w is None:
-        w = P.new_ones(B, M, 1)
+def knn_repulsion_weighted(P, W, k=8, r=0.03, stopgrad_w=True, max_M=12000, eps=1e-8):
     if stopgrad_w:
-        w = w.detach()
+        W = W.detach()
 
-    total = P.new_zeros(())
-    count = 0
-    BIG = 1e6
+    B, M, _ = P.shape
 
-    for b in range(B):
-        X = P[b]                       # [M,3]
-        W = w[b].clamp(0, 1)          # [M,1]
+    # cost guard
+    if (max_M is not None) and (M > max_M):
+        idx = torch.randperm(M, device=P.device)[:max_M]
+        P = P[:, idx]
+        W = W[:, idx]
+        M = P.size(1)
 
-        keep = (W.squeeze(-1) > 1e-3)
-        X = X[keep]
-        W = W[keep]
-        Me = X.shape[0]
-        if Me <= 1:
-            continue
+    # k must be <= M-1 (exclude self)
+    k_eff = int(min(k, max(M - 1, 0)))
+    if k_eff == 0:
+        return P.new_tensor(0.0)
 
-        acc = X.new_zeros(Me, k)      # store k nn distances
+    # pairwise squared distances
+    d2 = torch.cdist(P, P, p=2).pow(2)                 # [B,M,M]
+    knn_d2, knn_idx = d2.topk(k_eff + 1, dim=-1, largest=False)
+    knn_d2  = knn_d2[..., 1:]                          # [B,M,k_eff]
+    knn_idx = knn_idx[..., 1:]                         # [B,M,k_eff]
 
-        for i0 in range(0, Me, tile):
-            i1 = min(i0 + tile, Me)
-            Q = X[i0:i1]                              # [Ti,3]
-            D = torch.cdist(Q, X, p=2)               # [Ti, Me]
+    # hinge repulsion within radius r
+    rep = torch.relu((r * r) - knn_d2)                 # [B,M,k_eff]
 
-            # DO NOT modify D in place. Create a new tensor with big values at (near-)self entries.
-            # self pairs show up as ~0 distance; push them out before topk:
-            D_masked = torch.where(D <= 1e-12, D.new_full(D.shape, BIG), D)
+    # normalize weights so magnitude is stable
+    Wn   = W / W.mean(dim=1, keepdim=True).clamp_min(eps)  # [B,M,1]
+    Wn_s = Wn.squeeze(-1)                                   # [B,M]
 
-            vals, _ = torch.topk(D_masked, k=k, largest=False, dim=-1)  # [Ti,k]
-            acc[i0:i1] = vals
+    # weights for center and neighbor
+    w_i = Wn_s.unsqueeze(-1).expand(-1, -1, k_eff)          # [B,M,k_eff]
+    # broadcast weights across neighbor axis, then gather
+    Wn_mat = Wn_s.unsqueeze(1).expand(B, M, M)              # [B,M,M]
+    w_j = torch.gather(Wn_mat, 2, knn_idx)                  # [B,M,k_eff]
 
-        rep = torch.relu(r - acc)         # [Me,k]
-        rep = rep * W                     # weight each point
-        total = total + rep.mean()
-        count += 1
-
-    return total / max(count, 1)
+    return (rep * w_i * w_j).mean()
 
 
-# utils/loss_functions.py
-def coverage_loss_weighted(P_pred, W_pred, P_gt, max_pred=12000, max_gt=12000, stopgrad_w=True):
-    """
-    P_pred : [B, M, 3]
-    W_pred : [B, M, 1] (soft top-k point weights) — will downweight inactive points
-    P_gt   : [B, N, 3]
-    """
+def coverage_loss_weighted(P_pred, W_pred, P_gt, max_pred=12000, max_gt=12000, stopgrad_w=True, eps=1e-8):
     B, M, _ = P_pred.shape
     if stopgrad_w:
         W_pred = W_pred.detach()
+
     out = P_pred.new_zeros(B)
-
     for b in range(B):
-        X = P_pred[b]
-        W = W_pred[b].clamp(0,1)
-        Y = P_gt[b]
+        X = P_pred[b]                      # [M,3]
+        W = W_pred[b].clamp(0, 1)          # [M,1]
+        Y = P_gt[b]                        # [N,3]
 
-        # sample proportional to weights to focus on effective points
-        m = X.shape[0]
-        n = Y.shape[0]
-
+        m = X.size(0); n = Y.size(0)
         if m > max_pred:
-            probs = (W.squeeze(-1) + 1e-6)
-            idx = torch.multinomial(probs, num_samples=max_pred, replacement=False)
-            X = X[idx]; W = W[idx]
+            p = (W.squeeze(-1) + eps)
+            p = p / p.sum().clamp_min(1.0)  # normalize, prevents multinomial errors
+            idx = torch.multinomial(p, num_samples=max_pred, replacement=False)
+            X, W = X[idx], W[idx]
+            m = X.size(0)
 
         if n > max_gt:
-            # uniform subsample gt is fine
             jdx = torch.randperm(n, device=Y.device)[:max_gt]
             Y = Y[jdx]
+            n = Y.size(0)
 
-        D = torch.cdist(X, Y, p=2)       # [Mp, Ng]
-        dmin, _ = D.min(dim=1)           # [Mp]
-        # weight by W and average
-        out[b] = (dmin * W.squeeze(-1)).sum() / (W.sum().clamp_min(1.0))
+        if W.sum() <= 0:
+            # no active predicted points — return 0 to avoid NaN; outer weights will downweight this batch anyway
+            out[b] = 0.0
+            continue
+
+        D = torch.cdist(X, Y, p=2)         # [m,n]
+        dmin = D.min(dim=1).values         # [m]
+        out[b] = (dmin * W.squeeze(-1)).sum() / W.sum().clamp_min(1.0)
 
     return out.mean()
 

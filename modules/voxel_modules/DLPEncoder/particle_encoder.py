@@ -511,214 +511,198 @@ class ParticleEncoder(nn.Module):
                 deterministic: bool = False,
                 warmup: bool = False):
 
-        assert points.dim() == 3 and points.size(-1) >= 3, \
-            f"expected [B,N,3(+F)], got {tuple(points.shape)}"
+        assert points.dim() == 3 and points.size(-1) >= 3, f"expected [B,N,3(+F)], got {tuple(points.shape)}"
         if mask_pc is not None:
-            assert mask_pc.shape[:2] == points.shape[:2], \
-                f"mask_pc must be [B,N], got {tuple(mask_pc.shape)}"
+            assert mask_pc.shape[:2] == points.shape[:2], f"mask_pc must be [B,N], got {tuple(mask_pc.shape)}"
 
-        B = points.size(0)
+        B, N = points.shape[:2]
+        dbg = getattr(self, "debug_prints", False)
 
-        # ---- stage-1: pos & scale ----
+        # ---- stage-1: pos & scale (prior + attributes) ----
         s1 = self.encode_pos_scale_with_prior(points, dense,
                                             mask=mask_pc,
                                             deterministic=deterministic,
                                             warmup=warmup)
 
-        # unpack
-        kp_p         = s1['kp_p']
-        var_kp       = s1['var_kp']
-        z_base       = s1['z_base']
-        z            = s1['z']
-        mu_tot       = s1['mu_tot']
-        z_base_var   = s1['z_base_var']
+        # unpack (stage-1, FULL K)
+        kp_p         = s1['kp_p']           # [B,K,3]
+        var_kp       = s1['var_kp']         # [B,K,*]
+        z_base       = s1['z_base']         # [B,K,3]
+        z            = s1['z']              # [B,K,3]
+        mu_tot       = s1['mu_tot']         # [B,K,3]
+        z_base_var   = s1['z_base_var']     # [B,K,Dv]
 
-        mu_scale     = s1['mu_scale']
+        mu_scale     = s1['mu_scale']       # [B,K,3]
         logvar_scale = s1.get('logvar_scale', None)
-        z_scale      = s1['z_scale']
+        z_scale      = s1['z_scale']        # [B,K,3]
 
-        mu_offset     = s1['mu_offset']
-        logvar_offset = s1['logvar_offset']
-        z_offset      = s1['z_offset']
+        mu_offset     = s1['mu_offset']     # [B,K,3]
+        logvar_offset = s1['logvar_offset'] # [B,K,3]
+        z_offset      = s1['z_offset']      # [B,K,3]
 
-        obj_on_a   = s1.get('obj_on_a', None)
+        obj_on_a   = s1.get('obj_on_a', None)  # [B,K,1] or logits
         obj_on_b   = s1.get('obj_on_b', None)
         mu_obj_on  = s1.get('mu_obj_on', None)
-        z_obj_on   = s1.get('z_obj_on', None)
+        z_obj_on   = s1.get('z_obj_on', None)  # [B,K,1] (what VoxelDLP.forward reads)
 
         mu_depth     = s1.get('mu_depth', None)
         logvar_depth = s1.get('logvar_depth', None)
         z_depth      = s1.get('z_depth', None)
 
-        kp_tiles      = s1.get('kp_tiles', None)
+        kp_tiles     = s1.get('kp_tiles', None)
 
-        # expected presence (for gating)
+        # presence prob (for gating)
         if (obj_on_a is not None) and (obj_on_b is not None):
-            p_on = (obj_on_a / (obj_on_a + obj_on_b + 1e-6)).clamp(0, 1)   # [B,K,1]
+            p_on = (obj_on_a / (obj_on_a + obj_on_b + 1e-6)).clamp(0, 1)  # [B,K,1]
         else:
             p_on = None
 
         # ---------- soft point→KP ownership for training ----------
         if self.training:
-            tau = getattr(self, "ownership_tau", 0.10)               # you can anneal this
+            tau = getattr(self, "ownership_tau", 0.10)
             soft_w = self._soft_assign(points[..., :3], z, tau=tau)  # [B,N,K]
+            if mask_pc is not None:
+                # add -big to masked points before softmax (assume _soft_assign returns probs; if it returns logits, move this inside)
+                # If _soft_assign already returns normalized weights, renormalize after zeroing masked rows:
+                soft_w = soft_w * mask_pc.unsqueeze(-1).to(soft_w.dtype)      # zero out pad rows
+                denom = soft_w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                soft_w = soft_w / denom
             use_tiles = None
         else:
             soft_w = None
             use_tiles = kp_tiles
 
-        # ---- (optional) variance filtering if you later shrink K for appearance ----
-        if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
-            total_var = z_base_var.sum(-1)                                  # [B,K]
-            n_filter = self.n_kp_dec if not warmup else min(
-                self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc)
-            )
+        # ---- optional: appearance on subset, but KEEP full-K tensors ----
+        use_subset = (self.n_kp_enc != self.n_kp_dec) and self.interaction_features and self.use_null_features_embed
+        K = z.shape[1]
+
+        if use_subset:
+            total_var = z_base_var.sum(-1)  # [B,K]
+            n_filter = self.n_kp_dec if not warmup else min(self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc))
+            n_filter = max(1, n_filter)
 
             if self.training:
-                # train-soft: relaxed Top-K mask (no slicing)
-                # validity mask to avoid degenerate proposals
-                pos_valid = (kp_p.abs().sum(dim=-1) > 1e-6)                 # [B,K]
-                cov_diag  = var_kp.diagonal(dim1=-2, dim2=-1)               # [B,K,3]
-                cov_valid = (cov_diag.sum(dim=-1) > 1e-9)                   # [B,K]
+                # relaxed top-k weights (no slicing)
+                pos_valid = (kp_p.abs().sum(dim=-1) > 1e-6)                  # [B,K]
+                cov_diag  = var_kp.diagonal(dim1=-2, dim2=-1)                # [B,K,3]
+                cov_valid = (cov_diag.sum(dim=-1) > 1e-9)                    # [B,K]
                 valid     = (pos_valid | cov_valid)
-                score     = -total_var                                      # low variance = good
+
+                score = -total_var                                          # low variance = good
                 keep_w_app, _ = self._relaxed_topk_weights(
                     score, n_filter, valid,
                     tau=getattr(self, "relaxed_topk_tau", 0.3),
                     training=True
-                )                                                           # [B,K]
-                # (Optional) expose for downstream weighting
+                )  # [B,K] mixture over K
+
                 s1['keep_w_app'] = keep_w_app
 
-                # ---- stage-2: appearance for all K proposals (soft ownership) ----
+                # full-K appearance; let encode_appearance optionally use keep_w_app if it wants
                 s2 = self.encode_appearance(points, z, z_scale,
                                             deterministic=deterministic,
                                             obj_on=p_on,
                                             mask_pc=mask_pc,
                                             kp_tiles=use_tiles,
                                             soft_weights=soft_w)
-                mu_features     = s2['mu_features']      # [B,K,F]
+                mu_features     = s2['mu_features']   # [B,K,F]
                 logvar_features = s2['logvar_features']
                 z_features      = s2['z_features']
 
             else:
-                # eval-hard: slice to the top-K for speed
-                _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
+                # hard top-k for speed, but keep full-K tensors by scattering
+                _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)  # [B,nf]
                 bidx = torch.arange(B, device=points.device)[:, None]
 
-                z_app         = z[bidx, keep_idx].contiguous()
-                z_scale_app   = z_scale[bidx, keep_idx].contiguous()
-                p_on_app      = p_on[bidx, keep_idx] if p_on is not None else None  # [B,nf,1]
+                z_app       = z[bidx, keep_idx].contiguous()        # [B,nf,3]
+                z_scale_app = z_scale[bidx, keep_idx].contiguous()  # [B,nf,3]
+                p_on_app    = p_on[bidx, keep_idx] if p_on is not None else None
 
-                # ---- stage-2: appearance on subset ----
+                # gather soft_w per batch for the kept KPs if available
+                if soft_w is None:
+                    soft_w_app = None
+                else:
+                    # soft_w: [B,N,K] -> [B,N,nf] per batch gather
+                    # build an index tensor for advanced gather
+                    gather_idx = keep_idx.unsqueeze(1).expand(B, N, n_filter)  # [B,N,nf]
+                    soft_w_app = torch.gather(soft_w, dim=2, index=gather_idx)
+
                 s2 = self.encode_appearance(points, z_app, z_scale_app,
                                             deterministic=deterministic,
                                             obj_on=p_on_app,
                                             mask_pc=mask_pc,
                                             kp_tiles=use_tiles,
-                                            soft_weights=soft_w if soft_w is None else soft_w[:, :, keep_idx[0]]  # keep shape if needed
-                                            )
+                                            soft_weights=soft_w_app)
 
                 # scatter back into full K slots
                 Fdim = s2['mu_features'].size(-1)
-                mu_features_full = torch.zeros(B, z.shape[1], Fdim, device=points.device, dtype=s2['mu_features'].dtype)
-                z_features_full  = torch.zeros_like(mu_features_full)
-                logvar_features_full = (torch.zeros_like(mu_features_full)
-                                        if s2['logvar_features'] is not None else None)
+                mu_features = torch.zeros(B, K, Fdim, device=points.device, dtype=s2['mu_features'].dtype)
+                z_features  = torch.zeros_like(mu_features)
+                logvar_features = (torch.zeros_like(mu_features)
+                                if s2['logvar_features'] is not None else None)
 
-                mu_features_full[bidx, keep_idx] = s2['mu_features']
-                z_features_full[bidx, keep_idx]  = s2['z_features']
-                if logvar_features_full is not None:
-                    logvar_features_full[bidx, keep_idx] = s2['logvar_features']
+                mu_features[bidx, keep_idx] = s2['mu_features']
+                z_features[bidx, keep_idx]  = s2['z_features']
+                if logvar_features is not None:
+                    logvar_features[bidx, keep_idx] = s2['logvar_features']
 
-                # reduce stage-1 to the kept subset for consistency
-                z           = z_app
-                z_scale     = z_scale_app
-                z_base      = z_base[bidx, keep_idx]
-                mu_tot      = mu_tot[bidx, keep_idx]
-                kp_p        = kp_p[bidx, keep_idx]
-                var_kp      = var_kp[bidx, keep_idx]
-                z_base_var  = z_base_var[bidx, keep_idx]
-                mu_scale    = mu_scale[bidx, keep_idx] if mu_scale is not None else None
-                if logvar_scale is not None:
-                    logvar_scale = logvar_scale[bidx, keep_idx]
-                mu_features     = mu_features_full
-                z_features      = z_features_full
-                logvar_features = logvar_features_full
-                if p_on is not None:
-                    p_on = p_on_app
+                if dbg:
+                    print(f"[encode_all] eval subset: computed appearance on {n_filter}/{K} and scattered back to full K")
 
         else:
-            # ---- stage-2: appearance for all K proposals ----
+            # full-K appearance
             s2 = self.encode_appearance(points, z, z_scale,
                                         deterministic=deterministic,
-                                        obj_on=p_on,        # may be None -> ungated
+                                        obj_on=p_on,        # may be None
                                         mask_pc=mask_pc,
                                         kp_tiles=use_tiles,
                                         soft_weights=soft_w)
-            mu_features     = s2['mu_features']
+            mu_features     = s2['mu_features']   # [B,K,F]
             logvar_features = s2['logvar_features']
             z_features      = s2['z_features']
 
-        # ---- final compact dict (PC path) ----
+        # ---- return dict matching VoxelDLP.forward() keys ----
         return {
             # anchors / positions
-            'mu_anchor':       z_base,
-            'logvar_anchor':   torch.zeros_like(z_base),
-            'z_base':          z_base,
-            'z':               z,
-
-            # offsets
-            'mu_offset':       mu_offset,
-            'logvar_offset':   logvar_offset,
-            'z_offset':        z_offset,
-            'mu_tot':          mu_tot,
+            'z_base':          z_base,            # [B,K,3]
+            'z':               z,                 # [B,K,3]
+            'mu_tot':          mu_tot,            # [B,K,3]
+            'mu_offset':       mu_offset,         # [B,K,3]
+            'logvar_offset':   logvar_offset,     # [B,K,3]
 
             # scales
-            'mu_scale':        mu_scale,
-            'logvar_scale':    logvar_scale,
-            'z_scale':         z_scale,
+            'mu_scale':        mu_scale,          # [B,K,3]
+            'logvar_scale':    logvar_scale,      # [B,K,3] or None
+            'z_scale':         z_scale,           # [B,K,3]
 
             # features
-            'mu_features':     mu_features,
-            'logvar_features': logvar_features,
-            'z_features':      z_features,
+            'mu_features':     mu_features,       # [B,K,F]
+            'logvar_features': logvar_features,   # [B,K,F] or None
+            'z_features':      z_features,        # [B,K,F]
 
-            # depth-specific feature keys (not used in PC path)
-            'z_depth_features':      None,
-            'mu_depth_features':     None,
-            'logvar_depth_features': None,
+            # presence / depth
+            'obj_on_a':        obj_on_a,
+            'obj_on_b':        obj_on_b,
+            'mu_obj_on':       mu_obj_on,
+            'z_obj_on':        z_obj_on,          # [B,K,1] or None
 
-            # crops (not available in PC path)
-            'cropped_objects': None,
+            'mu_depth':        mu_depth,
+            'logvar_depth':    logvar_depth,
+            'z_depth':         z_depth,
 
             # prior proposal info
-            'kp_p':        kp_p,
-            'var_kp':      var_kp,
-            'z_base_var':  z_base_var,
+            'kp_p':            kp_p,              # [B,K,3]
+            'var_kp':          var_kp,            # [B,K,*]
+            'z_base_var':      z_base_var,        # [B,K,Dv]
 
-            # optional scores (kept compatible with RGB)
-            'mu_score':     (z_base_var.sum(-1, keepdim=True) / 30.0) * 2 - 1,
-            'logvar_score': torch.full((B, z_base.shape[1], 1),
-                                    math.log(0.2 ** 2),
-                                    device=z_base.device,
-                                    dtype=z_base.dtype),
-            'z_score':      (z_base_var.sum(-1, keepdim=True) / 30.0) * 2 - 1,
+            # BG features (not used yet)
+            'mu_bg_features':     None,
+            'logvar_bg_features': None,
+            'z_bg_features':      None,
 
-            # presence & depth (if produced)
-            'obj_on_a':   obj_on_a,
-            'obj_on_b':   obj_on_b,
-            'mu_obj_on':  mu_obj_on,
-            'z_obj_on':   z_obj_on,
-
-            'mu_depth':     mu_depth,
-            'logvar_depth': logvar_depth,
-            'z_depth':      z_depth,
-
-            # keep-weights for training (optional; helps weight per-KP losses downstream)
-            **({'keep_w_app': s1.get('keep_w_app')} if self.training and 'keep_w_app' in s1 else {}),
-
+            # optional training diagnostics
+            **({'keep_w_app': s1.get('keep_w_app')} if (self.training and ('keep_w_app' in s1)) else {}),
             'patch_id_embed': None,
+            'z_offset':        z_offset,          # keep if you use it elsewhere
         }
 
 

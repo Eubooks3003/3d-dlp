@@ -332,6 +332,7 @@ class DLPDecoder(nn.Module):
                 f"eff_obj_pts≈{eff_obj_pts_per_batch[0].item():.1f}  "
                 f"(per batch example 0)")
 
+        print("points scene: ", pts_scene.shape)
         return {
             "points_scene": pts_scene,
             "points_bg":    pts_bg,

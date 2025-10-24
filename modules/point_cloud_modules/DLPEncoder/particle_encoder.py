@@ -447,117 +447,101 @@ class ParticleEncoder(nn.Module):
 
 
     def encode_all(self,
-                points: torch.Tensor,           # [B, N, 3(+F)]
-                mask_pc: torch.Tensor = None,   # [B, N] (bool) True=valid
-                deterministic: bool = False,
-                warmup: bool = False):
+               points: torch.Tensor,           # [B, N, 3(+F)]
+               mask_pc: torch.Tensor = None,   # [B, N] (bool) True=valid
+               deterministic: bool = False,
+               warmup: bool = False):
         """
         Single-frame point-cloud pipeline:
-        1) propose positions/scales via prior (+ attribute head)
-        2) optionally variance-filter if enc<dec and using null-embed
-        3) encode appearance for the selected set
-        4) return a compact dict (no time dims)
+        1) Stage-1 prior (+attributes) -> positions/scales (+ optional obj_on/depth)
+        2) If enc!=dec and using null-embed: compute appearance on a subset but SCATTER BACK to full K
+        3) Return a dict whose keys MATCH VoxelDLP.forward() expectations
         """
-        assert points.dim() == 3 and points.size(-1) >= 3, \
-            f"expected [B,N,3(+F)], got {tuple(points.shape)}"
+        assert points.dim() == 3 and points.size(-1) >= 3, f"expected [B,N,3(+F)], got {tuple(points.shape)}"
         if mask_pc is not None:
-            assert mask_pc.shape[:2] == points.shape[:2], \
-                f"mask_pc must be [B,N], got {tuple(mask_pc.shape)}"
+            assert mask_pc.shape[:2] == points.shape[:2], f"mask_pc must be [B,N], got {tuple(mask_pc.shape)}"
 
         B = points.size(0)
+        dbg = getattr(self, "debug_prints", False)
 
-        # ---- 1) stage-1: positions & scales from prior+attributes ----
+        # ---- 1) Stage-1: positions & scales (+ attributes) ----
         s1 = self.encode_pos_scale_with_prior(points,
                                             mask=mask_pc,
                                             deterministic=deterministic,
                                             warmup=warmup)
-
-        # unpack stage-1 we actually use
+        # Required stage-1 outputs (use names your modules actually emit)
         kp_p         = s1['kp_p']                  # [B,K,3]
         var_kp       = s1['var_kp']                # [B,K,*]
-        z_base       = s1['z_base']                # [B,K,3]
-        z            = s1['z']                     # [B,K,3]
-        kp_mask = s1['kp_mask']
+        z_base       = s1['z_base']                # [B,K,3]  (anchors)
+        z            = s1['z']                     # [B,K,3]  (post offset)
+        kp_mask      = s1['kp_mask']               # [B,K] (BOOL!)
         mu_tot       = s1['mu_tot']                # [B,K,3]
         z_base_var   = s1['z_base_var']            # [B,K,Dv]
         mu_scale     = s1['mu_scale']              # [B,K,3]
         logvar_scale = s1.get('logvar_scale', None)
         z_scale      = s1['z_scale']               # [B,K,3]
 
-        # optional extras (presence/depth etc.)
-        obj_on_a     = s1.get('obj_on_a', None)
+        # optional extras
+        obj_on_a     = s1.get('obj_on_a', None)        # [B,K,1] or logits
         obj_on_b     = s1.get('obj_on_b', None)
         mu_obj_on    = s1.get('mu_obj_on', None)
-        z_obj_on     = s1.get('z_obj_on', None)
+        z_obj_on     = s1.get('z_obj_on', None)        # [B,K,1] (what your forward expects)
 
         mu_depth     = s1.get('mu_depth', None)
         logvar_depth = s1.get('logvar_depth', None)
         z_depth      = s1.get('z_depth', None)
 
-        # ---- 2) variance-based filtering if you plan to encode fewer particles later ----
-        if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
-            # keep masked KPs out of Top-K
+        mu_offset    = s1['mu_offset']                 # [B,K,3]
+        logvar_offset= s1['logvar_offset']             # [B,K,3]
+
+        # ---- 2) Stage-2: appearance with optional variance-based subset ----
+        K_enc = z.shape[1]
+        use_subset = (self.n_kp_enc != self.n_kp_dec) and self.interaction_features and self.use_null_features_embed
+
+        if use_subset:
+            # ensure boolean mask
+            assert kp_mask.dtype == torch.bool, "kp_mask must be boolean when using masked_fill(~kp_mask, ...)"
             total_var = z_base_var.sum(-1)                               # [B,K]
             total_var = total_var.masked_fill(~kp_mask, float('inf'))
 
-            n_filter = self.n_kp_dec if not warmup else min(
-                self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc)
-            )
-            _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)     # [B,n_filter]
+            n_filter = self.n_kp_dec if not warmup else min(self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc))
+            n_filter = max(1, n_filter)
+            _, keep_idx = torch.topk(total_var, k=n_filter, dim=-1, largest=False)  # [B, n_filter]
             bidx = torch.arange(B, device=points.device)[:, None]
 
-            z_app         = z[bidx, keep_idx].contiguous()         # [B,n_filter,3]
-            z_scale_app   = z_scale[bidx, keep_idx].contiguous()   # [B,n_filter,3]
-            kp_mask_app   = kp_mask.gather(1, keep_idx)            # [B,n_filter]
-            gate_app      = kp_mask_app.unsqueeze(-1).to(z.dtype)  # [B,n_filter,1]
+            # subset tensors for appearance
+            z_app       = z[bidx, keep_idx].contiguous()         # [B,nf,3]
+            z_scale_app = z_scale[bidx, keep_idx].contiguous()   # [B,nf,3]
+            kp_mask_app = kp_mask.gather(1, keep_idx)            # [B,nf]
+            gate_app    = kp_mask_app.unsqueeze(-1).to(z.dtype)  # [B,nf,1]
 
-            print("GATE APP SHAPE: ", gate_app.shape)
-            print("KP MASK: ", kp_mask_app.shape)
-
-            # ---- 3) stage-2: appearance on subset ----
             s2 = self.encode_appearance(points, z_app, z_scale_app,
                                         deterministic=deterministic,
-                                        obj_on=gate_app,                 # gate matches n_filter
+                                        obj_on=gate_app,
                                         mask_pc=mask_pc)
-
-            # scatter back into full K slots using nulls/zeros
+            # scatter back to FULL K
             Fdim = s2['mu_features'].size(-1)
             if self.use_null_features_embed:
-                mu_features_full = self.null_feature_embed.repeat(B, self.n_kp_enc, 1)
+                mu_features = self.null_feature_embed.repeat(B, K_enc, 1)           # [B,K,F]
             else:
-                mu_features_full = torch.zeros(B, self.n_kp_enc, Fdim, device=points.device)
-            z_features_full = mu_features_full.clone()
-            logvar_features_full = None
+                mu_features = torch.zeros(B, K_enc, Fdim, device=points.device)
+
+            z_features = mu_features.clone()
+            logvar_features = None
             if s2['logvar_features'] is not None:
-                logvar_features_full = torch.zeros(B, self.n_kp_enc, Fdim, device=points.device)
+                logvar_features = torch.zeros(B, K_enc, Fdim, device=points.device)
 
-            mu_features_full[bidx, keep_idx] = s2['mu_features']
-            z_features_full[bidx, keep_idx]  = s2['z_features']
-            if logvar_features_full is not None:
-                logvar_features_full[bidx, keep_idx] = s2['logvar_features']
+            mu_features[bidx, keep_idx] = s2['mu_features']      # fill selected
+            z_features[bidx, keep_idx]  = s2['z_features']
+            if logvar_features is not None:
+                logvar_features[bidx, keep_idx] = s2['logvar_features']
 
-            # keep stage-1 tensors consistent with the selected set
-            take        = keep_idx
-            z           = z[bidx, take]
-            z_scale     = z_scale[bidx, take]
-            z_base      = z_base[bidx, take]
-            mu_tot      = mu_tot[bidx, take]
-            kp_p        = kp_p[bidx, take]
-            var_kp      = var_kp[bidx, take]
-            z_base_var  = z_base_var[bidx, take]
-            mu_scale    = mu_scale[bidx, take]
-            if logvar_scale is not None:
-                logvar_scale = logvar_scale[bidx, take]
-            kp_mask     = kp_mask[bidx, take] 
-
-            mu_features     = mu_features_full
-            z_features      = z_features_full
-            logvar_features = logvar_features_full
+            if dbg:
+                print(f"[encode_all] subset appearance on {n_filter}/{K_enc}, scattered to full K={K_enc}")
 
         else:
-            # ---- 3) stage-2: appearance for all proposals ----
-            gate_all = kp_mask.unsqueeze(-1).to(z.dtype)      # [B,K,1] matches z: [B,K,3]
-
+            # full appearance
+            gate_all = kp_mask.unsqueeze(-1).to(z.dtype)      # [B,K,1]
             s2 = self.encode_appearance(points, z, z_scale,
                                         deterministic=deterministic,
                                         obj_on=gate_all,
@@ -566,40 +550,48 @@ class ParticleEncoder(nn.Module):
             logvar_features = s2['logvar_features']       # [B,K,F] or None
             z_features      = s2['z_features']            # [B,K,F]
 
+        # ---- 3) (Optional) BG features — return None if you don't have them yet ----
+        mu_bg_features     = None
+        logvar_bg_features = None
+        z_bg_features      = None
 
-        # ---- 4) final compact dict (point-cloud only; no BG) ----
+        # ---- 4) Return dict that MATCHES VoxelDLP.forward keys ----
         return {
-            # positions
-            'pos_anchor':   z_base,            # [B,K,3]
-            'pos':          z,                 # [B,K,3]
-            'pos_mu':       mu_tot,            # [B,K,3]
-            'pos_logvar':   s1['logvar_offset'],  # [B,K,3] if produced
-            'kp_mask': kp_mask,
+            # positions / offsets
+            'z_base':            z_base,            # [B,K,3]
+            'z':                 z,                # [B,K,3]
+            'mu_tot':            mu_tot,           # [B,K,3]
+            'mu_offset':         mu_offset,        # [B,K,3]
+            'logvar_offset':     logvar_offset,    # [B,K,3]
+            'kp_p':              kp_p,             # [B,K,3]
+            'var_kp':            var_kp,           # [B,K,*]
+            'kp_mask':           kp_mask,          # [B,K] (bool)
+            'z_base_var':        z_base_var,       # [B,K,Dv]
 
             # scales
-            'scale_mu':     mu_scale,          # [B,K,3]
-            'scale_logvar': logvar_scale,      # [B,K,3] or None
-            'scale':        z_scale,           # [B,K,3]
+            'mu_scale':          mu_scale,         # [B,K,3]
+            'logvar_scale':      logvar_scale,     # [B,K,3] or None
+            'z_scale':           z_scale,          # [B,K,3]
 
             # features
-            'feat_mu':      mu_features,       # [B,K,F]
-            'feat_logvar':  logvar_features,   # [B,K,F] or None
-            'feat':         z_features,        # [B,K,F]
+            'mu_features':       mu_features,      # [B,K,F]
+            'logvar_features':   logvar_features,  # [B,K,F] or None
+            'z_features':        z_features,       # [B,K,F]
 
-            # prior proposal info
-            'kp_p':         kp_p,              # [B,K,3]
-            'kp_var':       var_kp,            # [B,K,*]
-            'kp_score':     z_base_var.sum(-1, keepdim=True),  # [B,K,1]
+            # presence / depth (optional)
+            'obj_on_a':          obj_on_a,
+            'obj_on_b':          obj_on_b,
+            'mu_obj_on':         mu_obj_on,
+            'z_obj_on':          z_obj_on,         # [B,K,1] or None
 
-            # optional extras if your stage-1 produced them
-            'obj_on_a':     obj_on_a,
-            'obj_on_b':     obj_on_b,
-            'mu_obj_on':    mu_obj_on,
-            'z_obj_on':     z_obj_on,
-            'mu_depth':     mu_depth,
-            'logvar_depth': logvar_depth,
-            'z_depth':      z_depth,
-            'z_base_var':   z_base_var,      # [B,K,Dv]
+            'mu_depth':          mu_depth,
+            'logvar_depth':      logvar_depth,
+            'z_depth':           z_depth,
+
+            # background (None if not used)
+            'mu_bg_features':    mu_bg_features,
+            'logvar_bg_features':logvar_bg_features,
+            'z_bg_features':     z_bg_features,
         }
 
 

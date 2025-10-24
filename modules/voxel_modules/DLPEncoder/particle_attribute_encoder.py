@@ -214,11 +214,17 @@ class ParticleAttributeEncoder3D(nn.Module):
 
         # default z_scale = (crop / grid)
         if z_scale is None:
-            zs = torch.tensor([self.crop_w/(W-1), self.crop_h/(H-1), self.crop_d/(D-1)],
-                            device=x_dense.device, dtype=x_dense.dtype)  # (x,y,z)
-            z_scale = zs.view(1,1,3).expand(B, K, 3)
+            zs = torch.tensor([
+                (self.crop_w - 1) / (W - 1),
+                (self.crop_h - 1) / (H - 1),
+                (self.crop_d - 1) / (D - 1),
+            ], device=x_dense.device, dtype=x_dense.dtype)  # (x,y,z)
+            z_scale = zs.view(1, 1, 3).expand(B, K, 3)
         else:
-            z_scale = torch.sigmoid(z_scale)  # like 2D path
+            z_scale = torch.sigmoid(z_scale)
+        # always keep scales in a sane range
+        z_scale = z_scale.clamp(1e-3, 1.0)
+
 
         # flatten positions/scales to match [B*K, ...]
         z_pos   = kp_xyz.reshape(B*K, 3)        # (x,y,z)
