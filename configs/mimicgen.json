@@ -1,9 +1,7 @@
 {
-  "ds": "TO",
-  "root": "/home/ellina/Desktop/Code/TO-Scene/ply/TO-vanilla",
-  "modality": "point_cloud",
-  "decoder_point_mode": "", 
-  "points_per_object": 128,
+  "ds": "mimicgen",
+  "root": "/home/ellina/Desktop/Code/lpwm-dev/mimicgen_data/stack",
+  "cams": ["agentview", "sideview"],
   "device": "cuda",
   "batch_size": 32,
   "lr": 0.00008,
