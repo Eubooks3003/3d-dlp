@@ -1274,6 +1274,7 @@ class VoxelDLP(nn.Module):
         points_bg = dec.get('points_bg', None)
         obj_weights = dec.get('obj_weights', None)
         points_weights = dec.get('point_weights', None)
+        kp_topk = dec.get('kp_topk', None)
 
         # -------- Pack outputs --------
         output_dict = {
@@ -1307,6 +1308,7 @@ class VoxelDLP(nn.Module):
             'pts_norm': pts_norm,
             'point_weights': points_weights,
             'obj_weights': obj_weights,
+            'kp_topk': kp_topk, 
             # 'vox_bg':  vox_bg,
             # 'vox_obj': vox_obj,
             # give the loss direct access to the GT dense voxel grid:
@@ -1889,149 +1891,172 @@ class VoxelDLP(nn.Module):
         beta_obj=0.0,
         use_kl_mask=True,
         apply_mask_on_obj_on=False,
-        balance=0.5,                    # used to mix geom vs color (see below)
+        balance=0.5,                    # geom vs color mix (0..1)
         color_weight=0.0,
 
-        # DCD controls
+        # ----- DCD controls -----
         dcd_scale=1.0,
-        dcd_tau=None,                   # can be float or [B,1]; if None auto-estimate in DCD
+        dcd_tau=None,                   # float or [B,1]; None => auto inside weighted_dcd
         dcd_freq_temp=1.0,
 
-        # optional extras
+        # ----- extras -----
         use_repulsion=True,
         use_coverage=True,
         use_normals=False,
+        use_kp_repulsion=True,          # NEW: small KP-level separation
 
-        # weighting controls
-        rec_weight_stopgrad=True,       # detach point/object weights in recon
+        # ----- warmup blend -----
+        use_sym_chamfer_warmup=True,    # NEW: blend with symmetric chamfer when warmup=True
+        chamfer_warmup_mix=0.5,         # weight for chamfer inside the geom term during warmup (0..1)
+
+        # ----- weighting -----
+        rec_weight_stopgrad=True,       # detach point/object weights for recon terms
         eps=1e-8,
+
+        # ----- dispersion weights (can be tuned) -----
+        w_repulsion=0.03,               # was 0.01
+        w_cov=0.30,                     # was 0.20
+        w_norm=0.10,
+        w_kp_sep=1e-3,                  # NEW: tiny KP repulsion
     ):
         import torch
         import torch.nn.functional as F
+        device, dtype = x.device, x.dtype
 
         # ---------- unpack ----------
         B = x.size(0)
         x_pts = x[..., :3]
         if mask_pc is None:
-            mask_pc = torch.ones(x_pts.shape[:2], dtype=torch.bool, device=x.device)
+            mask_pc = torch.ones(x_pts.shape[:2], dtype=torch.bool, device=device)
 
-        # encoder/decoder things
-        kp_p            = model_output['kp_p']                       # [B,K,3]
-        z               = model_output['z']                          # [B,K,3]
-        mu_tot          = model_output.get('mu_tot', z)              # [B,K,3]
-        z_base          = model_output['z_base']                     # [B,K,3]
-        z_base_var      = model_output.get('z_base_var', None)       # [B,K,Dv]
+        # encoder/decoder outputs
+        kp_p            = model_output['kp_p']                             # [B,K,3]
+        z               = model_output['z']                                # [B,K,3]
+        mu_tot          = model_output.get('mu_tot', z)                    # [B,K,3]
+        z_base          = model_output['z_base']                           # [B,K,3]
+        z_base_var      = model_output.get('z_base_var', None)             # [B,K,Dv]
 
-        mu_scale        = model_output.get('mu_scale', None)         # [B,K,3] or None
-        logvar_scale    = model_output.get('logvar_scale', None)     # [B,K,3] or None
-        mu_features     = model_output.get('feat_mu', model_output['mu_features'])               # [B,K,F]
-        logvar_features = model_output.get('feat_logvar', model_output.get('logvar_features'))   # [B,K,F] or None
-        mu_bg           = model_output.get('mu_bg_features', None)   # [B,Fbg] or None
+        mu_scale        = model_output.get('mu_scale', None)               # [B,K,3] or None
+        logvar_scale    = model_output.get('logvar_scale', None)           # [B,K,3] or None
+        mu_features     = model_output.get('feat_mu', model_output['mu_features'])
+        logvar_features = model_output.get('feat_logvar', model_output.get('logvar_features'))
+        mu_bg           = model_output.get('mu_bg_features', None)         # [B,Fbg] or None
         logvar_bg       = model_output.get('logvar_bg_features', None)
 
-        mu_offset       = model_output.get('mu_offset', None)        # [B,K,3] or None
-        logvar_offset   = model_output.get('logvar_offset', None)    # [B,K,3] or None
+        mu_offset       = model_output.get('mu_offset', None)              # [B,K,3] or None
+        logvar_offset   = model_output.get('logvar_offset', None)          # [B,K,3] or None
 
         obj_on          = model_output.get('obj_on', model_output.get('z_obj_on', None))  # [B,K,1] or None
-        kp_mask_bool    = model_output.get('kp_mask', None)           # [B,K] bool
+        kp_mask_bool    = model_output.get('kp_mask', None)                 # [B,K] bool
 
-        pts_scene       = model_output['points_scene']                # [B, Mtot, 3]
-        pts_bg          = model_output.get('points_bg', None)         # [B, Mbg, 3] or None
-        pts_obj         = model_output.get('points_obj', None)        # [B, K, M, 3]
-        rgb_scene       = model_output.get('rgb_scene', None)         # [B, Mtot, 3] or None
+        pts_scene       = model_output['points_scene']                      # [B, Mtot, 3]
+        pts_bg          = model_output.get('points_bg', None)               # [B, Mbg, 3] or None
+        pts_obj         = model_output.get('points_obj', None)              # [B, K, M, 3]
+        rgb_scene       = model_output.get('rgb_scene', None)               # [B, Mtot, 3] or None
 
-        # decoder weights
-        m_obj           = model_output.get('obj_weights', None)       # [B,K,1] soft (0..1)
-        w_points_obj    = model_output.get('point_weights', None)     # [B,K*M,1] per-point for objects
-
-        device = x.device
-        dtype  = x.dtype
+        # decoder-provided weights
+        m_obj           = model_output.get('obj_weights', None)             # [B,K,1] soft (0..1)
+        w_points_obj    = model_output.get('point_weights', None)           # [B,K*M,1] per-point (objects)
 
         # ---------- helper gates ----------
-        def denom(m):  # normalize by active count, avoid 0
+        def denom(m):  # normalize by active count per batch
             return m.sum(dim=-1).clamp_min(1.0)
 
         if kp_mask_bool is None:
-            w_kp = torch.ones(z.shape[:2], dtype=z.dtype, device=device)     # [B,K]
+            w_kp = torch.ones(z.shape[:2], dtype=z.dtype, device=device)    # [B,K]
         else:
             w_kp = kp_mask_bool.float()
 
         obj_on_s = obj_on.squeeze(-1) if obj_on is not None else torch.ones_like(w_kp)  # [B,K]
 
-        # KL gate: encoder kp mask * presence * decoder selection (detached)
-        kl_gate = w_kp * (obj_on_s if use_kl_mask else 1.0)                   # [B,K]
+        # KL gate: encoder kp mask * presence * (detached) decoder selection
+        kl_gate = w_kp * (obj_on_s if use_kl_mask else 1.0)                 # [B,K]
         if m_obj is not None:
             m_det = m_obj.squeeze(-1).detach() if rec_weight_stopgrad else m_obj.squeeze(-1)
             kl_gate = kl_gate * m_det
 
-        print(" pts scen: ", pts_scene.shape)
-        # ---------- build per-predicted-point weights ONCE (aligned to pts_scene order) ----------
+        # ---------- per-predicted-point weights aligned to pts_scene ----------
         B, Mtot, _ = pts_scene.shape
-        if pts_bg is not None:
-            Mbg = pts_bg.shape[1]
-        else:
-            Mbg = 0
+        Mbg = 0 if (pts_bg is None) else pts_bg.shape[1]
 
         if w_points_obj is None:
             w_pred_points = torch.ones(B, Mtot, 1, device=device, dtype=dtype)
         else:
-            print("Mbg: ", Mbg)
-            print("w_points_obj: ", w_points_obj.shape[1])
             assert Mtot == (Mbg + w_points_obj.shape[1]), "Mismatch: scene points vs (bg + obj) points."
             w_bg = torch.ones(B, Mbg, 1, device=device, dtype=dtype)
-            w_pred_points = torch.cat([w_bg, w_points_obj], dim=1)            # [B, Mtot, 1]
+            w_pred_points = torch.cat([w_bg, w_points_obj], dim=1)          # [B,Mtot,1]
 
         if rec_weight_stopgrad:
             w_pred_points = w_pred_points.detach()
 
-        w_norm = w_pred_points.sum(dim=1, keepdim=True).clamp_min(1.0)        # [B,1,1]
-        w_pred_points_n = w_pred_points / w_norm                              # sum ≈ 1 per batch
+        # normalize per batch so weights sum ~1 (prevents trivial scaling games)
+        w_norm = w_pred_points.sum(dim=1, keepdim=True).clamp_min(1.0)      # [B,1,1]
+        w_pred_points_n = w_pred_points / w_norm
 
-        # ---------- geometry reconstruction (Weighted DCD) ----------
+        # ---------- geom reconstruction ----------
+        # Weighted DCD (pred->gt) — primary term
         dcd_batch = weighted_dcd(
             pred=pts_scene, gt=x_pts,
-            w_pred=w_pred_points_n, tau=dcd_tau,
-            freq_temp=dcd_freq_temp, eps=eps
+            w_pred=w_pred_points_n,
+            tau=dcd_tau, freq_temp=dcd_freq_temp, eps=eps
         )  # [B]
         loss_rec_geom = (dcd_scale * dcd_batch).mean()
+
+        # (Warmup) symmetric chamfer blend to promote coverage/spread
+        if use_sym_chamfer_warmup and warmup:
+            def chamfer_l2(pred, gt, gt_mask=None):
+                # symmetric L2 chamfer; supports optional binary mask on gt
+                d2_pg = torch.cdist(pred, gt, p=2).pow(2)                    # [B,M,N]
+                fwd = d2_pg.min(dim=-1).values.mean(dim=-1)                  # [B]
+                d2_gp = torch.cdist(gt, pred, p=2).pow(2).min(dim=-1).values # [B,N]
+                if gt_mask is not None:
+                    d2_gp = (d2_gp * gt_mask.float()).sum(dim=-1) / gt_mask.sum(dim=-1).clamp_min(1.0)
+                else:
+                    d2_gp = d2_gp.mean(dim=-1)
+                return 0.5 * (fwd + d2_gp)                                   # [B]
+
+            cham = chamfer_l2(pts_scene, x_pts, mask_pc).mean()
+            mix = float(chamfer_warmup_mix)
+            loss_rec_geom = (1.0 - mix) * loss_rec_geom + mix * cham
 
         # ---------- color reconstruction (optional) ----------
         loss_rec_color = torch.tensor(0.0, device=device)
         if color_weight > 0.0 and rgb_scene is not None and x.size(-1) >= 6:
             x_rgb = x[..., 3:6]
             with torch.no_grad():
-                # nearest GT per predicted point (O(BMN); downsample if needed)
                 d = torch.cdist(pts_scene, x_pts, p=2)                        # [B,Mtot,N]
                 nn_idx = d.argmin(dim=-1)                                     # [B,Mtot]
             nn_rgb = torch.gather(x_rgb, dim=1, index=nn_idx.unsqueeze(-1).expand(-1, -1, 3))
             rgb_err = (rgb_scene - nn_rgb).pow(2).mean(-1, keepdim=True)      # [B,Mtot,1]
-            loss_rec_color = (rgb_err * w_pred_points_n).sum(dim=1).mean()     # scalar
+            loss_rec_color = (rgb_err * w_pred_points_n).sum(dim=1).mean()
 
-        # Mix geom vs color using 'balance' (0..1)
+        # Mix geom vs color
         loss_rec = balance * loss_rec_geom + (1.0 - balance) * (color_weight * loss_rec_color)
 
-        # ---------- extras (repulsion / coverage / normals) ----------
+        # ---------- extras: repulsion / coverage / normals ----------
         loss_repulsion = torch.tensor(0.0, device=device)
         loss_cov       = torch.tensor(0.0, device=device)
         loss_norm      = torch.tensor(0.0, device=device)
 
         if pts_obj is not None:
             Bk, K, M, _ = pts_obj.shape
-            P_obj = pts_obj.reshape(Bk, K*M, 3)                                # [B, K*M, 3]
+            P_obj = pts_obj.reshape(Bk, K*M, 3)                                # [B,K*M,3]
             if w_points_obj is None:
                 W_obj = P_obj.new_ones(Bk, K*M, 1)
             else:
                 W_obj = w_points_obj.detach() if rec_weight_stopgrad else w_points_obj
+                # normalize per batch (keeps scale of W consistent)
                 W_obj = W_obj / (W_obj.mean(dim=1, keepdim=True).clamp_min(1e-6))
 
-            if use_repulsion:
-                loss_repulsion = knn_repulsion_weighted(P_obj, W_obj, k=8, r=0.03,
-                                                        stopgrad_w=rec_weight_stopgrad, max_M=12000)
-            if use_coverage:
-                loss_cov = coverage_loss_weighted(P_pred=P_obj, W_pred=W_obj, P_gt=x_pts,
-                                                max_pred=12000, max_gt=12000,
-                                                stopgrad_w=rec_weight_stopgrad)
-
+            if use_repulsion and 'knn_repulsion_weighted' in globals():
+                loss_repulsion = knn_repulsion_weighted(
+                    P_obj, W_obj, k=8, r=0.03, stopgrad_w=rec_weight_stopgrad, max_M=12000
+                )
+            if use_coverage and 'coverage_loss_weighted' in globals():
+                loss_cov = coverage_loss_weighted(
+                    P_pred=P_obj, W_pred=W_obj, P_gt=x_pts,
+                    max_pred=12000, max_gt=12000, stopgrad_w=rec_weight_stopgrad
+                )
             if use_normals and 'estimate_normals_pca' in globals():
                 with torch.no_grad():
                     n_rec = estimate_normals_pca(pts_scene, k=16)              # [B,Mtot,3]
@@ -2041,24 +2066,28 @@ class VoxelDLP(nn.Module):
                 n_in  = estimate_normals_pca(x_pts, k=16)
                 loss_norm = (1.0 - (n_in * n_tgt).sum(dim=-1).abs()).mean()
 
-        # modest weights
-        w_repulsion = 0.01
-        w_cov       = 0.20
-        w_norm      = 0.10
+        # add dispersion extras
+        loss_rec = loss_rec + w_repulsion * loss_repulsion + w_cov * loss_cov + w_norm * loss_norm
 
-        loss_rec = loss_rec \
-                + w_repulsion * loss_repulsion \
-                + w_cov       * loss_cov \
-                + w_norm      * loss_norm
+        # ---------- (optional) small KP-level repulsion ----------
+        loss_kp_sep = torch.tensor(0.0, device=device)
+        if use_kp_repulsion:
+            def kp_repulsion(mu, s=0.15):
+                # exp(-||mu_i - mu_j||^2 / (2 s^2)) over pairs i!=j
+                d = torch.cdist(mu, mu) + 1e-6                                  # [B,K,K]
+                Kloc = mu.size(1)
+                mask = 1.0 - torch.eye(Kloc, device=mu.device)[None]
+                return (torch.exp(-(d**2) / (2*s*s)) * mask).sum((1,2)).mean()
+            loss_rec = loss_rec + w_kp_sep * kp_repulsion(mu_tot)
 
         # ---------- Priors / KLs (gated) ----------
-        logvar_kp      = getattr(self, 'logvar_kp', None)            # prior logvar for offsets
+        logvar_kp      = getattr(self, 'logvar_kp', None)
         obj_on_a_prior = getattr(self, 'obj_on_a_p', None)
         obj_on_b_prior = getattr(self, 'obj_on_b_p', None)
         mu_scale_prior = getattr(self, 'mu_scale_prior', None)
         logvar_scale_p = getattr(self, 'logvar_scale_p', None)
 
-        # KL: keypoint offsets (use encoder posterior variance if available)
+        # KL: positions/offsets
         loss_kl_kp = torch.tensor(0.0, device=device)
         if logvar_kp is not None:
             mu_post = mu_tot
@@ -2066,11 +2095,11 @@ class VoxelDLP(nn.Module):
             logvar_prior = logvar_kp.expand_as(mu_prior)
             logvar_post  = (torch.zeros_like(mu_post) if logvar_offset is None else logvar_offset)
 
-            # Align K if prior proposals > posterior (eval slicing)
+            # align K if needed (mirror your encoder keep rule)
             if mu_prior.shape[1] != mu_post.shape[1]:
                 K_post = mu_post.shape[1]
                 if (z_base_var is not None) and (z_base_var.shape[1] == mu_prior.shape[1]):
-                    total_var = z_base_var.sum(-1)                                    # [B,K_prior]
+                    total_var = z_base_var.sum(-1)                               # [B,K_prior]
                     _, keep_idx = torch.topk(total_var, k=K_post, dim=-1, largest=False)
                     b = torch.arange(mu_prior.size(0), device=device)[:, None]
                     def take(t):
@@ -2089,7 +2118,7 @@ class VoxelDLP(nn.Module):
                 (mu_post - mu_prior) ** 2 / torch.exp(logvar_prior)
                 + torch.exp(logvar_post - logvar_prior)
                 + (logvar_prior - logvar_post) - 1.0
-            ).sum(dim=-1)                                                          # [B,K]
+            ).sum(dim=-1)                                                        # [B,K]
             kl_kp = (kl_kp * kl_gate_use).sum(dim=-1) / denom(kl_gate_use)
             loss_kl_kp = kl_kp.mean()
 
@@ -2100,13 +2129,13 @@ class VoxelDLP(nn.Module):
                 (mu_scale - mu_scale_prior) ** 2 / torch.exp(logvar_scale_p)
                 + torch.exp(logvar_scale) / torch.exp(logvar_scale_p)
                 - (logvar_scale - logvar_scale_p) - 1.0
-            ).sum(dim=-1)                                                          # [B,K]
+            ).sum(dim=-1)                                                        # [B,K]
             kl_scale = (kl_scale * kl_gate).sum(dim=-1) / denom(kl_gate)
             loss_kl_scale = kl_scale.mean()
 
         # KL: features (FG/BG)
         if logvar_features is None:
-            kl_feat_obj = 0.5 * (mu_features ** 2).sum(dim=-1)                     # [B,K]
+            kl_feat_obj = 0.5 * (mu_features ** 2).sum(dim=-1)                   # [B,K]
         else:
             kl_feat_obj = 0.5 * ((mu_features ** 2) + torch.exp(logvar_features) - logvar_features - 1.0).sum(dim=-1)
         kl_feat_obj = (kl_feat_obj * kl_gate).sum(dim=-1) / denom(kl_gate)
@@ -2135,16 +2164,11 @@ class VoxelDLP(nn.Module):
                 kl_beta = kl_beta.mean(dim=-1)
             loss_kl_obj_on = kl_beta.mean()
 
-        # presence regularizer (sparsity control)
-        # Option A (original): quadratic on count
-        # active_count = (obj_on_s * w_kp).sum(dim=-1)                   # [B]
-        # loss_obj_reg = (active_count ** 2).mean()
-
-        # Option B (target fraction)
+        # presence regularizer
         target_active = getattr(self, "target_active_frac", None)
         if target_active is None:
-            active_frac = (obj_on_s * w_kp).sum(dim=-1) / denom(w_kp)            # [B] in [0,1]
-            loss_obj_reg = active_frac.mean()                                    # simple L1-like
+            active_frac = (obj_on_s * w_kp).sum(dim=-1) / denom(w_kp)              # [B] in [0,1]
+            loss_obj_reg = active_frac.mean()
         else:
             active_frac = (obj_on_s * w_kp).sum(dim=-1) / denom(w_kp)
             loss_obj_reg = ((active_frac - float(target_active)) ** 2).mean()
@@ -2152,6 +2176,13 @@ class VoxelDLP(nn.Module):
         # ---------- total ----------
         loss_kl_total = loss_kl_kp + loss_kl_scale + loss_kl_feat + loss_kl_obj_on
         loss = beta_rec * loss_rec + beta_kl * loss_kl_total + beta_obj * loss_obj_reg
+
+        assert loss_kl_total.dim() == 0, f"loss_kl_total is not scalar, shape={tuple(loss_kl_total.shape)}"        
+        assert loss_obj_reg.dim() == 0, f"loss_obj_reg is not scalar, shape={tuple(loss_obj_reg.shape)}"
+        # assert loss.dim() == 0, f"loss is not scalar, shape={tuple(loss.shape)}"
+
+        loss = loss.mean()
+
 
         return {
             'loss': loss,
@@ -2164,9 +2195,9 @@ class VoxelDLP(nn.Module):
             'kl': loss_kl_total,
             'loss_kl_kp': loss_kl_kp,
             'loss_kl_scale': loss_kl_scale,
-            'loss_kl_feat': loss_kl_feat,
+            'loss_kl_feat': kl_feat_obj + kl_feat_bg,
             'loss_kl_obj_on': loss_kl_obj_on,
-            'obj_on_l1': active_frac.mean(),   # compatibility with your logs
+            'obj_on_l1': active_frac.mean(),          # for continuity with your logs
         }
 
 

@@ -419,7 +419,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 s_mean=mu_scale_mean
             )
 
-            # break  # for debug
+            break  # for debug
         pbar.close()
         # at end of epoch
         losses.append(float(np.mean(batch_losses)))
@@ -471,10 +471,12 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             mu_b = model_output.get('mu') or model_output.get('mu_tot')
             kp_xyz = model_output['kp_p']
 
+            print("KP XYZ: ", kp_xyz.shape)
+
             with torch.no_grad():
                 idx, kp_topk, scores_topk = select_topk_keypoints(model_output, topk, prefer_logvar=True)
 
-
+            print(" KP TOPK : ", kp_topk.shape)
             # Interactive logs with adjustable marker size
             # log_pc_plotly("gt/plotly_pc_with_kp",  gt_clean, colors=None, ids=None, kps=kp_xyz, step=epoch, point_size=2)
             # log_pc_plotly("rec/plotly_pc_with_kp", rec_pts,  colors=rec_cols, ids=ids,  kps=kp_xyz, step=epoch, point_size=2)

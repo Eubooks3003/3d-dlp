@@ -495,7 +495,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             )
 
 
-            # break  # for debug
+            break  # for debug
         pbar.close()
         # at end of epoch
         losses.append(float(np.mean(batch_losses)))
@@ -576,15 +576,17 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             ids      = model_output.get('assign_ids', None)
             ids      = ids[b0] if ids is not None else None
 
+            print("gt clean: ", gt_clean.shape)
+            gt_clean = gt_clean[b0]
+
             print("REc points: ", rec_pts.shape)
 
             # --- KPs ---
-            kp_xyz = model_output.get('kp_p', None)  # [B,K,3] in [-1,1]
-            if kp_xyz is not None:
-                with torch.no_grad():
-                    idx, kp_topk, scores_topk = select_topk_keypoints(model_output, topk, prefer_logvar=True)
-            else:
-                kp_topk = None
+            kp_xyz = model_output.get('kp_p', None)[b0]  # [B,K,3] in [-1,1]
+
+            kp_topk =  model_output.get('kp_topk', None)[b0] 
+            print("KP TOPK:  ", kp_topk.shape)
+            print("KP XYZ: ", kp_xyz.shape)
 
             eff_pts = extract_effective_points_from_pointweights(model_output, thresh=0.5)
 
