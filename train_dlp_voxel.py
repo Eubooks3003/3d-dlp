@@ -495,7 +495,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             )
 
 
-            break  # for debug
+            # break  # for debug
         pbar.close()
         # at end of epoch
         losses.append(float(np.mean(batch_losses)))
