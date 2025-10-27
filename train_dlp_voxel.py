@@ -369,6 +369,44 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                  recon_loss_func=recon_loss_func,
                                  beta_obj=beta_obj)
             
+            with torch.no_grad():
+                # --- decoder-side diagnostics if present ---
+                d = model_output.get("diag", None)
+                if d:
+                    # Means across batch for concise scalars
+                    wandb.log({
+                        "spawn/r_s0": float(d["radii"][:,0].mean().item()) if d["radii"].size(1) >= 1 else None,
+                        "spawn/r_s1": float(d["radii"][:,1].mean().item()) if d["radii"].size(1) >= 2 else None,
+                        "spawn/u_std_s0": float(d["u_std"][:,0].mean().item()) if d["u_std"].size(1) >= 1 else None,
+                        "spawn/u_std_s1": float(d["u_std"][:,1].mean().item()) if d["u_std"].size(1) >= 2 else None,
+                        "spawn/scale_mean": float(d["scale_mean"].mean().item()),
+                        "spawn/d2kp_mean": float(d["d2kp_mean"].mean().item()),
+                        "spawn/d2kp_std":  float(d["d2kp_std"].mean().item()),
+                    }, step=iteration)
+                # --- object-cloud spread in world space ---
+            pts_obj = model_output.get("points_obj", None)     # [B,K,M,3]
+            kp      = model_output.get("kp_p", None)           # [B,K,3]
+            if (pts_obj is not None) and (kp is not None):
+                # per-object mean radial distance and std
+                d = (pts_obj - kp.unsqueeze(2)).norm(dim=-1)   # [B,K,M]
+                world_rad_mean = d.mean(dim=(1,2)).mean().item()
+                world_rad_std  = d.std(dim=(1,2)).mean().item()
+                wandb.log({
+                    "obj/rad_mean": world_rad_mean,
+                    "obj/rad_std":  world_rad_std
+                }, step=iteration)
+
+                # min-NN distance inside each object (sampled to keep it cheap)
+                # subsample points to avoid O(M^2)
+                B,K,M,_ = pts_obj.shape
+                m_sub = min(256, M)
+                idx = torch.randperm(M, device=pts_obj.device)[:m_sub]
+                Psub = pts_obj[:,:,idx]                        # [B,K,m_sub,3]
+                # compute KNN=2 to skip self
+                D = torch.cdist(Psub.reshape(B*K, m_sub, 3), Psub.reshape(B*K, m_sub, 3), p=2)
+                D[torch.arange(B*K, device=D.device).unsqueeze(-1), torch.arange(m_sub, device=D.device)] = 1e9
+                min_nn = D.min(dim=-1).values.mean().item()
+                wandb.log({"obj/min_nn_dist_mean": min_nn}, step=iteration)
             # --- pick tensors inside model_output to watch gradient flow through ---
             watch_tensors = {}
             for name in ["kp_p", "z", "z_scale", "mu_offset", "mu_scale",

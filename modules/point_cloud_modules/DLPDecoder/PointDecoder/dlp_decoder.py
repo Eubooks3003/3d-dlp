@@ -237,6 +237,7 @@ class DLPDecoder(nn.Module):
 
         points_obj = out["points_obj"]                        # [B,K,M,3]
         rgb_perobj = out.get("rgb_obj", None)                 # [B,K,M,3] or None
+        diag = out["diag"]
 
         # If your heads don’t already absorb w, apply it here for safety in losses:
         # keep coordinates as-is; carry w out so losses can weight them.
@@ -252,7 +253,8 @@ class DLPDecoder(nn.Module):
         return {"points_obj": points_obj,
                 "points_obj_flat": pts_flat,
                 "rgb_obj_flat": rgb_obj,
-                "obj_weights": weights}  # [B,K,1]
+                "obj_weights": weights,
+                "diag": diag}  # [B,K,1]
 
 
     # ----------------- background decode -----------------
@@ -267,24 +269,25 @@ class DLPDecoder(nn.Module):
         # 2) soft top-k mask with STE
         k   = getattr(self, "n_kp_dec", 10)
         tau = getattr(self, "topk_tau", 0.5)
-        m, _, top_idx = self.soft_topk_mask(logits, k=k, tau=tau, hard=True)  # m:[B,K,1], top_idx:[B,k]
+        # m: [B,K,1] in [0,1] (hard k-hot in forward via STE), top_idx: [B,k]
+        m, _, top_idx = self.soft_topk_mask(logits, k=k, tau=tau, hard=True)
 
         with torch.no_grad():
             sel_frac = (m.squeeze(-1) > 0.5).float().mean().item()
             print(f"[decode_all] k={k}  ~selected-obj frac={sel_frac:.3f}  (tau={tau})")
 
-        # --- NEW: gather the Top-K keypoints (positions) ---
+        # --- gather the Top-K keypoints (positions) ---
         # z: [B,K,3], top_idx: [B,k] -> kp_topk: [B,k,3]
         kp_topk = z.gather(1, top_idx.unsqueeze(-1).expand(-1, -1, z.size(-1)))
 
-        # 3) decode objects with the soft mask (keeps nice gradients)
+        # 3) decode objects with the SOFT mask (keeps nice gradients through decoder)
         obj = self.decode_objects_pc(
             z_kp=z,
             z_features=z_features,
             obj_on=obj_on,
             z_scale=z_scale,
             z_depth=z_depth,
-            kp_mask=m.squeeze(-1)
+            kp_mask=m.squeeze(-1)  # [B,K]
         )
 
         # 4) flatten objects
@@ -301,19 +304,37 @@ class DLPDecoder(nn.Module):
         pts_scene = torch.cat([pts_bg, pts_obj_flat], dim=1)
         rgb_scene = torch.cat([rgb_bg, rgb_obj_flat], dim=1) if (rgb_bg is not None and rgb_obj_flat is not None) else None
 
-        # 7) per-object -> per-point weights
+        # 7) per-point weights for OBJECT points (used by the loss)
         B, K = m.shape[:2]
-        M    = obj["points_obj"].shape[2]
-        obj_weights_per_point = (
-            m.unsqueeze(2).expand(B, K, M, 1).reshape(B, K*M, 1)
-        ).to(obj["points_obj"].dtype)
+        M    = obj["points_obj"].shape[2]  # points per object
+        # hard Top-K mask for warmup weighting only
+        hard_mask = torch.zeros_like(m)  # [B,K,1]
+        hard_mask.scatter_(1, top_idx.unsqueeze(-1), 1.0)
+
+        if warmup:
+            # Unit weights for SELECTED objects' points so offsets get strong gradients
+            point_weights = (
+                hard_mask.unsqueeze(2)                 # [B,K,1,1]
+                .expand(B, K, M, 1)
+                .reshape(B, K*M, 1)                    # [B,K*M,1]
+                .to(obj["points_obj"].dtype)
+            )
+        else:
+            # Default: soft per-object weights broadcast to their points
+            point_weights = (
+                m.unsqueeze(2)                         # [B,K,1,1]
+                .expand(B, K, M, 1)
+                .reshape(B, K*M, 1)                    # [B,K*M,1]
+                .to(obj["points_obj"].dtype)
+            )
 
         with torch.no_grad():
-            eff_obj_pts_per_batch = obj_weights_per_point.sum(dim=1).squeeze(-1)  # [B]
+            eff_obj_pts_per_batch = point_weights.sum(dim=1).squeeze(-1)  # [B]
             raw_obj_pts = torch.full((B,), K*M, device=m.device, dtype=eff_obj_pts_per_batch.dtype)
             print(f"[decode_all] raw_obj_pts={int(raw_obj_pts[0].item())}  "
                 f"eff_obj_pts≈{eff_obj_pts_per_batch[0].item():.1f}  (per batch example 0)")
         print("points scene: ", pts_scene.shape)
+        diag = obj.get("diag", None)
 
         return {
             "points_scene": pts_scene,
@@ -322,11 +343,11 @@ class DLPDecoder(nn.Module):
             "rgb_scene":    rgb_scene,
             "rgb_bg":       rgb_bg,
             "rgb_obj":      rgb_obj_flat,           # [B,K*M,3] or None
-            "obj_weights":  m,                      # [B,K,1]
-            "point_weights": obj_weights_per_point, # [B,K*M,1]
-            # --- NEW outputs ---
+            "obj_weights":  m,                      # [B,K,1]  (soft object weights)
+            "point_weights": point_weights,         # [B,K*M,1] (object points only)
             "topk_idx":     top_idx,                # [B,k]
             "kp_topk":      kp_topk,                # [B,k,3]
+            "diag": diag
         }
 
 

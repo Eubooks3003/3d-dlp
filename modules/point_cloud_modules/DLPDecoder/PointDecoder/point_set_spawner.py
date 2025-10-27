@@ -74,8 +74,10 @@ class PointSetSpawnerNSP(nn.Module):
         # slot feature pre-embed
         self.seed = nn.Sequential(nn.Linear(self.F, hidden), nn.ReLU(inplace=True))
         # learnable per-scale radii (meters): start roomy, we will anneal in training
-        init_rs = torch.tensor([0.03, 0.01][:self.S], dtype=torch.float32)  # e.g., 3cm & 1cm
-        self.scale_radius = nn.Parameter(torch.log(torch.exp(init_rs) - 1.0))
+        self.r_min = 0.06                                 # <-- floor on canonical radius (meters). Try 0.06–0.10
+        init_rs   = torch.tensor([0.12, 0.08][:self.S],   # <-- start non-tiny
+                                dtype=torch.float32)
+        self.scale_radius = nn.Parameter(torch.log(torch.exp(init_rs - self.r_min) - 1.0))
 
         # initial offsets per scale (deterministic, one-shot like your original xyz_heads)
         self.init_heads = nn.ModuleList([
@@ -121,6 +123,8 @@ class PointSetSpawnerNSP(nn.Module):
         self._use_guidance = False
         self._guidance_weight = 0.0
         self._guidance_fn = None  # callable(u_world->[B,K,M,3] -> returns grad wrt u_local)
+        self.s_min = 0.06                                 # <-- world scale floor (per axis)
+        self.s_max = 0.40
 
     def set_guidance(self, fn, weight: float):
         """
@@ -151,7 +155,7 @@ class PointSetSpawnerNSP(nn.Module):
         # ---- initialize canonical offsets per scale (bounded) ----
         u_scales, rgb_scales, w_scales = [], [], []
         for s, m in enumerate(self.Ms):
-            r_s = F.softplus(self.scale_radius[s]) + 1e-4         # scalar radius (>0)
+            r_s = self.r_min + F.softplus(self.scale_radius[s]) 
             raw = self.init_heads[s](h).view(B, K, m, 3)          # [B,K,m,3]
             u = torch.tanh(raw) * r_s                             # bounded local offsets
             u_scales.append(u)
@@ -172,7 +176,8 @@ class PointSetSpawnerNSP(nn.Module):
             for i in range(self.n_steps):
                 t_emb = t_emb_list[i].view(1, 1, 1, -1).expand(B, K, 1, -1)  # [B,K,1,E]
                 for s, m in enumerate(self.Ms):
-                    r_s = F.softplus(self.scale_radius[s]) + 1e-4
+                    r_s = self.r_min + F.softplus(self.scale_radius[s])
+
                     u = u_scales[s]                                          # [B,K,m,3]
                     # build per-point input: concat u, h, t_emb
                     h_exp  = h.unsqueeze(2).expand(B, K, m, h.shape[-1])
@@ -192,6 +197,10 @@ class PointSetSpawnerNSP(nn.Module):
                     # re-bound to local radius
                     u = torch.tanh(u / (r_s + 1e-9)) * r_s
                     u_scales[s] = u
+
+                    if self.training and getattr(self, "_add_warmup_jitter", True):
+                        u = u + 0.02 * r_s * torch.randn_like(u)
+
 
         # ---- optional per-point confidence (at final step) ----
         for s, m in enumerate(self.Ms):
@@ -213,12 +222,12 @@ class PointSetSpawnerNSP(nn.Module):
 
         # object scale (same semantics as your original; feel free to switch to exp + clamp)
         s_res = self.scale_head(z_feat)                                        # [B,K,3]
+        s_min, s_max = self.s_min, self.s_max
         if self.scale_activation == "sigmoid":
-            s_base = torch.sigmoid(z_scale)
-            s_res  = torch.sigmoid(s_res)
-            scale  = s_base * (0.5 + s_res)
+            # Map to [s_min, s_max] no matter what the network outputs
+            scale = s_min + (s_max - s_min) * torch.sigmoid(z_scale + s_res)
         else:
-            scale  = torch.exp(z_scale + s_res)
+            scale = torch.clamp(torch.exp(z_scale + s_res), s_min, s_max)
 
         pts_world = u_rot * scale.unsqueeze(2) + z_pos.unsqueeze(2)            # [B,K,M,3]
 
@@ -245,9 +254,32 @@ class PointSetSpawnerNSP(nn.Module):
         }
         if conf is not None:
             out["point_conf"] = conf       # optional: [B,K,M,1] for loss weighting / pruning
+
+        with torch.no_grad():
+            # per-scale canonical spread
+            u_std = torch.stack([u.std(dim=(1,2)) for u in u_scales], dim=1)  # [B, S, 3]
+            # radii per scale (scalars)
+            radii = torch.stack([self.r_min + F.softplus(self.scale_radius[i]) for i in range(self.S)]).unsqueeze(0).repeat(B,1)
+            # world scale stats
+            # recompute scale as in forward()
+            s_res = self.scale_head(z_feat)
+            scale = self.s_min + (self.s_max - self.s_min) * torch.sigmoid(z_scale + s_res)  # [B,K,3]
+            scale_mean = scale.mean(dim=(1,2))  # [B]
+            # distance to kp (how tight are clouds around the kp centers)
+            d_to_kp = (pts_world - z_pos.unsqueeze(2)).norm(dim=-1)  # [B,K,M]
+            d_to_kp_mean = d_to_kp.mean(dim=(1,2))                   # [B]
+            d_to_kp_std  = d_to_kp.std(dim=(1,2))                    # [B]
+
+        diag = {
+            "u_std": u_std,                 # [B,S,3]
+            "radii": radii,                 # [B,S]
+            "scale_mean": scale_mean,       # [B]
+            "d2kp_mean": d_to_kp_mean,      # [B]
+            "d2kp_std": d_to_kp_std,        # [B]
+        }
+        out["diag"] = diag
         return out
 
-    # helper: quick projection to world for guidance (uses current scale/rot/pos)
     def _to_world(self, u_local, z_pos, z_scale, z_feat, s_index: int):
         B,K,m,_ = u_local.shape
         if self.use_rotation:
@@ -256,8 +288,6 @@ class PointSetSpawnerNSP(nn.Module):
         else:
             u_rot = u_local
         s_res = self.scale_head(z_feat)
-        if self.scale_activation == "sigmoid":
-            scale = torch.sigmoid(z_scale) * (0.5 + torch.sigmoid(s_res))
-        else:
-            scale = torch.exp(z_scale + s_res)
-        return u_rot * scale.unsqueeze(2) + z_pos.unsqueeze(2)  # [B,K,m,3]
+        # NEW: same mapping as in forward()
+        scale = self.s_min + (self.s_max - self.s_min) * torch.sigmoid(z_scale + s_res)
+        return u_rot * scale.unsqueeze(2) + z_pos.unsqueeze(2)
