@@ -4,6 +4,7 @@ from typing import List, Dict, Optional
 import numpy as np
 import torch
 from datasets.point_cloud_datasets.to_scene_ds import TODataset
+from datasets.voxel_ds import VoxelDataset
 
 def get_point_cloud_dataset(
     ds: str,
@@ -25,6 +26,12 @@ def get_point_cloud_dataset(
             normalize_to_unit_cube=normalize_to_unit_cube,
             include_rgb=include_rgb,
         )
+    if ds == "voxel":
+      return VoxelDataset(
+          root=root,         # folder containing *_voxels.pt / *_meta.pt pairs
+          split=mode,        # "train" | "val" | "test"
+          sample_length=sample_length,
+      )
     raise NotImplementedError(f"Unknown point-cloud dataset: {ds}")
 
 

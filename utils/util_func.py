@@ -170,65 +170,126 @@ def reparameterize(mu, logvar, eps=None, return_eps=False):
         return z
 
 
+# --- helper: build 3D affine grid + sample (translation only for the mask utilities) ---
+def _affine_grid_sample_3d(x, theta, out_shape, mode="nearest", padding_mode="zeros"):
+    """
+    x:        [N, C, D, H, W]
+    theta:    [N, 3, 4]  (3D affine)
+    out_shape (N, C, D, H, W)
+    """
+    N, C, D, H, W = out_shape
+    grid = F.affine_grid(theta, size=out_shape, align_corners=False)     # [N, D, H, W, 3]
+    return F.grid_sample(x, grid, mode=mode, padding_mode=padding_mode, align_corners=False)
+
+
+def _as_triple(val):
+    # accept int or (D,H,W)
+    if isinstance(val, (tuple, list)):
+        assert len(val) == 3, "feature_dim/mask_size must be int or a 3-tuple (D,H,W)"
+        return int(val[0]), int(val[1]), int(val[2])
+    v = int(val)
+    return v, v, v
+
+
+# =========================
+#        3D versions
+# =========================
 def create_masks_fast(center, anchor_s, feature_dim=16, patch_size=None):
-    # center: [batch_size, n_kp, 2] in kp_range
-    # anchor_h, anchor_w: size of anchor in [0, 1]
-    batch_size, n_kp = center.shape[0], center.shape[1]
+    """
+    3D analogue of your create_masks_fast:
+      - center: [B, K, 3] in [-1,1], interpreted as (x, y, z)
+      - feature_dim: int or (D, H, W) of the target mask volume
+      - anchor_s: fraction that controls the cube side length (per-axis via (dim-1))
+    Returns:
+      [B, K, 1, D, H, W] with a single translated 1-cube per keypoint.
+    """
+    B, K = center.shape[0], center.shape[1]
+    D, H, W = _as_triple(feature_dim)
+
+    # per-axis cube size (like 2D: round(anchor_s * (dim-1)))
     if patch_size is None:
-        patch_size = np.round(anchor_s * (feature_dim - 1)).astype(int)
-    # create white rectangles
-    masks = torch.ones(batch_size * n_kp, 1, patch_size, patch_size, device=center.device).float()
-    # pad the masks to image size
-    pad_size = (feature_dim - patch_size) // 2
-    padded_patches_batch = F.pad(masks, pad=[pad_size] * 4)
-    # move the masks to be centered around the kp
-    delta_t_batch = 0.0 - center
-    delta_t_batch = delta_t_batch.reshape(-1, delta_t_batch.shape[-1])  # [bs * n_kp, 2]
-    zeros = torch.zeros([delta_t_batch.shape[0], 1], device=delta_t_batch.device).float()
-    ones = torch.ones([delta_t_batch.shape[0], 1], device=delta_t_batch.device).float()
-    theta = torch.cat([ones, zeros, delta_t_batch[:, 1].unsqueeze(-1),
-                       zeros, ones, delta_t_batch[:, 0].unsqueeze(-1)], dim=-1)
-    theta = theta.view(-1, 2, 3)  # [batch_size * n_kp, 2, 3]
-    mode = "nearest"
-    # mode = 'bilinear'
+        pd = int(np.round(anchor_s * (D - 1)))
+        ph = int(np.round(anchor_s * (H - 1)))
+        pw = int(np.round(anchor_s * (W - 1)))
+    else:
+        pd, ph, pw = _as_triple(patch_size)
 
-    trans_padded_patches_batch = affine_grid_sample(padded_patches_batch, theta, padded_patches_batch.shape, mode=mode)
+    pd = max(pd, 1); ph = max(ph, 1); pw = max(pw, 1)
 
-    trans_padded_patches_batch = trans_padded_patches_batch.view(batch_size, n_kp, *padded_patches_batch.shape[1:])
-    # [bs, n_kp, 1, feature_dim, feature_dim]
-    return trans_padded_patches_batch
+    # small cube of ones, then pad to full D,H,W
+    masks = torch.ones(B * K, 1, pd, ph, pw, device=center.device, dtype=torch.float)
+
+    # padding order for 5D pad is (W_l, W_r, H_l, H_r, D_l, D_r)
+    pad_w = (W - pw) // 2
+    pad_h = (H - ph) // 2
+    pad_d = (D - pd) // 2
+    masks = F.pad(masks, pad=(pad_w, W - pw - pad_w, pad_h, H - ph - pad_h, pad_d, D - pd - pad_d))
+
+    # translation only: place cube at kp location
+    # center is in [-1,1] for (x, y, z). We translate by Delta = 0 - center (same as your 2D code).
+    delta = (0.0 - center).reshape(-1, 3)  # [B*K, 3]
+    theta = torch.zeros(B * K, 3, 4, device=center.device, dtype=masks.dtype)
+    theta[:, 0, 0] = 1.0; theta[:, 1, 1] = 1.0; theta[:, 2, 2] = 1.0  # identity
+    theta[:, 0, 3] = delta[:, 0]  # x translation
+    theta[:, 1, 3] = delta[:, 1]  # y translation
+    theta[:, 2, 3] = delta[:, 2]  # z translation
+
+    transformed = _affine_grid_sample_3d(
+        masks, theta, (B * K, 1, D, H, W), mode="nearest", padding_mode="zeros"
+    )
+    return transformed.view(B, K, 1, D, H, W)
 
 
 def create_masks_with_scale(kp_batch, anchor_s, image_size, scale=None, scale_normalized=False):
     """
-    translate patches to be centered around given keypoints
-    kp_batch: [bs, n_kp, 2] in [-1, 1]
-    patches: [bs, n_kp, ch_patches, patch_size, patch_size]
-    scale: None or [bs, n_kp, 2] or [bs, n_kp, 1]
-    scale_normalized: False if scale is not in [0, 1]
-    :return: translated_padded_patches [bs, n_kp, ch, img_size, img_size]
+    3D analogue of create_masks_with_scale:
+      - kp_batch: [B, K, 3] in [-1,1] (x, y, z)
+      - image_size: int or (D, H, W) of the target volume
+      - if scale is None -> z_scale = (patch / image) per-axis from anchor_s
+      - else use 'scale' (sigmoid if not normalized)
+    Returns:
+      [B, K, 1, D, H, W]
     """
-    patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
-    patches_batch = torch.ones(kp_batch.shape[0], kp_batch.shape[1], 1, patch_size, patch_size,
-                               device=kp_batch.device, dtype=torch.float)
-    batch_size, n_kp, ch_patch, patch_size, _ = patches_batch.shape
-    img_size = image_size
+    B, K = kp_batch.shape[:2]
+    D, H, W = _as_triple(image_size)
+
+    # cube size driven by anchor_s per axis
+    pd = int(np.round(anchor_s * (D - 1)))
+    ph = int(np.round(anchor_s * (H - 1)))
+    pw = int(np.round(anchor_s * (W - 1)))
+    pd = max(pd, 1); ph = max(ph, 1); pw = max(pw, 1)
+
+    patches = torch.ones(B, K, 1, pd, ph, pw, device=kp_batch.device, dtype=torch.float)
+    N = B * K
+
     if scale is None:
-        z_scale = (patch_size / img_size) * torch.ones_like(kp_batch)
+        z_scale = torch.tensor(
+            [pd / D, ph / H, pw / W], device=kp_batch.device, dtype=kp_batch.dtype
+        ).view(1, 1, 3).expand(B, K, 3)
     else:
-        # normalize to [0, 1]
-        if scale_normalized:
-            z_scale = scale
-        else:
-            z_scale = torch.sigmoid(scale)  # -> [0, 1]
-    z_pos = kp_batch.reshape(-1, kp_batch.shape[-1])  # [bs * n_kp, 2]
-    z_scale = z_scale.view(-1, z_scale.shape[-1])  # [bs * n_kp, 2]
-    patches_batch = patches_batch.reshape(-1, *patches_batch.shape[2:])
-    out_dims = (batch_size * n_kp, ch_patch, img_size, img_size)
-    trans_patches_batch = spatial_transform(patches_batch, z_pos, z_scale, out_dims, inverse=True)
-    trans_padded_patches_batch = trans_patches_batch.view(batch_size, n_kp, *trans_patches_batch.shape[1:])
-    # [bs, n_kp, 1, img_size, img_size]
-    return trans_padded_patches_batch
+        z_scale = scale if scale_normalized else torch.sigmoid(scale)  # [B, K, 3] in (0,1)
+
+    z_pos   = kp_batch.reshape(-1, 3)        # [N, 3]
+    z_scale = z_scale.view(-1, 3)            # [N, 3]
+    patches = patches.view(N, 1, pd, ph, pw) # [N, 1, pd, ph, pw]
+
+    # build affine theta (scale+translate), then use inverse=True behavior:
+    # Instead of duplicating your spatial_transform_3d, construct theta^{-1} explicitly.
+    # For inverse grid: diag = 1/scale, trans = -pos/scale  (same as your 2D inverse branch)
+    eps = 1e-9
+    inv_theta = torch.zeros(N, 3, 4, device=kp_batch.device, dtype=patches.dtype)
+    inv_theta[:, 0, 0] = 1.0 / (z_scale[:, 0] + eps)
+    inv_theta[:, 1, 1] = 1.0 / (z_scale[:, 1] + eps)
+    inv_theta[:, 2, 2] = 1.0 / (z_scale[:, 2] + eps)
+    inv_theta[:, 0, 3] = - z_pos[:, 0] / (z_scale[:, 0] + eps)
+    inv_theta[:, 1, 3] = - z_pos[:, 1] / (z_scale[:, 1] + eps)
+    inv_theta[:, 2, 3] = - z_pos[:, 2] / (z_scale[:, 2] + eps)
+
+    out = _affine_grid_sample_3d(
+        patches, inv_theta, (N, 1, D, H, W), mode="nearest", padding_mode="zeros"
+    )
+    return out.view(B, K, 1, D, H, W)
+
 
 
 
@@ -831,39 +892,42 @@ def animate_trajectories(orig_trajectory, pred_trajectory, pred_trajectory_2=Non
     imageio.mimsave(path, total_images, duration=(1000 / duration), loop=0)  # 1/50
 
 
+import torch
+import torch.nn.functional as F
+
 def spatial_transform(image, z_pos, z_scale, out_dims, inverse=False, eps=1e-9, padding_mode="zeros"):
     """
-    https://github.com/zhixuan-lin/G-SWM
-    spatial transformer network used to scale and shift input according to z_where in:
-            1/ x -> x_att   -- shapes (H, W) -> (attn_window, attn_window) -- thus inverse = False
-            2/ y_att -> y   -- (attn_window, attn_window) -> (H, W) -- thus inverse = True
-    inverting the affine transform as follows: A_inv ( A * image ) = image
-    A = [R | T] where R is rotation component of angle alpha, T is [tx, ty] translation component
-    A_inv rotates by -alpha and translates by [-tx, -ty]
-    if x' = R * x + T  -->  x = R_inv * (x' - T) = R_inv * x - R_inv * T
-    here, z_where is 3-dim [scale, tx, ty] so inverse transform is [1/scale, -tx/scale, -ty/scale]
-    R = [[s, 0],  ->  R_inv = [[1/s, 0],
-         [0, s]]               [0, 1/s]]
-    ------
-    image: [batch_size * n_kp, ch, h, w]
-    z_pos: [batch_size * n_kp, 2]
-    z_scale: [batch_size * n_kp, 2]
-    out_dims: tuple (batch_size * n_kp, ch, h*, w*)
+    3D spatial transformer.
+    image:   [batch_size * n_kp, ch, D, H, W]
+    z_pos:   [batch_size * n_kp, 3]   (x, y, z) in [-1, 1]
+    z_scale: [batch_size * n_kp, 3]   (sx, sy, sz) in (0, 1] if forward; unnormalized if inverse is False -> same as 2D code
+    out_dims: tuple (batch_size * n_kp, ch, D*, H*, W*)
     """
-    # 0. validate values range
-    # z_pos = z_pos.clamp(-1, 1)
-    # z_scale = z_scale.clamp(0, 1)
-    # 1. construct 2x3 affine matrix for each datapoint in the batch
-    theta = torch.zeros(2, 3, device=image.device).repeat(image.shape[0], 1, 1)
-    # set scaling
-    theta[:, 0, 0] = z_scale[:, 1] if not inverse else 1 / (z_scale[:, 1] + eps)
-    theta[:, 1, 1] = z_scale[:, 0] if not inverse else 1 / (z_scale[:, 0] + eps)
+    N = image.shape[0]
+    theta = torch.zeros(N, 3, 4, device=image.device, dtype=image.dtype)
 
-    # set translation
-    theta[:, 0, -1] = z_pos[:, 1] if not inverse else - z_pos[:, 1] / (z_scale[:, 1] + eps)
-    theta[:, 1, -1] = z_pos[:, 0] if not inverse else - z_pos[:, 0] / (z_scale[:, 0] + eps)
-    # construct sampling grid and sample image from grid
-    return affine_grid_sample(image, theta, out_dims, mode='bilinear', padding_mode=padding_mode)
+    if not inverse:
+        sx = z_scale[:, 0]; sy = z_scale[:, 1]; sz = z_scale[:, 2]
+        tx = z_pos[:, 0];   ty = z_pos[:, 1];   tz = z_pos[:, 2]
+    else:
+        sx = 1.0 / (z_scale[:, 0] + eps)
+        sy = 1.0 / (z_scale[:, 1] + eps)
+        sz = 1.0 / (z_scale[:, 2] + eps)
+        tx = - z_pos[:, 0] / (z_scale[:, 0] + eps)
+        ty = - z_pos[:, 1] / (z_scale[:, 1] + eps)
+        tz = - z_pos[:, 2] / (z_scale[:, 2] + eps)
+
+    # diag scales
+    theta[:, 0, 0] = sx
+    theta[:, 1, 1] = sy
+    theta[:, 2, 2] = sz
+    # translations
+    theta[:, 0, 3] = tx
+    theta[:, 1, 3] = ty
+    theta[:, 2, 3] = tz
+
+    grid = F.affine_grid(theta, out_dims, align_corners=False)     # [N, D*, H*, W*, 3]
+    return F.grid_sample(image, grid, mode='bilinear', padding_mode=padding_mode, align_corners=False)
 
 
 def generate_dlp_logo():

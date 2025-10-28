@@ -15,10 +15,11 @@ import torchvision.utils as vutils
 import torch.optim as optim
 # modules
 from models import DLP
-from voxel_models import VoxelDLP
+from voxel_models import DLP
 # datasets
 from datasets.get_dataset import get_image_dataset
 from datasets.point_cloud_datasets.get_dataset import get_point_cloud_dataset, pc_collate
+from datasets.voxelize_ds_wrapper import VoxelizedDataset
 # util functions
 from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save_config, log_line,
                              plot_bb_on_image_batch_from_z_scale_nms, plot_bb_on_image_batch_from_masks_nms,
@@ -140,23 +141,20 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # Point Cloud Stuff
 
     decoder_point_mode = config["decoder_point_mode"]
-    points_per_object = config["points_per_object"]
-    points_per_scale = config["points_per_scale"]
-    points_bg = config["points_bg"]
 
     # Voxel Stuff
     voxel_mode = config["voxel_mode"]
     voxel_grid_whd = config["voxel_grid_whd"]
 
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=pc_collate)
 
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
     # model
 
-    model = VoxelDLP(
+    model = DLP(
         cdim=ch,  # Number of input image channels
-        image_size=image_size,  # Input image size (assumed square)
+        image_size=voxel_grid_whd[0],  # TODO: this is a jank way of dealing with sizes
         normalize_rgb=normalize_rgb,  # If True, normalize RGB to [-1, 1], else keep [0, 1]
 
         # Keypoint and patch configuration
@@ -217,16 +215,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         depth_feature_dim=depth_feature_dim,
         split_loss=split_loss, 
         depth_loss_ratio=depth_loss_ratio,
-        
-        # PC Stuff
-        decoder_point_mode=decoder_point_mode,
-        points_per_object=points_per_object,
-        points_per_scale=points_per_scale,
-        points_bg=points_bg,
-
-        # Voxel Stuff
-        voxel_mode=voxel_mode,
-        voxel_grid_whd=voxel_grid_whd,
+    
         ).to(device)
         
     model_info = model.info()
@@ -357,12 +346,15 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
-            pts  = batch["points"].to(device)   # [B, N, 3]
-            mask = batch["mask"].to(device) 
+            vox  = batch["voxels"].to(device)  
+            print("VOX: ", vox.shape)
+            vox  = batch["voxels"].to(device)  
+
+            # mask = batch["mask"].to(device) 
 
             warmup = (epoch < warmup_epoch)
             # forward pass
-            model_output = model(pts, mask, warmup=warmup, with_loss=True,
+            model_output = model(vox, warmup=warmup, with_loss=True,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
@@ -486,7 +478,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             mu_scale_mean   = _to_float(torch.sigmoid(mu_scale) if mu_scale is not None else None)
 
             # point count sanity
-            valid_points    = _to_float(mask.float().sum(dim=1) if mask is not None else None)
+            # valid_points    = _to_float(mask.float().sum(dim=1) if mask is not None else None)
             valid_points    = int(valid_points) if not isinstance(valid_points, float) else valid_points
 
             # --- collect per-batch scalars ---

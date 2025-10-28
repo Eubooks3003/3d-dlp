@@ -129,24 +129,39 @@ def custom_to_pil(x):
         x = x.convert("RGB")
     return x
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ---- helpers ----
+def _norm3d(C):
+    # GroupNorm works for any spatial rank; safer than BatchNorm2d for 3D.
+    groups = 32 if C >= 32 else max(1, C // 4)
+    return nn.GroupNorm(groups, C)
+
+# Reuse your existing 'nonlinearity' if defined; otherwise:
+try:
+    nonlinearity
+except NameError:
+    def nonlinearity(x):  # SiLU as in many UNets
+        return F.silu(x, inplace=True)
+
+# ============================ 3D VERSIONS ============================
 
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv, padding_mode='zeros', mode='nearest'):
         super().__init__()
         self.with_conv = with_conv
-        self.mode = mode
+        self.mode = mode  # 'nearest' or 'trilinear'
         if self.with_conv:
-            self.conv = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1, padding_mode=padding_mode)
+            self.conv = nn.Conv3d(in_channels, in_channels, kernel_size=3, stride=1, padding=1,
+                                  padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
 
     def forward(self, x):
-        if self.mode == 'bilinear':
-            x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode=self.mode, align_corners=False)
+        if self.mode == 'trilinear':
+            x = F.interpolate(x, scale_factor=2.0, mode='trilinear', align_corners=False)
         else:
-            x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode=self.mode)
+            x = F.interpolate(x, scale_factor=2.0, mode='nearest')
         if self.with_conv:
             x = self.conv(x)
         return x
@@ -157,26 +172,24 @@ class Downsample(nn.Module):
         super().__init__()
         self.with_conv = with_conv
         self.use_conv_block = use_conv_block
-        self.padding_mode = 'constant' if padding_mode == 'zeros' else padding_mode
+        # F.pad for 5D supports 'constant' reliably; map others to 'constant'
+        self.padding_mode = 'constant'
         if self.with_conv:
-            # no asymmetric padding in torch conv, must do it ourselves
             if self.use_conv_block:
-                self.conv = ConvBlock(in_channels=in_channels, out_channels=in_channels, dropout=0.0, padding=0,
-                                      stride=2, kernel_size=3)
+                self.conv = ConvBlock(in_channels=in_channels, out_channels=in_channels,
+                                      dropout=0.0, padding=0, stride=2, kernel_size=3, padding_mode='zeros')
             else:
-                self.conv = torch.nn.Conv2d(in_channels,
-                                            in_channels,
-                                            kernel_size=3,
-                                            stride=2,
-                                            padding=0)
+                self.conv = nn.Conv3d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+        else:
+            self.avg = nn.AvgPool3d(kernel_size=2, stride=2)
 
     def forward(self, x):
         if self.with_conv:
-            pad = (0, 1, 0, 1)
-            x = torch.nn.functional.pad(x, pad, mode=self.padding_mode, value=0)
+            # pad (W0,W1,H0,H1,D0,D1)
+            x = F.pad(x, (0,1, 0,1, 0,1), mode=self.padding_mode, value=0)
             x = self.conv(x)
         else:
-            x = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
+            x = self.avg(x)
         return x
 
 
@@ -187,23 +200,17 @@ class ConvBlock(nn.Module):
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
-        self.conv = torch.nn.Conv2d(in_channels,
-                                    out_channels,
-                                    kernel_size=kernel_size,
-                                    stride=stride,
-                                    padding=padding, padding_mode=padding_mode)
-        if temb_channels > 0:
-            self.temb_proj = torch.nn.Linear(temb_channels,
-                                             out_channels)
-        self.norm = norm_layer(out_channels)
-        self.dropout = torch.nn.Dropout(dropout)
+
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
+                              padding=padding, padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+        self.temb_proj = nn.Linear(temb_channels, out_channels) if temb_channels > 0 else None
+        self.norm = _norm3d(out_channels)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, temb=None):
-        h = x
-        h = self.conv(h)
-        if temb is not None:
-            h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None]
-
+        h = self.conv(x)
+        if temb is not None and self.temb_proj is not None:
+            h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None, None]
         h = self.norm(h)
         h = nonlinearity(h)
         h = self.dropout(h)
@@ -219,44 +226,29 @@ class ResnetBlock(nn.Module):
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        self.norm1 = norm_layer(in_channels)
-        self.conv1 = torch.nn.Conv2d(in_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1, padding_mode=padding_mode)
-        if temb_channels > 0:
-            self.temb_proj = torch.nn.Linear(temb_channels,
-                                             out_channels)
-        self.norm2 = norm_layer(out_channels)
-        self.dropout = torch.nn.Dropout(dropout)
-        self.conv2 = torch.nn.Conv2d(out_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1, padding_mode=padding_mode)
+        self.norm1 = _norm3d(in_channels)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                               padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+        self.temb_proj = nn.Linear(temb_channels, out_channels) if temb_channels > 0 else None
+        self.norm2 = _norm3d(out_channels)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                               padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                self.conv_shortcut = torch.nn.Conv2d(in_channels,
-                                                     out_channels,
-                                                     kernel_size=3,
-                                                     stride=1,
-                                                     padding=1, padding_mode=padding_mode)
+                self.conv_shortcut = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                                               padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
             else:
-                self.nin_shortcut = torch.nn.Conv2d(in_channels,
-                                                    out_channels,
-                                                    kernel_size=1,
-                                                    stride=1,
-                                                    padding=0)
+                self.nin_shortcut = nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x, temb):
-        h = x
-        h = self.norm1(h)
+        h = self.norm1(x)
         h = nonlinearity(h)
         h = self.conv1(h)
 
-        if temb is not None:
-            h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None]
+        if temb is not None and self.temb_proj is not None:
+            h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None, None]
 
         h = self.norm2(h)
         h = nonlinearity(h)
@@ -264,10 +256,7 @@ class ResnetBlock(nn.Module):
         h = self.conv2(h)
 
         if self.in_channels != self.out_channels:
-            if self.use_conv_shortcut:
-                x = self.conv_shortcut(x)
-            else:
-                x = self.nin_shortcut(x)
+            x = self.conv_shortcut(x) if self.use_conv_shortcut else self.nin_shortcut(x)
 
         return x + h
 
@@ -276,53 +265,30 @@ class AttnBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.in_channels = in_channels
-
-        self.norm = norm_layer(in_channels)
-        self.q = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.k = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.v = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.proj_out = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0)
+        self.norm = _norm3d(in_channels)
+        self.q = nn.Conv3d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.k = nn.Conv3d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.v = nn.Conv3d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.proj_out = nn.Conv3d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
-        h_ = x
-        h_ = self.norm(h_)
+        h_ = self.norm(x)
         q = self.q(h_)
         k = self.k(h_)
         v = self.v(h_)
 
-        # compute attention
-        b, c, h, w = q.shape
-        q = q.reshape(b, c, h * w)
-        q = q.permute(0, 2, 1)  # b,hw,c
-        k = k.reshape(b, c, h * w)  # b,c,hw
-        w_ = torch.bmm(q, k)  # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c) ** (-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
+        b, c, d, h, w = q.shape
+        n = d * h * w
+        q = q.reshape(b, c, n).permute(0, 2, 1)  # [B, N, C]
+        k = k.reshape(b, c, n)                   # [B, C, N]
+        attn = torch.bmm(q, k) * (c ** -0.5)     # [B, N, N]
+        attn = F.softmax(attn, dim=2)
 
-        # attend to values
-        v = v.reshape(b, c, h * w)
-        w_ = w_.permute(0, 2, 1)  # b,hw,hw (first hw of k, second of q)
-        h_ = torch.bmm(v, w_)  # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-        h_ = h_.reshape(b, c, h, w)
-
+        v = v.reshape(b, c, n)                   # [B, C, N]
+        attn_t = attn.permute(0, 2, 1)           # [B, N, N]
+        h_ = torch.bmm(v, attn_t)                # [B, C, N]
+        h_ = h_.reshape(b, c, d, h, w)
         h_ = self.proj_out(h_)
-
         return x + h_
 
 
@@ -336,31 +302,19 @@ class Encoder(nn.Module):
         self.temb_ch = 0
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
-        self.resolution = resolution
+        self.resolution = resolution  # assume cubic D=H=W=resolution
         self.in_channels = in_channels
         self.padding_mode = padding_mode
         self.use_attention = attention
         self.residual = residual
         self.mid_blocks = mid_blocks
+
         block_nn = ResnetBlock if self.residual else ConvBlock
 
-        # downsampling
-        # if self.residual:
-        #     self.conv_in = torch.nn.Conv2d(in_channels,
-        #                                    self.ch,
-        #                                    kernel_size=3,
-        #                                    stride=1,
-        #                                    padding=1, padding_mode=self.padding_mode)
-        # else:
-        #     self.conv_in = ConvBlock(in_channels=in_channels, out_channels=self.ch, padding_mode=self.padding_mode,
-        #                              temb_channels=self.temb_ch, dropout=dropout)
-
         first_conv_pad = in_conv_kernel_size // 2
-        self.conv_in = torch.nn.Conv2d(in_channels,
-                                       self.ch,
-                                       kernel_size=in_conv_kernel_size,
-                                       stride=1,
-                                       padding=first_conv_pad, padding_mode=self.padding_mode)
+        self.conv_in = nn.Conv3d(in_channels, self.ch, kernel_size=in_conv_kernel_size, stride=1,
+                                 padding=first_conv_pad,
+                                 padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
 
         curr_res = resolution
         in_ch_mult = (1,) + tuple(ch_mult)
@@ -370,84 +324,52 @@ class Encoder(nn.Module):
             attn = nn.ModuleList()
             block_in = ch * in_ch_mult[i_level]
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks):
+            for _ in range(self.num_res_blocks):
                 block.append(block_nn(in_channels=block_in,
                                       out_channels=block_out,
                                       temb_channels=self.temb_ch,
                                       dropout=dropout, padding_mode=self.padding_mode))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    if attention:
-                        attn.append(AttnBlock(block_in))
-                    else:
-                        attn.append(nn.Identity())
+                    attn.append(AttnBlock(block_in) if attention else nn.Identity())
             down = nn.Module()
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions - 1:
-                # down.downsample = Downsample(block_in, resamp_with_conv, padding_mode=padding_mode,
-                #                              use_conv_block=not self.residual)
-                down.downsample = Downsample(block_in, resamp_with_conv, padding_mode=padding_mode)
+                down.downsample = Downsample(block_in, resamp_with_conv, padding_mode=self.padding_mode)
                 curr_res = curr_res // 2
             self.down.append(down)
 
         # middle
         self.mid = nn.Module()
-
         if self.mid_blocks:
-            self.mid.block_1 = block_nn(in_channels=block_in,
-                                        out_channels=block_in,
-                                        temb_channels=self.temb_ch,
-                                        dropout=dropout, padding_mode=self.padding_mode)
-            if attention:
-                self.mid.attn_1 = AttnBlock(block_in)
-            else:
-                self.mid.attn_1 = nn.Identity()
-            self.mid.block_2 = block_nn(in_channels=block_in,
-                                        out_channels=block_in,
-                                        temb_channels=self.temb_ch,
-                                        dropout=dropout, padding_mode=self.padding_mode)
+            self.mid.block_1 = block_nn(in_channels=block_in, out_channels=block_in,
+                                        temb_channels=self.temb_ch, dropout=dropout, padding_mode=self.padding_mode)
+            self.mid.attn_1 = AttnBlock(block_in) if attention else nn.Identity()
+            self.mid.block_2 = block_nn(in_channels=block_in, out_channels=block_in,
+                                        temb_channels=self.temb_ch, dropout=dropout, padding_mode=self.padding_mode)
         else:
             self.mid.block_1 = nn.Identity()
             self.mid.attn_1 = nn.Identity()
             self.mid.block_2 = nn.Identity()
 
-        # if attention:
-        #     self.mid.block_1 = block_nn(in_channels=block_in,
-        #                                 out_channels=block_in,
-        #                                 temb_channels=self.temb_ch,
-        #                                 dropout=dropout, padding_mode=self.padding_mode)
-        #     self.mid.attn_1 = AttnBlock(block_in)
-        #     self.mid.block_2 = block_nn(in_channels=block_in,
-        #                                 out_channels=block_in,
-        #                                 temb_channels=self.temb_ch,
-        #                                 dropout=dropout, padding_mode=self.padding_mode)
-        # else:
-        #     self.mid.block_1 = nn.Identity()
-        #     self.mid.attn_1 = nn.Identity()
-        #     self.mid.block_2 = nn.Identity()
-
         # end
-        self.norm_out = norm_layer(block_in) if self.residual else nn.Identity()
-        self.conv_out = torch.nn.Conv2d(block_in,
-                                        2 * z_channels if double_z else z_channels,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1, padding_mode=self.padding_mode)
+        self.norm_out = _norm3d(block_in) if self.residual else nn.Identity()
+        self.conv_out = nn.Conv3d(block_in, 2 * z_channels if double_z else z_channels,
+                                  kernel_size=3, stride=1, padding=1,
+                                  padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
         self.conv_output_size = self.calc_conv_output_size()
 
     def calc_conv_output_size(self):
-        dummy_input = torch.zeros(1, self.in_channels, self.resolution, self.resolution)
-        dummy_input = self(dummy_input)
-        return dummy_input[0].shape
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, self.in_channels, self.resolution, self.resolution, self.resolution)
+            dummy_out = self.forward(dummy_input)
+        # returns [C_out, D_out, H_out, W_out]
+        return dummy_out.shape[1:]
 
     def forward(self, x):
-        # assert x.shape[2] == x.shape[3] == self.resolution, "{}, {}, {}".format(x.shape[2], x.shape[3], self.resolution)
-
-        # timestep embedding
+        # x: [B, C, D, H, W]
         temb = None
-
-        # downsampling
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -458,14 +380,12 @@ class Encoder(nn.Module):
             if i_level != self.num_resolutions - 1:
                 hs.append(self.down[i_level].downsample(hs[-1]))
 
-        # middle
         h = hs[-1]
         if self.mid_blocks:
             h = self.mid.block_1(h, temb)
             h = self.mid.attn_1(h)
             h = self.mid.block_2(h, temb)
 
-        # end
         if self.residual:
             h = self.norm_out(h)
             h = nonlinearity(h)
@@ -473,6 +393,15 @@ class Encoder(nn.Module):
         return h
 
 class Decoder(nn.Module):
+    """
+    3D-aware version of your Decoder.
+
+    Args:
+      ch, out_ch, ch_mult, num_res_blocks, attn_resolutions, dropout, resamp_with_conv, residual,
+      resolution: int or (D,H,W)  -> full output spatial size
+      z_channels: channels of latent tensor at lowest resolution
+      give_pre_end, padding_mode, attention, mid_blocks, upsample_method ('nearest'|'trilinear')
+    """
     def __init__(self, *, ch, out_ch, ch_mult=(1, 2, 4, 8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, residual=True,
                  resolution, z_channels, give_pre_end=False, padding_mode='zeros', attention=False,
@@ -482,82 +411,56 @@ class Decoder(nn.Module):
         self.temb_ch = 0
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
-        self.resolution = resolution
-        # self.in_channels = in_channels
+        self.residual = residual
         self.give_pre_end = give_pre_end
         self.padding_mode = padding_mode
         self.use_attention = attention
-        self.residual = residual
         self.mid_blocks = mid_blocks
         self.upsample_method = upsample_method
+
+        # resolution handling (3D)
+        D = H = W = resolution
+
+        # lowest resolution (after downsampling n-1 times)
+        d0 = D // 2 ** (self.num_resolutions - 1)
+        h0 = H // 2 ** (self.num_resolutions - 1)
+        w0 = W // 2 ** (self.num_resolutions - 1)
+        self.z_shape = (1, z_channels, d0, h0, w0)
+
+        # choose block type
         block_nn = ResnetBlock if self.residual else ConvBlock
 
-        # compute in_ch_mult, block_in and curr_res at lowest res
+        # compute in_ch_mult, block_in and curr_res
         in_ch_mult = (1,) + tuple(ch_mult)
         block_in = ch * ch_mult[self.num_resolutions - 1]
-        curr_res = resolution // 2 ** (self.num_resolutions - 1)
-        self.z_shape = (1, z_channels, curr_res, curr_res)
-        # print("Working with z of shape {} = {} dimensions.".format(
-        #     self.z_shape, np.prod(self.z_shape)))
+        curr_res_d, curr_res_h, curr_res_w = d0, h0, w0
 
         # z to block_in
-        # if self.residual:
-        #     self.conv_in = torch.nn.Conv2d(z_channels,
-        #                                    block_in,
-        #                                    kernel_size=3,
-        #                                    stride=1,
-        #                                    padding=1, padding_mode=self.padding_mode)
-        # else:
-        #     self.conv_in = ConvBlock(in_channels=z_channels, out_channels=block_in, padding_mode=self.padding_mode,
-        #                              temb_channels=self.temb_ch, dropout=dropout)
-
-        self.conv_in = torch.nn.Conv2d(z_channels,
-                                       block_in,
-                                       kernel_size=3,
-                                       stride=1,
-                                       padding=1, padding_mode=self.padding_mode)
+        self.conv_in = nn.Conv3d(z_channels, block_in, kernel_size=3, stride=1, padding=1, padding_mode=self.padding_mode)
 
         # middle
         self.mid = nn.Module()
-
         if self.mid_blocks:
             self.mid.block_1 = block_nn(in_channels=block_in,
                                         out_channels=block_in,
                                         temb_channels=self.temb_ch,
                                         dropout=dropout, padding_mode=self.padding_mode)
-            if attention:
-                self.mid.attn_1 = AttnBlock(block_in)
-            else:
-                self.mid.attn_1 = nn.Identity()
+            # 3D attention block can be added here; identity for now
+            self.mid.attn_1 = nn.Identity()
             self.mid.block_2 = block_nn(in_channels=block_in,
                                         out_channels=block_in,
                                         temb_channels=self.temb_ch,
                                         dropout=dropout, padding_mode=self.padding_mode)
         else:
             self.mid.block_1 = nn.Identity()
-            self.mid.attn_1 = nn.Identity()
+            self.mid.attn_1  = nn.Identity()
             self.mid.block_2 = nn.Identity()
-
-        # if attention:
-        #     self.mid.block_1 = block_nn(in_channels=block_in,
-        #                                 out_channels=block_in,
-        #                                 temb_channels=self.temb_ch,
-        #                                 dropout=dropout, padding_mode=self.padding_mode)
-        #     self.mid.attn_1 = AttnBlock(block_in)
-        #     self.mid.block_2 = block_nn(in_channels=block_in,
-        #                                 out_channels=block_in,
-        #                                 temb_channels=self.temb_ch,
-        #                                 dropout=dropout, padding_mode=self.padding_mode)
-        # else:
-        #     self.mid.block_1 = nn.Identity()
-        #     self.mid.attn_1 = nn.Identity()
-        #     self.mid.block_2 = nn.Identity()
 
         # upsampling
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
-            attn = nn.ModuleList()
+            attn  = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
             for i_block in range(self.num_res_blocks + 1):
                 block.append(block_nn(in_channels=block_in,
@@ -565,46 +468,36 @@ class Decoder(nn.Module):
                                       temb_channels=self.temb_ch,
                                       dropout=dropout, padding_mode=self.padding_mode))
                 block_in = block_out
-                if curr_res in attn_resolutions:
-                    if attention:
-                        attn.append(AttnBlock(block_in))
-                    else:
-                        attn.append(nn.Identity())
+                # attention resolutions (use D resolution to decide)
+                if curr_res_d in attn_resolutions:
+                    attn.append(nn.Identity())  # placeholder for 3D attention if you add it
             up = nn.Module()
             up.block = block
-            up.attn = attn
+            up.attn  = attn
             if i_level != 0:
-                # with_conv = resamp_with_conv if residual else False
-                with_conv = resamp_with_conv
-                up.upsample = Upsample(block_in, with_conv, padding_mode=self.padding_mode, mode=self.upsample_method)
-                curr_res = curr_res * 2
-            self.up.insert(0, up)  # prepend to get consistent order
+                up.upsample = Upsample(block_in, with_conv=resamp_with_conv,
+                                         padding_mode=self.padding_mode, mode=self.upsample_method)
+                curr_res_d *= 2
+                curr_res_h *= 2
+                curr_res_w *= 2
+            self.up.insert(0, up)
 
         # end
         self.norm_out = norm_layer(block_in) if self.residual else nn.Identity()
-        self.conv_out = torch.nn.Conv2d(block_in,
-                                        out_ch,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1, padding_mode=self.padding_mode)
+        self.conv_out = nn.Conv3d(block_in, out_ch, kernel_size=3, stride=1, padding=1, padding_mode=self.padding_mode)
 
     def forward(self, z):
-        # assert z.shape[1:] == self.z_shape[1:]
+        # z: [B, C, d0, h0, w0]  expected to match self.z_shape[1:]
         self.last_z_shape = z.shape
-
-        # timestep embedding
         temb = None
 
-        # z to block_in
         h = self.conv_in(z)
 
-        # middle
         if self.mid_blocks:
             h = self.mid.block_1(h, temb)
             h = self.mid.attn_1(h)
             h = self.mid.block_2(h, temb)
 
-        # upsampling
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 h = self.up[i_level].block[i_block](h, temb)
@@ -613,7 +506,6 @@ class Decoder(nn.Module):
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
-        # end
         if self.give_pre_end:
             return h
 
@@ -622,7 +514,7 @@ class Decoder(nn.Module):
             h = nonlinearity(h)
         h = self.conv_out(h)
         return h
-
+    
 class LPIPS(nn.Module):
     # Learned perceptual metric
     def __init__(self, use_dropout=True):
