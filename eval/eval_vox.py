@@ -1,438 +1,329 @@
-# eval/eval_vox.py
-import math
 import numpy as np
-import torch
-import wandb
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+import torch, wandb
 
-
-# ---------------------------
-# basic utils
-# ---------------------------
-def to_np(x):
-    if x is None:
-        return None
-    if torch.is_tensor(x):
+# ---------- small utils ----------
+def _np(x):
+    if x is None: return None
+    if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     return np.asarray(x)
 
-def clamp01(x):
-    if x is None: return None
-    if torch.is_tensor(x):
-        return x.clamp(0, 1)
-    return np.clip(x, 0, 1)
-
-def _ensure_5d(vol):
-    """
-    Accepts [B,C,D,H,W] | [C,D,H,W] | [D,H,W] (float or bool).
-    Returns (V, B, C) where V is np.float32 [B,C,D,H,W].
-    """
+def _as_DHW(vol):
+    """Accept [D,H,W], [1,D,H,W], or [C,D,H,W] with C==1; return [D,H,W] or None."""
     if vol is None:
-        return None, 0, 0
-    if torch.is_tensor(vol):
-        vol = vol.detach().cpu().float()
-    vol = np.asarray(vol)
-
-    if vol.ndim == 5:
-        B, C = int(vol.shape[0]), int(vol.shape[1])
-    elif vol.ndim == 4:
-        vol = vol[None, ...]     # [1,C,D,H,W]
-        B, C = 1, int(vol.shape[1])
-    elif vol.ndim == 3:
-        vol = vol[None, None, ...]  # [1,1,D,H,W]
-        B, C = 1, 1
-    else:
-        raise ValueError(f"volume must be [B,C,D,H,W] or [C,D,H,W] or [D,H,W], got {vol.shape}")
-    return vol.astype(np.float32), B, C
-
-def _center_slices(v_np):
-    """
-    v_np: [C,D,H,W] or [1,D,H,W]
-    Returns dict with mid XY/XZ/YZ slice (as 2D arrays).
-    """
-    if v_np.ndim == 4:
-        C, D, H, W = v_np.shape
-    elif v_np.ndim == 3:
-        C, D, H, W = 1, *v_np.shape
-        v_np = v_np[None, ...]
-    else:
-        raise ValueError(f"expected [C,D,H,W] got {v_np.shape}")
-
-    c = min(C, 1)   # show the first channel by default
-    v0 = v_np[0] if C >= 1 else v_np[0]
-    d2, h2, w2 = D // 2, H // 2, W // 2
-    return {
-        "XY@z": v0[d2, :, :],      # [H,W]
-        "XZ@y": v0[:, h2, :],      # [D,W]
-        "YZ@x": v0[:, :, w2],      # [D,H]
-    }
-
-def _format_slice(ax, img, title, cmap="magma"):
-    ax.imshow(img, cmap=cmap, origin="lower", interpolation="nearest")
-    ax.set_title(title, fontsize=9)
-    ax.set_xticks([]); ax.set_yticks([])
-
-def _normalize_for_plot(vol, per_volume=True):
-    """
-    Put arbitrary floats into [0,1] per-volume for nicer plotting.
-    """
-    v = vol.copy()
-    if per_volume:
-        lo = np.nanpercentile(v, 1)
-        hi = np.nanpercentile(v, 99)
-        if not math.isfinite(lo) or not math.isfinite(hi) or abs(hi - lo) < 1e-8:
-            return np.zeros_like(v)
-        v = (v - lo) / (hi - lo + 1e-12)
-        v = np.clip(v, 0, 1)
-    return v
-
-# ---------------------------
-# metrics
-# ---------------------------
-def vox_iou(pred, target, thresh=0.5):
-    """
-    IoU for binary occupancy volumes.
-    Accepts [B,1,D,H,W] or [B,D,H,W] etc.
-    """
-    p, B, C = _ensure_5d(pred)
-    t, _, _ = _ensure_5d(target)
-    assert p.shape == t.shape, f"shapes must match, got {p.shape} vs {t.shape}"
-    # use channel 0
-    P = (p[:, 0] >= thresh)
-    T = (t[:, 0] >= thresh)
-    inter = (P & T).sum(axis=(1, 2, 3))
-    union = (P | T).sum(axis=(1, 2, 3))
-    iou = np.where(union > 0, inter / (union + 1e-8), 1.0)
-    return float(iou.mean())
-
-def vox_mse(pred, target):
-    p, B, C = _ensure_5d(pred)
-    t, _, _ = _ensure_5d(target)
-    assert p.shape == t.shape
-    return float(((p - t) ** 2).mean())
-
-def vox_psnr(pred, target, data_range=1.0):
-    mse = vox_mse(pred, target)
-    if mse <= 1e-12:
-        return 99.0
-    return float(20.0 * math.log10(data_range) - 10.0 * math.log10(mse + 1e-12))
-
-# ---------------------------
-# logging: 2D slices panel
-# ---------------------------
-def log_vox_center_slices(name, vol, step=None, cmap="magma", normalize=True):
-    """
-    vol: [B,C,D,H,W] or [C,D,H,W] or [D,H,W]  (float/bool)
-    Logs a 2x2 panel with center XY/XZ/YZ of the first item in the batch.
-    """
-    v, B, C = _ensure_5d(vol)
-    v0 = v[0]  # [C,D,H,W]
-    if normalize:
-        v0 = _normalize_for_plot(v0)
-    sl = _center_slices(v0)
-
-    fig, axs = plt.subplots(2, 2, figsize=(7, 6), dpi=120)
-    _format_slice(axs[0,0], sl["XY@z"], "XY @ mid-z", cmap)
-    _format_slice(axs[0,1], sl["XZ@y"], "XZ @ mid-y", cmap)
-    _format_slice(axs[1,0], sl["YZ@x"], "YZ @ mid-x", cmap)
-    axs[1,1].axis("off"); axs[1,1].set_title("")
-
-    plt.tight_layout()
-    wandb.log({name: wandb.Image(fig)}, step=step)
-    plt.close(fig)
-
-def log_vox_compare_slices(name, gt, rec, step=None, cmap="magma", normalize=True, kps=None):
-    """
-    Side-by-side slices for GT vs REC; optional KP overlay (in [-1,1]^3).
-    """
-    g, _, _ = _ensure_5d(gt)
-    r, _, _ = _ensure_5d(rec)
-    g0, r0 = g[0], r[0]    # [C,D,H,W]
-    if normalize:
-        g0 = _normalize_for_plot(g0)
-        r0 = _normalize_for_plot(r0)
-
-    g_sl = _center_slices(g0)
-    r_sl = _center_slices(r0)
-
-    fig, axs = plt.subplots(2, 3, figsize=(10, 7), dpi=120)
-    _format_slice(axs[0,0], g_sl["XY@z"], "GT: XY@z", cmap)
-    _format_slice(axs[0,1], g_sl["XZ@y"], "GT: XZ@y", cmap)
-    _format_slice(axs[0,2], g_sl["YZ@x"], "GT: YZ@x", cmap)
-
-    _format_slice(axs[1,0], r_sl["XY@z"], "REC: XY@z", cmap)
-    _format_slice(axs[1,1], r_sl["XZ@y"], "REC: XZ@y", cmap)
-    _format_slice(axs[1,2], r_sl["YZ@x"], "REC: YZ@x", cmap)
-
-    # optional KP overlay (just on XY@z)
-    if kps is not None:
-        K = to_np(kps)
-        if K is not None:
-            # K ∈ [-1,1]^3 to pixel coords on XY slice
-            # Assumes square voxels and v0 shape [C,D,H,W].
-            _, D, H, W = g0.shape
-            def norm_to_idx(u, N):
-                # [-1,1] -> [0, N-1]
-                return (0.5 * (u + 1.0) * (N - 1.0))
-            x_pix = norm_to_idx(K[..., 0], W)
-            y_pix = norm_to_idx(K[..., 1], H)
-            axs[1,0].scatter(x_pix, y_pix, s=10, c="red", marker="x", linewidths=0.75)
-
-    plt.tight_layout()
-    wandb.log({name: wandb.Image(fig)}, step=step)
-    plt.close(fig)
-
-# ---------------------------
-# logging: interactive 3D volume
-# ---------------------------
-def log_vox_plotly_volume(name, vol, step=None, isovalue=0.5, mode="volume", colorscale="Viridis"):
-    """
-    Logs an interactive 3D volume or isosurface of a single example in the batch.
-      mode: "volume" (dense alpha ray-marching) or "isosurface"
-      isovalue: threshold for "isosurface".
-    """
-    v, B, C = _ensure_5d(vol)
-    V = v[0, 0]  # use first channel
-    V = np.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
-
-    fig = go.Figure()
-    if mode == "isosurface":
-        fig.add_trace(go.Isosurface(
-            value=V,
-            x=np.arange(V.shape[2]).flatten()[None].repeat(V.shape[0]*V.shape[1], 0).flatten(),
-            y=np.tile(np.arange(V.shape[1]), V.shape[0]*V.shape[2]),
-            z=np.repeat(np.arange(V.shape[0]), V.shape[1]*V.shape[2]),
-            isomin=isovalue, isomax=V.max(),
-            opacity=0.6,
-            caps=dict(x_show=False, y_show=False, z_show=False),
-            colorscale=colorscale,
-            surface_count=3
-        ))
-    else:
-        fig.add_trace(go.Volume(
-            value=V.flatten(),
-            x=np.arange(V.shape[2]).flatten()[None].repeat(V.shape[0]*V.shape[1], 0).flatten(),
-            y=np.tile(np.arange(V.shape[1]), V.shape[0]*V.shape[2]),
-            z=np.repeat(np.arange(V.shape[0]), V.shape[1]*V.shape[2]),
-            opacity=0.08,  # small for ray marching
-            surface_count=15,
-            colorscale=colorscale
-        ))
-
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=30, b=0),
-        scene=dict(aspectmode="data"),
-        showlegend=False,
-        title=name
-    )
-    wandb.log({name: fig}, step=step)
-
-# ---------------------------
-# keypoint selection (reused)
-# ---------------------------
-def select_topk_keypoints_vox(model_output, topk, prefer_logvar=True, eps=1e-8):
-    """
-    Same contract as your PC helper; uses z_base_var (smaller is better) if present,
-    falls back to kp_cov trace, else zeros.
-    """
-    kp = model_output.get('kp_p', None)   # [B,Kp,3]
-    assert kp is not None, "model_output['kp_p'] must be present"
-    B, Kp, _ = kp.shape
-    device = kp.device
-
-    score = None
-    if prefer_logvar and ('z_base_var' in model_output):
-        z_var = model_output['z_base_var']
-        if z_var.dim() > 2:
-            while z_var.dim() > 2:
-                z_var = z_var.sum(-1)
-        if z_var.shape[:2] == (B, Kp):
-            score = -z_var
-
-    if score is None and ('kp_cov' in model_output):
-        cov = model_output['kp_cov']
-        tr = cov[..., 0,0] + cov[..., 1,1] + cov[..., 2,2]
-        score = -tr
-
-    if score is None:
-        score = torch.zeros(B, Kp, device=device)
-
-    obj_on = model_output.get('obj_on', None)
-    if obj_on is not None:
-        o = obj_on.squeeze(-1) if (obj_on.dim() == 3 and obj_on.size(-1) == 1) else obj_on
-        if o.shape == (B, Kp):
-            score = score * o.clamp(0, 1)
-
-    k_eff = min(int(topk), Kp)
-    scores_topk, idx = torch.topk(score, k=k_eff, dim=-1, largest=True, sorted=True)
-    b = torch.arange(B, device=device)[:, None]
-    kp_topk = kp[b, idx]
-
-    model_output['kp_scores'] = score
-    model_output['kp_topk_idx'] = idx
-    model_output['kp_topk'] = kp_topk
-    model_output['kp_scores_topk'] = scores_topk
-    return idx, kp_topk, scores_topk
-
-
-# ---- eval_vox_plotly.py-like helpers ----
-import numpy as np, torch, wandb, plotly.graph_objects as go
-
-def _to_np(x):
-    if x is None: return None
-    return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
-
-def _pick_channel(vol, channel=0):
-    """
-    Accepts [C,D,H,W] or [D,H,W] and returns a [D,H,W] float32.
-    """
-    v = _to_np(vol)
-    assert v.ndim in (3,4), f"expected 3D or 4D, got {v.shape}"
-    if v.ndim == 4:
-        c = min(channel, v.shape[0]-1)
-        v = v[c]
-    v = v.astype(np.float32)
-    # sanitize
-    v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-    return v
-
-def _kp_np(kps):
-    """
-    Accepts [K,3] or [B,K,3] and returns Nx3 np array (no scaling).
-    """
-    if kps is None: return None
-    k = _to_np(kps)
-    if k.ndim == 3:  # [B,K,3] -> pick first
-        k = k[0]
-    if k.ndim == 1 and k.size == 3:
-        k = k[None]
-    if k.ndim != 2 or k.shape[-1] != 3: 
         return None
-    return k
+    V = _np(vol)
+    if V.ndim == 3:
+        return V
+    if V.ndim == 4:
+        if V.shape[0] == 1:   # [1,D,H,W]
+            return V[0]
+        raise ValueError(f"Volume has channel dim {V.shape[0]} != 1")
+    raise ValueError(f"Expected 3D or 4D volume, got shape {V.shape}")
 
-def _denorm_kp_to_index(kp_xyz_norm, D,H,W):
+def _kp_norm_to_index(K, D, H, W, order=("z","y","x")):
     """
-    Convert keypoints from normalized [-1,1] coords to voxel index space [0..D/H/W).
+    K: [K,3] in [-1,1] following given order.
+    Map to voxel-index coordinates (0..D-1,0..H-1,0..W-1) then to scene coords centered in voxel space.
     """
-    # grid_sample convention: x=last (W), y=H, z=D
-    x = (kp_xyz_norm[:,0] + 1.0) * 0.5 * (W-1)
-    y = (kp_xyz_norm[:,1] + 1.0) * 0.5 * (H-1)
-    z = (kp_xyz_norm[:,2] + 1.0) * 0.5 * (D-1)
-    return np.stack([x,y,z], axis=-1)
+    if K is None: return None
+    ord_map = {ax:i for i,ax in enumerate(order)}  # where z,y,x live in K[...,i]
+    z = np.clip((K[:, ord_map["z"]] + 1) * 0.5 * (D-1), 0, D-1)
+    y = np.clip((K[:, ord_map["y"]] + 1) * 0.5 * (H-1), 0, H-1)
+    x = np.clip((K[:, ord_map["x"]] + 1) * 0.5 * (W-1), 0, W-1)
+    # Use voxel-index as the scene space (consistent with isosurface axes)
+    return np.stack([x, y, z], axis=-1)  # Plotly uses x,y,z order
 
-def log_vox_plotly_volume(
-    name,
-    vol,                 # [C,D,H,W] or [D,H,W]; float in [0,1] or any scalar field
-    step=None,
-    channel=0,
-    mode="volume",       # "volume" | "isosurface" | "points"
-    isovalue=0.5,        # used for isosurface / points threshold
-    opacity=0.15,        # only for "volume"
-    kps=None,            # keypoints in [-1,1]^3
-    kps_size=3,
-    cmap="Viridis",
+def _robust_box_from_vol(vol, iso):
+    """Return (xrange, yrange, zrange) from nonzero iso region; fallback to full extents."""
+    D,H,W = vol.shape
+    mask = vol >= iso
+    if not mask.any():
+        return (0,W-1), (0,H-1), (0,D-1)
+    zz, yy, xx = np.where(mask)
+    return (float(xx.min()), float(xx.max())), (float(yy.min()), float(yy.max())), (float(zz.min()), float(zz.max()))
+import numpy as np
+import plotly.graph_objects as go
+import wandb
+
+# ---- try figure_factory; fall back if it pulls SciPy/Skimage and fails
+try:
+    import plotly.figure_factory as ff  # may import skimage/scipy under the hood
+    _HAS_FF = True
+except Exception:
+    _HAS_FF = False
+
+# ---- tiny universal converter ----
+def _np(x):
+    if x is None:
+        return None
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+    except Exception:
+        pass
+    return np.asarray(x)
+
+def _as_DHW(vol):
+    if vol is None: return None
+    V = _np(vol)
+    if V.ndim == 4 and V.shape[0] == 1:
+        V = V[0]
+    assert V.ndim == 3, f"Expected [D,H,W] or [1,D,H,W], got {V.shape}"
+    return V
+
+def _kp_norm_to_index(kps, D, H, W, order=("z","y","x")):
+    """
+    kps: [K,3] in [-1,1] (can be torch or np), with components ordered by `order`.
+    returns: [K,3] as plotly (x,y,z) voxel indices
+    """
+    k = _np(kps)                     # <<< fix: handle CUDA tensors
+    if k.ndim == 1:
+        k = k[None, :]
+    size = {"x": W, "y": H, "z": D}
+
+    def to_idx(v, n):
+        return np.clip(0.5 * (v + 1.0) * (n - 1), 0, n - 1)
+
+    # map from provided order (e.g., ("z","y","x")) to (x,y,z)
+    x = to_idx(k[:, order.index("x")], size["x"])
+    y = to_idx(k[:, order.index("y")], size["y"])
+    z = to_idx(k[:, order.index("z")], size["z"])
+    return np.stack([x, y, z], axis=-1)
+
+
+def _robust_nonempty_box(mask_xyz):
+    nz = np.argwhere(mask_xyz)
+    if nz.size == 0:
+        return (0,1),(0,1),(0,1)
+    mins = np.maximum(nz.min(0)-1, 0)
+    maxs = np.minimum(nz.max(0)+1, np.array(mask_xyz.shape)-1)
+    return (int(mins[0]), int(maxs[0])), (int(mins[1]), int(maxs[1])), (int(mins[2]), int(maxs[2]))
+
+# ---- minimal voxel->Mesh3d when ff.create_voxels is unavailable
+def _mesh_from_binary(mask_xyz, color="rgba(255,127,14,1.0)", opacity=0.9, max_voxels=120000):
+    # mask_xyz: [X,Y,Z] bool
+    X, Y, Z = mask_xyz.shape
+    idx = np.argwhere(mask_xyz)
+    if idx.shape[0] == 0:
+        return []
+    # (optional) downsample occupied cells to cap triangle count
+    if idx.shape[0] > max_voxels:
+        sel = np.random.choice(idx.shape[0], max_voxels, replace=False)
+        idx = idx[sel]
+
+    # cube template (8 verts, 12 triangles) at origin
+    verts_template = np.array([
+        [0,0,0],[1,0,0],[1,1,0],[0,1,0],
+        [0,0,1],[1,0,1],[1,1,1],[0,1,1],
+    ], dtype=float)
+    faces_template = np.array([
+        [0,1,2],[0,2,3],   # z=0
+        [4,6,5],[4,7,6],   # z=1
+        [0,4,5],[0,5,1],   # y=0 edge
+        [1,5,6],[1,6,2],   # x=1 edge
+        [2,6,7],[2,7,3],   # y=1 edge
+        [3,7,4],[3,4,0],   # x=0 edge
+    ], dtype=int)
+
+    # cull internal faces by checking neighbors; keep only boundary cubes
+    occ = mask_xyz
+    keep = []
+    for (x,y,z) in idx:
+        if (x==0 or not occ[x-1,y,z]) or (x==X-1 or not occ[x+1,y,z]) or \
+           (y==0 or not occ[x,y-1,z]) or (y==Y-1 or not occ[x,y+1,z]) or \
+           (z==0 or not occ[x,y,z-1]) or (z==Z-1 or not occ[x,y,z+1]):
+            keep.append((x,y,z))
+    if not keep:
+        return []
+
+    # build a single mesh
+    V = []
+    I = []
+    base = 0
+    for (x,y,z) in keep:
+        V.append(verts_template + np.array([x,y,z], dtype=float))
+        I.append(faces_template + base)
+        base += 8
+    V = np.vstack(V)
+    I = np.vstack(I)
+    mesh = go.Mesh3d(
+        x=V[:,0], y=V[:,1], z=V[:,2],
+        i=I[:,0], j=I[:,1], k=I[:,2],
+        color=color, opacity=opacity, flatshading=True, name="voxels", showscale=False
+    )
+    return [mesh]
+
+# ---------- public plotting APIs ----------
+def log_vox_overlay_plotly(
+    name, gt_vol, rec_vol, kps=None, step=None,
+    iso_levels=(0.2,), gt_color="rgba(31,119,180,1.0)", rec_color="rgba(255,127,14,1.0)",
+    kp_color="#ff0000", kp_order=("z","y","x"), point_size_kp=6,
 ):
-    """
-    Logs a 3D Plotly view to W&B.
-    - "volume": true 3D volume raymarch (fastest preview, tunable opacity)
-    - "isosurface": single surface at 'isovalue'
-    - "points": plots occupied voxels (>= isovalue) as small points
-    """
-    V = _pick_channel(vol, channel=channel)  # [D,H,W]
-    D,H,W = V.shape
+    G = _as_DHW(gt_vol)
+    R = _as_DHW(rec_vol)
     fig = go.Figure()
+    thr = float(np.min(iso_levels))
 
-    if mode == "volume":
-        fig.add_trace(go.Volume(
-            value=V.flatten(),
-            x=np.repeat(np.arange(W), D*H),
-            y=np.tile(np.repeat(np.arange(H), W), D),
-            z=np.repeat(np.arange(D), H*W),
-            opacity=opacity,            # overall opacity
-            surface_count=15,           # number of isosurfaces in the volume render
-            showscale=False,
-            colorscale=cmap,
-        ))
+    if R is not None:
+        maskR = np.transpose(R, (2,1,0)) > thr  # (X,Y,Z)
+        if maskR.any():
+            if _HAS_FF:
+                vox = ff.create_voxels(maskR, colorscale=[[0,rec_color],[1,rec_color]], opacity=1.0)
+                for tr in vox.data: tr.name="REC"; fig.add_trace(tr)
+            else:
+                for tr in _mesh_from_binary(maskR, rec_color, 0.95): tr.name="REC"; fig.add_trace(tr)
 
-    elif mode == "isosurface":
-        fig.add_trace(go.Isosurface(
-            value=V.flatten(),
-            x=np.repeat(np.arange(W), D*H),
-            y=np.tile(np.repeat(np.arange(H), W), D),
-            z=np.repeat(np.arange(D), H*W),
-            isomin=isovalue,
-            isomax=isovalue,
-            surface_count=1,
-            caps=dict(x_show=False, y_show=False, z_show=False),
-            showscale=False,
-            colorscale=cmap,
-        ))
+    if G is not None:
+        maskG = np.transpose(G, (2,1,0)) > thr
+        if maskG.any():
+            if _HAS_FF:
+                vox = ff.create_voxels(maskG, colorscale=[[0,gt_color],[1,gt_color]], opacity=0.65)
+                for tr in vox.data: tr.name="GT"; fig.add_trace(tr)
+            else:
+                for tr in _mesh_from_binary(maskG, gt_color, 0.65): tr.name="GT"; fig.add_trace(tr)
 
-    elif mode == "points":
-        idx = np.argwhere(V >= isovalue)
-        if idx.shape[0] > 120_000:  # safety downsample for speed
-            sel = np.random.choice(idx.shape[0], 120_000, replace=False)
-            idx = idx[sel]
-        # idx is [N,3] with [z,y,x] order
+    # keypoints
+    if kps is not None and (R is not None or G is not None):
+        D,H,W = (R.shape if R is not None else G.shape)
+        K = _kp_norm_to_index(kps, D,H,W, order=kp_order)
         fig.add_trace(go.Scatter3d(
-            x=idx[:,2], y=idx[:,1], z=idx[:,0],
+            x=K[:,0], y=K[:,1], z=K[:,2],
             mode="markers",
-            marker=dict(size=2, opacity=0.9),
-            name="voxels",
-        ))
-
-    # --- optional KP overlay (in normalized [-1,1] -> index space) ---
-    K = _kp_np(kps)
-    if K is not None:
-        K_ijk = _denorm_kp_to_index(K, D,H,W)  # [N,3] in (x,y,z) index space
-
-        fig.add_trace(go.Scatter3d(
-            x=K_ijk[:,0], y=K_ijk[:,1], z=K_ijk[:,2],
-            mode="markers",
-            marker=dict(size=kps_size, symbol="x", color="red"),
+            marker=dict(symbol="x", size=point_size_kp, color=kp_color, line=dict(width=3, color="black")),
             name="keypoints",
         ))
 
-    # nice equal aspectbox
+    # axes from occupied region (prefer REC)
+    if R is not None and (R > thr).any():
+        xr, yr, zr = _robust_nonempty_box(np.transpose(R,(2,1,0)) > thr)
+    elif G is not None and (G > thr).any():
+        xr, yr, zr = _robust_nonempty_box(np.transpose(G,(2,1,0)) > thr)
+    else:
+        xr, yr, zr = (0,1),(0,1),(0,1)
+
     fig.update_scenes(
-        xaxis=dict(range=[0, W-1]),
-        yaxis=dict(range=[0, H-1]),
-        zaxis=dict(range=[0, D-1]),
+        xaxis=dict(range=[xr[0], xr[1]]),
+        yaxis=dict(range=[yr[0], yr[1]]),
+        zaxis=dict(range=[zr[0], zr[1]]),
         aspectmode="data"
     )
-    fig.update_layout(
-        margin=dict(l=0,r=0,t=30,b=0),
-        scene_dragmode="turntable",
-        showlegend=True,
-        title=name,
-    )
+    fig.update_layout(margin=dict(l=0,r=0,t=30,b=0), showlegend=True, scene_dragmode="turntable")
+    wandb.log({name: fig}, step=step)
 
+def log_vox_isoseries(
+    name, vol, kps=None, iso_levels=(0.05,0.1,0.2,0.3,0.4),
+    step=None, color="rgba(255,127,14,1.0)", kp_color="#ff0000",
+    kp_order=("z","y","x"), point_size_kp=6,
+):
+    V = _as_DHW(vol)
+    if V is None: return
+    fig = go.Figure()
+    for i, iso in enumerate(sorted(iso_levels)):
+        mask = np.transpose(V, (2,1,0)) > float(iso)
+        if not mask.any(): continue
+        alpha = float(np.clip(0.35 + 0.35 * (i / max(1, len(iso_levels)-1)), 0.35, 0.95))
+        if _HAS_FF:
+            vox = ff.create_voxels(mask, colorscale=[[0,color],[1,color]], opacity=alpha)
+            for tr in vox.data: tr.name=f"iso≥{iso:.2f}"; fig.add_trace(tr)
+        else:
+            for tr in _mesh_from_binary(mask, color, alpha): tr.name=f"iso≥{iso:.2f}"; fig.add_trace(tr)
+
+    if kps is not None:
+        D,H,W = V.shape
+        K = _kp_norm_to_index(kps, D,H,W, order=kp_order)
+        fig.add_trace(go.Scatter3d(
+            x=K[:,0], y=K[:,1], z=K[:,2],
+            mode="markers",
+            marker=dict(symbol="x", size=point_size_kp, color=kp_color, line=dict(width=3, color="black")),
+            name="keypoints",
+        ))
+
+    mask_base = np.transpose(V, (2,1,0)) > float(min(iso_levels) if iso_levels else 0.5)
+    xr, yr, zr = _robust_nonempty_box(mask_base)
+    fig.update_scenes(
+        xaxis=dict(range=[xr[0], xr[1]]),
+        yaxis=dict(range=[yr[0], yr[1]]),
+        zaxis=dict(range=[zr[0], zr[1]]),
+        aspectmode="data"
+    )
+    fig.update_layout(margin=dict(l=0,r=0,t=30,b=0), showlegend=True, scene_dragmode="turntable")
     wandb.log({name: fig}, step=step)
 
 
-# --- GT logging: same API as rec ---
-def log_vox_plotly_gt_suite(prefix, gt_vol, step=None, channel=0, kps=None,
-                            iso=0.5, vol_opacity=0.15):
-    # log_vox_plotly_volume(f"{prefix}/gt_volume",   gt_vol, step=step,
-    #                       channel=channel, mode="volume", opacity=vol_opacity, kps=kps)
-    # log_vox_plotly_volume(f"{prefix}/gt_isosurf@{iso}", gt_vol, step=step,
-    #                       channel=channel, mode="isosurface", isovalue=iso, kps=kps)
-    log_vox_plotly_volume(f"{prefix}/gt_points@{iso}",  gt_vol, step=step,
-                          channel=channel, mode="points", isovalue=iso, kps=kps)
-
-
-def log_vox_plotly_rec_suite(prefix, rec_vol, step=None, channel=0, kps=None,
-                             iso=0.5, vol_opacity=0.15):
+@torch.no_grad()
+def topk_kps_from_variance(
+    model_output: dict,
+    topk: int,
+    *,
+    use_mu: str = "mu_tot",     # which kp positions to return: "mu_tot" or "kp_p"
+    prefer_logvar: bool = True, # if True, use z_base_var; else fall back to kp_cov trace or zeros
+    gate_with_obj_on: bool = True,
+):
     """
-    Mirrors log_vox_plotly_gt_suite but for reconstructed volumes.
-    Uses the same three modes: volume, isosurface (at `iso`), and points (at `iso`).
+    Select Top-K keypoints with *lowest* uncertainty.
+
+    Inputs (from model_output):
+      - 'z_base_var':   [B,K,*, ...]  (e.g., [B,K,3] or [B,K,4])   # summed across last dim
+      - 'kp_cov'     :  [B,K,3,3]     (optional fallback: use trace)
+      - 'obj_on'     :  [B,K] or [B,K,1]  (optional presence gate in [0,1])
+      - 'mu_tot'     :  [B,K,3]       (or 'kp_p' if you pass use_mu="kp_p")
+
+    Returns:
+      idx_topk      : [B,k]          (indices into K)
+      kp_topk       : [B,k,3]        (positions from `use_mu`)
+      scores_topk   : [B,k]          (selection scores; higher == better)
+      scores_all    : [B,K]          (per-kp scores; useful for viz / bboxes)
     """
-    # log_vox_plotly_volume(f"{prefix}/rec_volume",   rec_vol, step=step,
-    #                       channel=channel, mode="volume", opacity=vol_opacity, kps=kps)
-    # log_vox_plotly_volume(f"{prefix}/rec_isosurf@{iso}", rec_vol, step=step,
-    #                       channel=channel, mode="isosurface", isovalue=iso, kps=kps)
-    log_vox_plotly_volume(f"{prefix}/rec_points@{iso}",  rec_vol, step=step,
-                          channel=channel, mode="points", isovalue=iso, kps=kps)
+    # --- required positions ---
+    MU = model_output.get(use_mu, None)
+    if MU is None:
+        raise KeyError(f"model_output['{use_mu}'] is required (e.g., 'mu_tot' or 'kp_p').")
+    B, K, D = MU.shape
+    device = MU.device
+
+    # --- base score: negative summed variance (smaller var => higher score) ---
+    score = None
+    if prefer_logvar and ("z_base_var" in model_output and model_output["z_base_var"] is not None):
+        z_var = model_output["z_base_var"]
+        # reshape to [B,K,...] then sum all trailing dims -> [B,K]
+        while z_var.dim() > 2:
+            z_var = z_var.sum(-1)
+        if z_var.shape == (B, K):
+            score = -z_var  # smaller variance -> larger score
+
+    # fallback: use trace of covariance if provided
+    if score is None and ("kp_cov" in model_output and model_output["kp_cov"] is not None):
+        cov = model_output["kp_cov"]  # [B,K,3,3]
+        if cov.dim() == 4 and cov.shape[0] == B and cov.shape[1] == K:
+            tr = cov[..., 0,0] + cov[..., 1,1] + cov[..., 2,2]  # [B,K]
+            score = -tr
+
+    # final fallback: zeros (all equal)
+    if score is None:
+        score = torch.zeros(B, K, device=device)
+
+    # optional presence gate
+    if gate_with_obj_on and ("obj_on" in model_output) and (model_output["obj_on"] is not None):
+        obj_on = model_output["obj_on"]
+        if obj_on.dim() == 3 and obj_on.size(-1) == 1:
+            obj_on = obj_on.squeeze(-1)               # [B,K]
+        if obj_on.shape == (B, K):
+            score = score * obj_on.clamp(0, 1)        # gate in [0,1]
+
+    # optional mask: if you have 'kp_mask' (bool), set invalid to -inf
+    kp_mask = model_output.get("kp_mask", None)
+    if kp_mask is not None and kp_mask.shape == (B, K):
+        neg_inf = torch.full_like(score, float("-inf"))
+        score = torch.where(kp_mask, score, neg_inf)
+
+    # --- pick Top-K (largest scores == best) ---
+    k_eff = min(int(topk), K)
+    scores_topk, idx_topk = torch.topk(score, k=k_eff, dim=-1, largest=True, sorted=True)
+
+    b_idx = torch.arange(B, device=device)[:, None]
+    kp_topk = MU[b_idx, idx_topk]  # [B,k,3]
+
+    return idx_topk, kp_topk, scores_topk, score

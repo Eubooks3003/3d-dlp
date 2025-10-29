@@ -3701,26 +3701,7 @@ class ParticleInteractionEncoder(nn.Module):
                     flattened_z_cnn = final_cnn_ch * vox_elems
                     self.projection_mode = 'fc3d'
                     self.to_latent_lin = self.get_mlp(flattened_z_cnn, self.ctx_pre_pte_latent_dim)
-
-            else:
-                # (existing 2D path, unchanged)
-                feature_map_size = self.output_feat_map_size ** 2
-                if self.ctx_pre_pte_latent_dim % feature_map_size == 0:
-                    self.ch_learned_feature_dim = math.ceil(max(self.ctx_pre_pte_latent_dim / feature_map_size, 1))
-                    out_ch = self.ch_learned_feature_dim
-                    self.to_latent = nn.Conv2d(in_channels=final_cnn_ch, out_channels=out_ch, kernel_size=1)
-                    H_out, W_out = self.cnn_out_shape[-2], self.cnn_out_shape[-1]
-                    flattened_z_cnn = self.ch_learned_feature_dim * H_out * W_out
-                    self.projection_mode = 'fcn'
-                    self.to_latent_lin = nn.Identity()
-                else:
-                    self.ch_learned_feature_dim = final_cnn_ch
-                    self.to_latent = nn.Identity()
-                    H_out, W_out = self.cnn_out_shape[-2], self.cnn_out_shape[-1]
-                    flattened_z_cnn = final_cnn_ch * H_out * W_out
-                    self.projection_mode = 'fc'
-                    self.to_latent_lin = self.get_mlp(flattened_z_cnn, self.ctx_pre_pte_latent_dim)
-
+                    
             self.info = (f'ParticleInteractionEncoder: requested latent size: {self.ctx_pre_pte_latent_dim}, '
                          f' latent projection mode: {self.projection_mode},')
 
@@ -4995,7 +4976,6 @@ class ParticleEncoder(nn.Module):
         logvar_score = logvar_score.view(bs, timestep_horizon, *logvar_score.shape[1:])
         z_score      = z_score.view(bs, timestep_horizon, *z_score.shape[1:])
 
-        print("Logvar features is none in final output dict") if logvar_features is None else None
         encode_dict = {
             'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base),
             'z_base': z_base, 'z': z,
@@ -5554,7 +5534,6 @@ class DLPEncoder(nn.Module):
             z_bg_features = torch.cat([z_bg_features[:, :-1], mu_bg_features[:, -1:]], dim=1)
 
         if self.use_particle_inter_enc:
-            print("Using particle interaction encoder")
             z_in_inter = z_base + z_offset  # so we can detach z_base (ssm) if more stable
             inter_dict = self.particle_inter_enc(x, z_in_inter, z_scale, z_obj_on, z_depth, z_features, z_bg_features,
                                                  z_base_var, z_score, patch_id_embed,
@@ -5663,7 +5642,6 @@ class DLPEncoder(nn.Module):
             logvar_score = logvar_score[:, :-1].contiguous()
             z_score = z_score[:, :-1].contiguous()
         # TODO: Make sure all the necessary information from the depth encoding is returned and USED
-        print("logvar features is none in encoder: ", logvar_features is None)
         encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,

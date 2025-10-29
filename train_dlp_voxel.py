@@ -30,14 +30,69 @@ from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, 
                             topk_indices_from_output, wandb_log_iter_losses)
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
-import eval.eval_vox as eval_vox
-from eval.eval_pc import clean_pts, log_pc_plotly, log_pc_overlay_plotly, select_topk_keypoints, \
-    extract_effective_points_from_pointweights, summarize_points_plus
+from eval.eval_vox import log_vox_overlay_plotly, log_vox_isoseries, topk_kps_from_variance
 import wandb
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
+
+
+from collections import defaultdict
+
+def _to_float_safe(x, default=None):
+    if x is None:
+        return default
+    try:
+        if isinstance(x, (float, int)):
+            return float(x)
+        if hasattr(x, "detach"):
+            return float(x.detach().mean().item())
+        return float(x)
+    except Exception:
+        return default
+
+def wandb_log_lossdict(loss_dict: dict, step: int):
+    """Logs all scalar-like entries in loss_dict to W&B under their existing keys."""
+    flat = {}
+    for k, v in loss_dict.items():
+        val = _to_float_safe(v)
+        if val is not None:
+            flat[k] = val
+    if flat:
+        wandb.log(flat, step=step)
+    return flat  # return what was logged (as floats) for local use
+
+class EpochAverager:
+    """Collect per-iteration floats and compute epoch means for the keys we’ve actually seen."""
+    def __init__(self):
+        self.store = defaultdict(list)
+
+    def add(self, logged_loss_floats: dict):
+        for k, v in logged_loss_floats.items():
+            if v is not None:
+                self.store[k].append(float(v))
+
+    def means(self):
+        return {k: float(np.mean(v)) for k, v in self.store.items() if len(v) > 0}
+
+
+def build_epoch_log(epoch, means):
+    parts = [f"epoch {epoch:04d}", f"loss {means.get('loss', 0.0):.4f}"]
+    if 'loss_rec' in means: parts.append(f"rec {means['loss_rec']:.4f}")
+    if 'kl' in means:       parts.append(f"KL {means['kl']:.4f}")
+
+    bracket = []
+    for k,label in [
+        ('loss_kl_kp','kp'), ('loss_kl_feat','feat'),
+        ('loss_kl_scale','scale'), ('loss_kl_obj_on','obj'),
+        ('loss_kl_depth','depth'), ('loss_kl_context','ctx')
+    ]:
+        if k in means: bracket.append(f"{label} {means[k]:.3f}")
+    if bracket: parts.append("[" + ", ".join(bracket) + "]")
+
+    if 'obj_on_l1' in means: parts.append(f"on_L1 {means['obj_on_l1']:.3f}")
+    return " | ".join(parts)
 
 
 def train_dlp_pc(config_path='./configs/shapes.json'):
@@ -342,12 +397,12 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         obj_on_mean_list = []
         mu_scale_mean_list = []
 
+        epoch_avg = EpochAverager()
+
         
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
-            vox  = batch["voxels"].to(device)  
-            print("VOX: ", vox.shape)
             vox  = batch["voxels"].to(device)  
 
             # mask = batch["mask"].to(device) 
@@ -408,14 +463,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                     t.retain_grad()                # allow reading .grad on non-leaf tensors
                     watch_tensors[name] = t
 
-            # calculate loss
-            all_losses = model_output['loss_dict']
-            loss = all_losses['loss']
-
+            # ---- compute & backprop ----
+            all_losses = model_output['loss_dict']          # whatever your calc_* returned
+            loss = all_losses['loss']                       # must exist
             optimizer.zero_grad()
             loss.backward()
 
-            # --- log per-tensor grad magnitudes (mean and max) ---
+            # grads (unchanged)
             for k, v in watch_tensors.items():
                 gm = (v.grad.abs().mean().item() if v.grad is not None else 0.0)
                 gM = (v.grad.abs().max().item()  if v.grad is not None else 0.0)
@@ -425,152 +479,72 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
             optimizer.step()
 
-            log_param_updates(model, iteration)
-            wandb_log_iter_losses(all_losses, iteration)
+            # ---- log exactly what your loss dict contains ----
+            logged = wandb_log_lossdict(all_losses, iteration)   # returns dict of floats
+            epoch_avg.add(logged)
 
-            iteration += 1
+            # ---- compact tqdm postfix using available keys ----
+            def pick(key, default=0.0):
+                return logged.get(key, default)
 
-            # keypoint spread / motion
-            kp = model_output.get("kp_p")                          # [B,K,3] in [-1,1]
-            obj_on = model_output.get("obj_on")                    # [B,K,1] or [B,K]
-            if kp is not None:
-                spread = kp.std(dim=1).mean().item()              # avg spatial spread
-                wandb.log({"kp/spread": spread}, step=iteration)
-                if hasattr(model, "_kp_prev"):
-                    drift = (kp - model._kp_prev).pow(2).sum(-1).sqrt().mean().item()
-                    wandb.log({"kp/drift_per_step": drift}, step=iteration)
-                model._kp_prev = kp.detach().clone()
-
-            # how many are "on"
-            if obj_on is not None:
-                on_frac = obj_on.sigmoid().mean().item() if obj_on.dim()==3 else obj_on.mean().item()
-                wandb.log({"kp/on_frac": on_frac}, step=iteration)
-
-
-            # --- helpers ---
-            def _to_float(x, default=0.0):
-                if x is None:
-                    return float(default)
-                if isinstance(x, (float, int)):
-                    return float(x)
-                try:
-                    return float(x.detach().mean().item())
-                except Exception:
-                    return float(default)
-
-            # --- unpack logged losses from calc_static_elbo_pc ---
-            loss            = all_losses['loss']
-            loss_rec        = all_losses['loss_rec']                 # combined recon (DCD + weighted CD * weight)
-            rec_dcd         = all_losses.get('rec_dcd', None)        # pure DCD term
-            rec_cd_weighted = all_losses.get('rec_cd_weighted', None)# optional weighted CD term
-
-            loss_kl         = all_losses['kl']
-            loss_kl_kp      = all_losses.get('loss_kl_kp', None)
-            loss_kl_scale   = all_losses.get('loss_kl_scale', None)
-            loss_kl_feat    = all_losses.get('loss_kl_feat', None)
-            loss_kl_obj_on  = all_losses.get('loss_kl_obj_on', None)
-            obj_on_l1       = all_losses.get('obj_on_l1', None)
-
-            # --- a few encoder-side sanity stats (guarded) ---
-            obj_on          = model_output.get('obj_on', None)         # [B,K,1] or None
-            obj_on_mean     = _to_float(obj_on)                        # fraction of active objs (roughly)
-            mu_scale        = model_output.get('mu_scale', None)       # [B,K,3] or [B,K,1]
-            mu_scale_mean   = _to_float(torch.sigmoid(mu_scale) if mu_scale is not None else None)
-
-            # point count sanity
-            # valid_points    = _to_float(mask.float().sum(dim=1) if mask is not None else None)
-            valid_points    = int(valid_points) if not isinstance(valid_points, float) else valid_points
-
-            # --- collect per-batch scalars ---
-            batch_losses.append(_to_float(loss))
-            batch_losses_rec.append(_to_float(loss_rec))
-            batch_losses_kl.append(_to_float(loss_kl))
-            batch_losses_kl_kp.append(_to_float(loss_kl_kp))
-            batch_losses_kl_feat.append(_to_float(loss_kl_feat))
-            batch_losses_kl_scale.append(_to_float(loss_kl_scale))
-            batch_losses_kl_obj_on.append(_to_float(loss_kl_obj_on))
-
-            # recon components
-            if rec_dcd is not None:
-                losses_rec_dcd.append(_to_float(rec_dcd))
-            if rec_cd_weighted is not None:
-                losses_rec_cd_w.append(_to_float(rec_cd_weighted))
-
-            # obj_on stats
-            obj_on_l1_list.append(_to_float(obj_on_l1))
-            obj_on_mean_list.append(obj_on_mean)
-            mu_scale_mean_list.append(mu_scale_mean)
-
-
-
-            # optional: track obj_on stats
-            obj_on_l1_list.append(_to_float(obj_on_l1))
-            obj_on_mean_list.append(obj_on_mean)
-            mu_scale_mean_list.append(mu_scale_mean)
-
-            # --- tqdm/postfix (compact) ---
             if epoch < warmup_epoch:
                 pbar.set_description_str(f'epoch #{epoch} (warmup)')
             else:
                 pbar.set_description_str(f'epoch #{epoch}')
 
             pbar.set_postfix(
-                loss=_to_float(loss),
-                rec=_to_float(loss_rec),
-                KL=_to_float(loss_kl),
-                kp=_to_float(loss_kl_kp),
-                feat=_to_float(loss_kl_feat),
-                scale=_to_float(loss_kl_scale),
-                obj=_to_float(loss_kl_obj_on),
+                loss=pick('loss'),
+                rec=pick('loss_rec'),
+                KL=pick('kl'),
+                kp=pick('loss_kl_kp'),
+                feat=pick('loss_kl_feat'),
+                scale=pick('loss_kl_scale'),
+                obj=pick('loss_kl_obj_on'),
             )
+
+            iteration += 1
 
 
             # break  # for debug
         pbar.close()
         # at end of epoch
-        losses.append(float(np.mean(batch_losses)))
-        losses_rec.append(float(np.mean(batch_losses_rec)))
-        losses_kl.append(float(np.mean(batch_losses_kl)))
-        losses_kl_kp.append(float(np.mean(batch_losses_kl_kp)))
-        losses_kl_feat.append(float(np.mean(batch_losses_kl_feat)))
-        losses_kl_scale.append(float(np.mean(batch_losses_kl_scale)))
-        losses_kl_obj_on.append(float(np.mean(batch_losses_kl_obj_on)))
+        # end of epoch
+        means = epoch_avg.means()   # {'loss': ..., 'loss_rec': ..., 'kl': ..., ...} only for keys that appeared
 
-        mean_dcd   = float(np.mean(losses_rec_dcd)) if len(losses_rec_dcd) else None
-        mean_cdw   = float(np.mean(losses_rec_cd_w)) if len(losses_rec_cd_w) else None
-        mean_on_l1 = float(np.mean(obj_on_l1_list)) if len(obj_on_l1_list) else None
-        mean_on_p  = float(np.mean(obj_on_mean_list)) if len(obj_on_mean_list) else None
-        mean_s     = float(np.mean(mu_scale_mean_list)) if len(mu_scale_mean_list) else None
-
-        log_str = (
-            f"epoch {epoch:04d} | "
-            f"loss {losses[-1]:.4f} | rec {losses_rec[-1]:.4f}"
-            f"{'' if mean_dcd is None else f' (dcd {mean_dcd:.4f}'}"
-            f"{'' if mean_cdw is None else f', cdw {mean_cdw:.4f})' if mean_dcd is not None else f' (cdw {mean_cdw:.4f})'} | "
-            f"KL {losses_kl[-1]:.4f} [kp {losses_kl_kp[-1]:.3f}, feat {losses_kl_feat[-1]:.3f}, "
-            f"scale {losses_kl_scale[-1]:.3f}, obj {losses_kl_obj_on[-1]:.3f}] | "
-            f"on_L1 {0.0 if mean_on_l1 is None else mean_on_l1:.3f} | "
-            f"on̄ {0.0 if mean_on_p is None else mean_on_p:.3f} | "
-            f"s̄ {0.0 if mean_s is None else mean_s:.3f}"
-        )
-
+        # pretty print (robust to missing keys)
+        log_str = build_epoch_log(epoch, means)
         print(log_str)
         log_line(log_dir, log_str)
 
-        # ---- Decide monitored metric ----
-        # You already have epoch means: losses[-1], losses_rec[-1], etc.
-        if monitor == "loss":
-            monitored = losses[-1]
-        elif monitor == "rec":
-            monitored = losses_rec[-1]
-        elif monitor == "kl":
-            monitored = losses_kl[-1]
-        elif monitor == "vox/psnr_c0":
-            # if you computed metrics dict above (optional)
-            monitored = metrics.get("vox/psnr_c0", None) if "metrics" in locals() else None
-        else:
-            # fallback to total loss
-            monitored = losses[-1]
+        # choose monitored metric robustly
+        monitor_map = {
+            "loss": "loss",
+            "rec": "loss_rec",
+            "kl": "kl",
+            "vox/psnr_c0": "vox/psnr_c0",  # if you logged it in loss_dict or elsewhere
+        }
+        mon_key = monitor_map.get(monitor, "loss")
+        monitored = means.get(mon_key, means.get("loss", None))
+
+        # ---- Decide monitored metric (robust to missing keys) ----
+        means = epoch_avg.means()  # e.g., {'loss': ..., 'loss_rec': ..., 'kl': ..., ...}
+
+        def pick(mkey, default=None):
+            return means.get(mkey, default)
+
+        monitor_map = {
+            "loss": "loss",
+            "rec": "loss_rec",
+            "kl": "kl",
+            "vox/psnr_c0": "vox/psnr_c0",  # log this into means if you want to monitor it
+        }
+        mon_key   = monitor_map.get(monitor, "loss")
+        monitored = pick(mon_key, pick("loss", None))  # fallback to total loss if chosen key missing
+
+        # Optional: guard against NaN/Inf
+        if monitored is not None and (not np.isfinite(monitored)):
+            print(f"[warn] monitored metric {mon_key} is non-finite ({monitored}); skipping model selection this epoch.")
+            monitored = None
 
         # ---- Save "last" every epoch ----
         save_checkpoint(ckpt_last, model, optimizer, scheduler, epoch, best_val,
@@ -583,7 +557,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 best_val = monitored
                 save_checkpoint(ckpt_best, model, optimizer, scheduler, epoch, best_val,
                                 extra={"monitored": monitored, "best_update": True})
-                print(f"[ckpt] New best ({monitor}={monitored:.6f}) at epoch {epoch:04d} -> saved best.pt")
+                print(f"[ckpt] New best ({mon_key}={monitored:.6f}) at epoch {epoch:04d} -> saved best.pt")
 
         # ---- Periodic epoch snapshot ----
         if save_every and (epoch % save_every == 0 or epoch == num_epochs - 1):
@@ -591,77 +565,54 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             save_checkpoint(snap_path, model, optimizer, scheduler, epoch, best_val,
                             extra={"monitored": monitored, "snapshot": True})
 
+        # ------- EVAL (voxel version) -------
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 
-            # --- GT (mask-filtered) ---
-            # gt_clean = clean_pts(pts[b0], mask[b0] if mask is not None else None)  # [Ng,3]
-            gt_clean = model_output.get('pts_norm', None)
+            # pull voxel volumes (logits OK; we'll just visualize isos)
+            gt_vol  = model_output.get('x', None)   # [B,C,D,H,W]
+            rec_vol = model_output.get('rec', None)        # [B,C,D,H,W]
 
-            # --- REC ---
-            rec_pts  = model_output.get('points_scene', None)
-            rec_pts  = clean_pts(rec_pts[b0]) if rec_pts is not None else None
-            rec_cols = model_output.get('rec_colors', None)
-            rec_cols = rec_cols[b0] if rec_cols is not None else None
-            ids      = model_output.get('assign_ids', None)
-            ids      = ids[b0] if ids is not None else None
 
-            print("gt clean: ", gt_clean.shape)
-            gt_clean = gt_clean[b0]
+            gt_vol  = None if gt_vol  is None else gt_vol[b0]   # -> [D,H,W]
+            rec_vol = None if rec_vol is None else rec_vol[b0]  # -> [D,H,W]
 
-            print("REc points: ", rec_pts.shape)
+            # keypoints in normalized [-1,1] scene coords, shape [B,K,3]
+            kp_xyz = model_output.get('kp_p', None)
+            kp_xyz = None if kp_xyz is None else kp_xyz[b0]        # -> [K,3] (z,y,x)
 
-            # --- KPs ---
-            kp_xyz = model_output.get('kp_p', None)[b0]  # [B,K,3] in [-1,1]
 
-            kp_topk =  model_output.get('kp_topk', None)[b0] 
-            print("KP TOPK:  ", kp_topk.shape)
-            print("KP XYZ: ", kp_xyz.shape)
+            # Top-K (optional)
+            kp_topk = model_output.get('kp_topk', None)
+            kp_topk = None if kp_topk is None else kp_topk[b0]     # -> [k,3]
 
-            eff_pts = extract_effective_points_from_pointweights(model_output, thresh=0.5)
+            idx_topk, kp_topk, scores_topk, scores_all = topk_kps_from_variance(
+                model_output,
+                topk=topk,
+                use_mu="kp_p",          # or "kp_p" if you want prior mean locations
+                prefer_logvar=True,
+                gate_with_obj_on=True,
+            )
 
-            # --- Plotly logs (GT / REC / overlays) ---
-            log_pc_overlay_plotly("gt/gt_with_kp", gt_clean, None, kps=kp_xyz,
-                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("rec/rec_with_kp", None, eff_pts, kps=kp_xyz,
-                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
 
-            log_pc_overlay_plotly("gt/gt", gt_clean, None, kps=None,
-                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("rec/rec", None, eff_pts, kps=None,
-                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+            # ------ Voxel overlay (single iso or list) ------
+            iso_main = 0.25
+            log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=kp_xyz,
+                                iso_levels=[iso_main], step=iteration)
+            log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=None,
+                    iso_levels=[iso_main], step=iteration)
 
-            log_pc_overlay_plotly("viz/overlay_source_with_kp", gt_clean, eff_pts, kps=kp_xyz,
-                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-            log_pc_overlay_plotly("viz/overlay_source", gt_clean, eff_pts, kps=None,
-                                color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+
+            # A small iso sweep (nice for debugging)
+            log_vox_isoseries("vox/rec_isos", rec_vol, kps=kp_xyz,
+                            iso_levels=[0.05, 0.1, 0.2, 0.3, 0.4], step=iteration)
 
             if kp_topk is not None:
-                log_pc_overlay_plotly("gt/gt_topk", gt_clean, None, kps=kp_topk,
-                                    color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-                log_pc_overlay_plotly("rec/rec_topk", None, eff_pts, kps=kp_topk,
-                                    color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
-                log_pc_overlay_plotly("viz/overlay_source_topk", gt_clean, eff_pts, kps=kp_topk,
-                                    color_mode="source", step=iteration, point_size_gt=2, point_size_rec=2)
+                log_vox_overlay_plotly("vox/overlay_topk", gt_vol, rec_vol, kps=kp_topk,
+                                    iso_levels=[iso_main], step=iteration)
+                log_vox_isoseries("vox/rec_isos_topk", rec_vol, kps=kp_topk,
+                                iso_levels=[0.05, 0.1, 0.2, 0.3, 0.4], step=iteration)
 
-
-            eff_pts = extract_effective_points_from_pointweights(model_output, thresh=0.5)
-            print("EFFECTIVE POINTS: ", eff_pts.shape)
-            summarize_points_plus(eff_pts, name="eff_pts", norm_bounds=(-1,1), bins=24)
-            log_pc_overlay_plotly("rec/rec_topk_effective", None, eff_pts, kps=kp_topk,
-                                color_mode="source", step=iteration, point_size_rec=2)
-
-            # --- scalar metrics to W&B (only if computed) ---
-            metrics = {
-                "rec/dcd":        mean_dcd,
-                "rec/cd_weighted": mean_cdw,
-                "obj/on_L1":      mean_on_l1,
-                "obj/on_prob":    mean_on_p,
-                "obj/scale_mean": mean_s,
-            }
-            metrics = {k: v for k, v in metrics.items() if v is not None}
-            if metrics:
-                wandb.log(metrics, step=iteration)
 
 
 
