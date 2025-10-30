@@ -377,3 +377,126 @@ def print_vol_stats(tag, V):
     f_ok   = np.isfinite(v).all()
     print(f"{tag}: shape={v.shape}, min={v.min():.4g}, max={v.max():.4g}, mean={v.mean():.4g}, finite={f_ok}")
 
+import numpy as np
+import torch, wandb
+import plotly.graph_objects as go
+import torch.nn.functional as F
+
+def _flatten01(t, occ_channel=0):
+    """
+    Accepts [B,T,1,D,H,W] or [B,T,D,H,W] or [B,1,D,H,W] or [B,D,H,W].
+    Returns flat 1D tensor on CPU.
+    """
+    if t is None:
+        return None
+    if t.dim() == 6:       # [B,T,C,D,H,W] or [B,T,D,H,W]
+        if t.size(2) > 1:  # has C
+            t = t[:, :, occ_channel]
+        else:
+            t = t[:, :, 0]
+        t = t.reshape(-1, *t.shape[-3:])  # -> [BT, D,H,W]
+    elif t.dim() == 5:     # [B,C,D,H,W] or [B,D,H,W]
+        if t.size(1) > 1:
+            t = t[:, occ_channel]
+        else:
+            t = t[:, 0]
+        t = t.reshape(-1, *t.shape[-3:])  # -> [B, D,H,W]
+    elif t.dim() == 4:     # [D,H,W,B?] unlikely, or already [B,D,H,W]
+        pass
+    elif t.dim() == 3:     # [D,H,W]
+        t = t.unsqueeze(0)
+    else:
+        raise ValueError(f"Unexpected shape {tuple(t.shape)}")
+    return t.contiguous().view(-1).detach().cpu()
+
+@torch.no_grad()
+def log_voxel_rec_distributions(model_output, x, *, occ_channel=0, name_prefix="dist", step=None):
+    """
+    Logs histograms + stats for rec logits/probs and GT occupancy.
+    Expects model_output['rec'] as logits (NOT sigmoid'ed).
+    """
+    if 'rec' not in model_output:
+        raise KeyError("model_output['rec'] (logits) required")
+
+    rec_logits = _flatten01(model_output['rec'], occ_channel=occ_channel)
+    gt_flat    = _flatten01(x,                        occ_channel=occ_channel).float()
+
+    # Probs from logits
+    rec_probs = torch.sigmoid(torch.from_numpy(rec_logits.numpy())).numpy()
+
+    # --- stats ---
+    def _stats(arr):
+        return dict(
+            min=float(np.min(arr)),
+            max=float(np.max(arr)),
+            mean=float(np.mean(arr)),
+            std=float(np.std(arr)),
+        )
+    s_logits = _stats(rec_logits.numpy())
+    s_probs  = _stats(rec_probs)
+    s_gt     = dict(pos_frac=float(gt_flat.mean().item()), count=int(gt_flat.numel()))
+
+    # positive fraction at common thresholds
+    thr_grid = np.linspace(0.05, 0.95, 19)
+    pred_pos_fracs = (rec_probs[:, None] > thr_grid[None, :]).mean(axis=0)
+
+    # simple PR/IoU sweep
+    gt_np = gt_flat.numpy()
+    eps = 1e-8
+    prec, rec, iou = [], [], []
+    for th in thr_grid:
+        pred = (rec_probs > th)
+        tp = float(np.sum(pred & (gt_np > 0.5)))
+        fp = float(np.sum(pred & (gt_np < 0.5)))
+        fn = float(np.sum((~pred) & (gt_np > 0.5)))
+        p  = tp / (tp + fp + eps)
+        r  = tp / (tp + fn + eps)
+        u  = tp / (tp + fp + fn + eps)
+        prec.append(p); rec.append(r); iou.append(u)
+
+    # --- histograms (wandb native + a plotly overlay for probs) ---
+    log_dict = {
+        f"{name_prefix}/rec_logits_hist": wandb.Histogram(rec_logits.numpy()),
+        f"{name_prefix}/rec_probs_hist" : wandb.Histogram(rec_probs),
+        f"{name_prefix}/gt_hist"        : wandb.Histogram(gt_np),
+        f"{name_prefix}/stats/logits_min": s_logits["min"],
+        f"{name_prefix}/stats/logits_max": s_logits["max"],
+        f"{name_prefix}/stats/logits_mean": s_logits["mean"],
+        f"{name_prefix}/stats/probs_mean": s_probs["mean"],
+        f"{name_prefix}/stats/probs_std" : s_probs["std"],
+        f"{name_prefix}/gt/pos_frac": s_gt["pos_frac"],
+        f"{name_prefix}/gt/count": s_gt["count"],
+    }
+
+    # overlay histogram: probs vs GT (GT as 0/1 bars)
+    fig_hist = go.Figure()
+    fig_hist.add_trace(go.Histogram(x=rec_probs, nbinsx=50, name="pred_probs", opacity=0.7))
+    # put GT as two bars at 0 and 1 scaled to same total
+    fig_hist.add_trace(go.Histogram(x=gt_np, nbinsx=2, name="gt_occ(0/1)", opacity=0.6))
+    fig_hist.update_layout(barmode='overlay', title="Pred prob vs GT occupancy")
+    log_dict[f"{name_prefix}/overlay_hist"] = fig_hist
+
+    # threshold sweep plot
+    fig_sweep = go.Figure()
+    fig_sweep.add_trace(go.Scatter(x=thr_grid, y=prec, mode="lines+markers", name="precision"))
+    fig_sweep.add_trace(go.Scatter(x=thr_grid, y=rec,  mode="lines+markers", name="recall"))
+    fig_sweep.add_trace(go.Scatter(x=thr_grid, y=iou,  mode="lines+markers", name="IoU"))
+    fig_sweep.add_trace(go.Scatter(x=thr_grid, y=pred_pos_fracs, mode="lines+markers", name="pred_pos_frac", yaxis="y2"))
+    fig_sweep.update_layout(
+        title="Threshold sweep (probs→mask)",
+        xaxis_title="threshold",
+        yaxis=dict(title="PR/IoU"),
+        yaxis2=dict(title="pred_pos_frac", overlaying='y', side='right', rangemode='tozero'),
+        legend=dict(orientation='h')
+    )
+    log_dict[f"{name_prefix}/threshold_sweep"] = fig_sweep
+
+    # a couple of handy scalars
+    best_i = int(np.argmax(iou))
+    log_dict.update({
+        f"{name_prefix}/best_iou": float(iou[best_i]),
+        f"{name_prefix}/best_iou_thr": float(thr_grid[best_i]),
+        f"{name_prefix}/pred_pos@0.5": float(pred_pos_fracs[np.argmin(np.abs(thr_grid-0.5))]),
+    })
+
+    wandb.log(log_dict, step=step)

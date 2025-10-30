@@ -14,7 +14,7 @@ from modules.modules import DLPDynamics
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \
-    ChamferLossKL
+    ChamferLossKL, bce_logits_weighted
 from modules.vision_modules import rgb_to_minusoneone, minusoneone_to_rgb
 
 
@@ -1917,18 +1917,16 @@ class DLP(nn.Module):
             print("Using BCE reconstruction loss for voxel data.")
             # x should be binary occupancy {0,1}; if you stored density/counts, binarize:
             # x_occ = (x_flat > 0).float()  # or use a threshold appropriate to your voxelizer
-            x_occ = x
-            # TODO: put this in loss utils, also make this work with calc reconstruction_loss
-            loss_rec = self.bce_logits_loss(x_occ, rec_x)
-            # Optional: for logging-only, compute PR/IoU later. PSNR isn't meaningful for binary.
-            with torch.no_grad():
-                probs = torch.sigmoid(rec_x)
-                # quick IoU at 0.5 threshold (for debug)
-                pred = (probs > 0.5).float()
-                inter = (pred * x_occ).sum()
-                union = ((pred + x_occ) > 0).float().sum()
-                iou = inter / (union + 1e-8)
-                psnr = iou  # placeholder so your dict has a number; PSNR not meaningful here
+            bce = F.binary_cross_entropy_with_logits(rec_x, x, reduction='none')
+            b, t = bce.shape[:2]
+            bce = bce.view(b, t, -1)
+            loss_rec = bce.mean(dim=-1).mean()   
+        elif recon_loss_type == "bce-weighted":
+            loss_rec = bce_logits_weighted(
+                logits=rec_x,
+                target=x,
+                gamma_pos=getattr(self, "gamma_pos", 0.98)  # or pass via args
+            )
         else:
             # your original MSE path (e.g., for density/moments/avg_rgb)
             loss_rec = calc_reconstruction_loss(x, rec_x, loss_type='mse', reduction='none')
@@ -2049,7 +2047,7 @@ class DLP(nn.Module):
         loss_kl_dyn = torch.tensor(0.0, device=x.device)
         loss_scale = 0.1 if recon_loss_type == 'mse' else 0.01
         loss = loss_scale * loss
-        loss_dict = {'loss': loss, 'psnr': psnr.detach(), 'kl': loss_kl_static, 'kl_dyn': loss_kl_dyn,
+        loss_dict = {'loss': loss, 'kl': loss_kl_static, 'kl_dyn': loss_kl_dyn,
                      'loss_rec': loss_rec,
                      'obj_on_l1': obj_on_l1, 'loss_kl_kp': loss_kl_kp, 'loss_kl_feat': loss_kl_feat,
                      'loss_kl_obj_on': loss_kl_obj_on, 'loss_kl_scale': loss_kl_scale, 'loss_kl_depth': loss_kl_depth,
@@ -2065,27 +2063,36 @@ class DLP(nn.Module):
             other_param = other.parameters()
             for p, p_other in zip(params, other_param):
                 p.data.lerp_(p_other.data, 1.0 - betta)
-    def bce_logits_loss(self, x_occ, rec_logits):
-        """
-        x_occ: [B,T,1,D,H,W] or [B,T,D,H,W] in {0,1}
-        rec_logits: same shape as x_occ (logits, not probs)
-        Returns mean over batch of per-frame summed BCE.
-        """
-        # ensure shapes match
-        assert x_occ.shape == rec_logits.shape, f"{x_occ.shape=} vs {rec_logits.shape=}"
 
-        # class imbalance handling: pos_weight = #neg/#pos (per-batch)
-        with torch.no_grad():
-            pos = x_occ.sum()
-            neg = x_occ.numel() - pos
-            pos_weight = (neg / (pos + 1e-8)).clamp(min=1.0)
+    def bce_logits_asymmetric(
+        self,
+        logits,                  # [B,T,1,D,H,W] (logits)
+        target,                  # same shape, binary {0,1}
+        gamma_pos=0.7,           # γ in the paper (weight on positives)
+        label_smoothing=0.05,    # ε; set 0.0 to disable
+    ):
+        """
+        Asymmetric BCE with label smoothing, computed in logit space:
+        L = -γ * t' * log σ(z) - (1-γ) * (1 - t') * log (1 - σ(z))
+        where t' is smoothed target.
+        Reduction: mean over all elements.
+        """
+        # 1) label smoothing on targets
+        if label_smoothing > 0:
+            eps = float(label_smoothing)
+            t = target * (1 - eps) + eps * (1 - target)  # 0 -> eps, 1 -> 1-eps
+        else:
+            t = target
 
-        bce = F.binary_cross_entropy_with_logits(
-            rec_logits, x_occ, reduction='none', pos_weight=torch.tensor(pos_weight, device=x_occ.device)
-        )
-        # sum over voxels, mean over (B,T)
-        b, t = x_occ.shape[:2]
-        return bce.view(b, t, -1).sum(-1).mean()
+        # 2) stable log-sigmoid terms
+        # log σ(z) = -softplus(-z) ; log (1-σ(z)) = -softplus(z)
+        log_p   = -F.softplus(-logits)
+        log_1mp = -F.softplus( logits)
+
+        # 3) asymmetric weighting
+        loss = -(gamma_pos * t * log_p + (1.0 - gamma_pos) * (1.0 - t) * log_1mp)
+
+        return loss.mean()
 
 """
 JIT scripts

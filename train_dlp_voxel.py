@@ -30,7 +30,8 @@ from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, 
                             topk_indices_from_output, wandb_log_iter_losses)
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
-from eval.eval_vox import log_vox_overlay_plotly, log_vox_isoseries, topk_kps_from_variance, extract_volumes_for_vis, print_vol_stats
+from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, topk_kps_from_variance, 
+                           extract_volumes_for_vis, print_vol_stats, log_voxel_rec_distributions)
 import wandb
 
 matplotlib.use("Agg")
@@ -382,7 +383,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # iteration counter
     iteration = 0
     
-    run_name = f"{voxel_mode}-{voxel_grid_whd[0]}-{decoder_point_mode}"
+    run_name = f"{recon_loss_type}-beta_rec-{beta_rec}-beta_kl-{beta_kl}-kl_balance-{kl_balance}"
     wandb.init(
         name=run_name,
         config=config,
@@ -622,6 +623,14 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                     iso_levels=[iso_main], step=iteration)
                 log_vox_isoseries("vox/rec_isos_topk", rec_vol, kps=kp_topk,
                                 iso_levels=[0.05, 0.1, 0.2, 0.3, 0.4], step=iteration)
+
+            log_voxel_rec_distributions(
+                model_output=model_output,
+                x=vox,                 # your GT volume batch
+                occ_channel=0,
+                name_prefix="vox/dist",
+                step=iteration,
+            )
 
 
 

@@ -965,3 +965,23 @@ def kp_separation_loss(kp_xyz, obj_on, delta=0.05):
     sep = torch.relu(delta - d) * w_pair
     return sep.mean()
 
+def bce_logits_weighted(logits, target, gamma_pos=0.98):
+    """
+    logits: [...], raw decoder outputs (no sigmoid)
+    target: [...], binary {0,1} occupancy
+    gamma_pos: weight for positives (paper used ~0.98); negatives get (1-gamma_pos)
+    """
+    # log σ(z) and log(1-σ(z)) in a numerically-stable way
+    log_p   = -F.softplus(-logits)   # = log(sigmoid(logits))
+    log_1mp = -F.softplus( logits)   # = log(1 - sigmoid(logits))
+
+    # -(γ * t * log p + (1-γ)*(1-t)*log(1-p))
+    loss = -(gamma_pos * target * log_p + (1.0 - gamma_pos) * (1.0 - target) * log_1mp)
+    return loss.mean()
+
+# ---------- bias initialize a final logit layer ----------
+def init_logit_bias(module_with_bias, p_pos):
+    """Call once after model init: sets bias=logit(p_pos)."""
+    b = math.log(p_pos / max(1e-8, 1.0 - p_pos))
+    with torch.no_grad():
+        module_with_bias.bias.fill_(b)
