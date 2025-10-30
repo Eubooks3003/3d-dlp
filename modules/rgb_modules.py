@@ -17,186 +17,122 @@ from modules.vision_modules import Encoder, Decoder
 Basic Modules
 """
 
-class AlternativeSpatialSoftmaxKP3D(torch.nn.Module):
-    """
-    3D spatial-softmax over voxel heatmaps.
 
-    Inputs:
-      heatmap: [B, K, D, H, W]  (D=z depth, H=y, W=x)
-
-    Returns:
-      if variance=False:
-         kp: [B, K, 3]                    # (x, y, z) in kp_range
-      if variance=True:
-         (kp, cov):                       # full covariance
-             kp  [B, K, 3]                # (x, y, z)
-             cov [B, K, 3, 3]             # cov[i] symmetric PSD
-      if probs=True (in addition to above when requested):
-         sm_x [B, K, W], sm_y [B, K, H], sm_z [B, K, D]
+class AlternativeSpatialSoftmaxKP(torch.nn.Module):
     """
+    This module performs spatial-softmax (ssm) by performing marginalization over heatmaps.
+    """
+
     def __init__(self, kp_range=(-1, 1)):
         super().__init__()
         self.kp_range = kp_range
 
-    def forward(self, heatmap, probs: bool=False, variance: bool=False):
-        B, K, D, H, W = heatmap.shape
+    def forward(self, heatmap, probs=False, variance=False):
+        batch_size, n_kp, height, width = heatmap.shape
+        # p(x) = \int p(x,y)dy
+        logits = heatmap.view(batch_size, n_kp, -1)  # [batch_size, n_kp, h * w]
+        scores = torch.softmax(logits, dim=-1)  # [batch_size, n_kp, h * w]
+        scores = scores.view(batch_size, n_kp, height, width)  # [batch_size, n_kp, h, w]
+        y_axis = torch.linspace(self.kp_range[0], self.kp_range[1], height,
+                                device=scores.device).type_as(scores).expand(1, 1, -1)  # [1, 1, features_dim_height]
+        x_axis = torch.linspace(self.kp_range[0], self.kp_range[1], width,
+                                device=scores.device).type_as(scores).expand(1, 1, -1)  # [1, 1, features_dim_width]
 
-        # Softmax over all voxels
-        logits = heatmap.view(B, K, -1)                 # [B, K, D*H*W]
-        scores = torch.softmax(logits, dim=-1)
-        scores = scores.view(B, K, D, H, W)             # [B, K, D, H, W]
+        # marginalize over x (width) and y (height)
+        sm_h = scores.sum(dim=-1)  # [batch_size, n_kp, h]
+        sm_w = scores.sum(dim=-2)  # [batch_size, n_kp, w]
 
-        # Axes in the target range
-        x_axis = torch.linspace(self.kp_range[0], self.kp_range[1], W, device=heatmap.device, dtype=heatmap.dtype)
-        y_axis = torch.linspace(self.kp_range[0], self.kp_range[1], H, device=heatmap.device, dtype=heatmap.dtype)
-        z_axis = torch.linspace(self.kp_range[0], self.kp_range[1], D, device=heatmap.device, dtype=heatmap.dtype)
+        # # expected value: probability per coordinate * coordinate
+        kp_h = torch.sum(sm_h * y_axis, dim=-1, keepdim=True)  # [batch_size, n_kp, 1]
+        kp_h = kp_h.squeeze(-1)  # [batch_size, n_kp], y coordinate of each kp
 
-        # Per-axis marginals
-        sm_x = scores.sum(dim=(2, 3))      # [B, K, W]  sum over z,y
-        sm_y = scores.sum(dim=(2, 4))      # [B, K, H]  sum over z,x
-        sm_z = scores.sum(dim=(3, 4))      # [B, K, D]  sum over y,x
+        kp_w = torch.sum(sm_w * x_axis, dim=-1, keepdim=True)  # [batch_size, n_kp, 1]
+        kp_w = kp_w.squeeze(-1)  # [batch_size, n_kp], x coordinate of each kp
 
-        # Expectations (E[x], E[y], E[z])
-        Ex = (sm_x * x_axis.view(1, 1, W)).sum(dim=-1)  # [B, K]
-        Ey = (sm_y * y_axis.view(1, 1, H)).sum(dim=-1)  # [B, K]
-        Ez = (sm_z * z_axis.view(1, 1, D)).sum(dim=-1)  # [B, K]
+        # stack keypoints
+        kp = torch.stack([kp_h, kp_w], dim=-1)  # [batch_size, n_kp, 2], x, y coordinates of each kp
 
-        kp = torch.stack([Ex, Ey, Ez], dim=-1)          # [B, K, 3]  -> (x, y, z)
+        if variance:
+            # sigma^2 = E[x^2] - (E[x])^2
+            y_sq = (scores * (y_axis.unsqueeze(-1) ** 2)).sum(dim=(-2, -1))  # [batch_size, n_kp]
+            v_h = (y_sq - kp_h ** 2).clamp_min(1e-6)  # [batch_size, n_kp]
+            x_sq = (scores * (x_axis.unsqueeze(-2) ** 2)).sum(dim=(-2, -1))  # [batch_size, n_kp]
+            v_w = (x_sq - kp_w ** 2).clamp_min(1e-6)  # [batch_size, n_kp]
 
-        if not variance:
-            if probs:
-                return kp, sm_x, sm_y, sm_z
+            # covariance: E[xy] - E[x]E[y]
+            xy_sq = (scores * (y_axis.unsqueeze(-1) * x_axis.unsqueeze(-2))).sum(dim=(-2, -1))  # [batch_size, n_kp]
+            cov = xy_sq - kp_h * kp_w
+
+            var = torch.stack([v_h, v_w, cov], dim=-1)
+            return kp, var
+        if probs:
+            return kp, sm_h, sm_w
+        else:
             return kp
 
-        # Second moments E[x^2], E[y^2], E[z^2]
-        Ex2 = (scores * (x_axis.view(1,1,1,1,W) ** 2)).sum(dim=(2,3,4))  # [B, K]
-        Ey2 = (scores * (y_axis.view(1,1,1,H,1) ** 2)).sum(dim=(2,3,4))  # [B, K]
-        Ez2 = (scores * (z_axis.view(1,1,D,1,1) ** 2)).sum(dim=(2,3,4))  # [B, K]
 
-        # Cross-moments E[xy], E[xz], E[yz]
-        Exy = (scores * (x_axis.view(1,1,1,1,W) * y_axis.view(1,1,1,H,1))).sum(dim=(2,3,4))  # [B, K]
-        Exz = (scores * (x_axis.view(1,1,1,1,W) * z_axis.view(1,1,D,1,1))).sum(dim=(2,3,4))  # [B, K]
-        Eyz = (scores * (y_axis.view(1,1,1,H,1) * z_axis.view(1,1,D,1,1))).sum(dim=(2,3,4))  # [B, K]
-
-        # Covariances: Cov[a,b] = E[ab] - E[a]E[b]
-        var_x = (Ex2 - Ex**2).clamp_min(1e-6)
-        var_y = (Ey2 - Ey**2).clamp_min(1e-6)
-        var_z = (Ez2 - Ez**2).clamp_min(1e-6)
-        cov_xy = Exy - Ex*Ey
-        cov_xz = Exz - Ex*Ez
-        cov_yz = Eyz - Ey*Ez
-
-        # Assemble symmetric covariance matrix [B, K, 3, 3]
-        cov = torch.zeros(B, K, 3, 3, device=heatmap.device, dtype=heatmap.dtype)
-        cov[:, :, 0, 0] = var_x
-        cov[:, :, 1, 1] = var_y
-        cov[:, :, 2, 2] = var_z
-        cov[:, :, 0, 1] = cov[:, :, 1, 0] = cov_xy
-        cov[:, :, 0, 2] = cov[:, :, 2, 0] = cov_xz
-        cov[:, :, 1, 2] = cov[:, :, 2, 1] = cov_yz
-
-        if probs:
-            return kp, cov, sm_x, sm_y, sm_z
-        return kp, cov
-
-
-import torch
-import torch.nn as nn
-import numpy as np
-from typing import Tuple, Union
-
-class VoxelPatcher(nn.Module):
+class ImagePatcher(nn.Module):
     """
-    3D patcher in canonical PyTorch layout.
-    Input:  [B, C, D, H, W]
-    Output: [B, C, N, pd, ph, pw]   (non-overlapping tiles)
+    Author: Tal Daniel
+    This module take an image of size B x cdim x H x W and return a patchified tesnor
+    B x cdim x num_patches x patch_size x patch_size. It also gives you the global location of the patch
+    w.r.t the original image. We use this module to extract prior KP from patches, and we need to know their
+    global coordinates for the Chamfer-KL.
     """
-    def __init__(self, cdim=3, volume_size=(64,64,64), patch_size=(16,16,16)):
-        super().__init__()
+
+    def __init__(self, cdim=3, image_size=64, patch_size=16):
+        super(ImagePatcher, self).__init__()
         self.cdim = cdim
-        if isinstance(volume_size, int):
-            self.D = self.H = self.W = volume_size
-        else:
-            self.D, self.H, self.W = map(int, volume_size)
-        if isinstance(patch_size, int):
-            self.pd = self.ph = self.pw = patch_size
-        else:
-            self.pd, self.ph, self.pw = map(int, patch_size)
-
-        # strides = patch sizes (no overlap)
-        self.dd, self.dh, self.dw = self.pd, self.ph, self.pw
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.kh, self.kw = self.patch_size, self.patch_size  # kernel size
+        self.dh, self.dw = self.patch_size, patch_size  # stride
         self.unfold_shape = self.get_unfold_shape()
-        self.patch_location_idx = self.get_patch_location_idx()  # [N, 3] with (d,h,w)
-
-    def _num_tiles(self):
-        nd = self.D // self.pd
-        nh = self.H // self.ph
-        nw = self.W // self.pw
-        return nd, nh, nw
-
-    def get_unfold_shape(self):
-        nd, nh, nw = self._num_tiles()
-        if (self.D % self.pd) or (self.H % self.ph) or (self.W % self.pw):
-            raise ValueError(
-                f"Volume dims (D={self.D}, H={self.H}, W={self.W}) "
-                f"must be divisible by (pd={self.pd}, ph={self.ph}, pw={self.pw})."
-            )
-        return (self.cdim, nd, nh, nw, self.pd, self.ph, self.pw)
+        self.patch_location_idx = self.get_patch_location_idx()
+        # print(f'unfold shape: {self.unfold_shape}')
+        # print(f'patch locations: {self.patch_location_idx}')
 
     def get_patch_location_idx(self):
-        ds = np.arange(0, self.D, self.pd)
-        hs = np.arange(0, self.H, self.ph)
-        ws = np.arange(0, self.W, self.pw)
-        dd, hh, ww = np.meshgrid(ds, hs, ws, indexing="ij")  # (d,h,w) order
-        dhws = np.stack((dd, hh, ww), axis=-1).reshape(-1, 3)
-        return torch.tensor(dhws, dtype=torch.int32)
+        h = np.arange(0, self.image_size)[::self.patch_size]
+        w = np.arange(0, self.image_size)[::self.patch_size]
+        ww, hh = np.meshgrid(h, w)
+        hw = np.stack((hh, ww), axis=-1)
+        hw = hw.reshape(-1, 2)
+        # return torch.from_numpy(hw).int()
+        return torch.tensor(hw, dtype=torch.int)
 
     def get_patch_centers(self):
-        mid = torch.tensor([self.pd//2, self.ph//2, self.pw//2], dtype=torch.int32)
-        return self.get_patch_location_idx() + mid
+        mid = self.patch_size // 2
+        patch_locations_idx = self.get_patch_location_idx()
+        patch_locations_idx += mid
+        return patch_locations_idx
 
-    @staticmethod
-    def _ensure_5d_dhw(x: torch.Tensor):
-        if x.ndim != 5:
-            raise ValueError(f"Expected [B,C,D,H,W], got {tuple(x.shape)}")
+    def get_unfold_shape(self):
+        dummy_input = torch.zeros(1, self.cdim, self.image_size, self.image_size)
+        patches = dummy_input.unfold(2, self.kh, self.dh).unfold(3, self.kw, self.dw)
+        unfold_shape = patches.shape[1:]
+        return unfold_shape
 
-    def vox_to_patches(self, x: torch.Tensor) -> torch.Tensor:
-        """[B,C,D,H,W] -> [B,C,N,pd,ph,pw]"""
-        self._ensure_5d_dhw(x)
-        B, C, D, H, W = x.shape
-        nd, nh, nw = D // self.pd, H // self.ph, W // self.pw
-        if (D % self.pd) or (H % self.ph) or (W % self.pw):
-            raise ValueError(f"Input dims not divisible by patch size: (D={D},H={H},W={W}) vs (pd={self.pd},ph={self.ph},pw={self.pw})")
+    def img_to_patches(self, x):
+        patches = x.unfold(2, self.kh, self.dh).unfold(3, self.kw, self.dw)
+        patches = patches.contiguous().view(patches.shape[0], patches.shape[1], -1, self.kh, self.kw)
+        return patches
 
-        # [B, C, nd, pd, nh, ph, nw, pw]
-        x = x.view(B, C, nd, self.pd, nh, self.ph, nw, self.pw)
-        # -> [B, C, nd, nh, nw, pd, ph, pw]
-        x = x.permute(0, 1, 2, 4, 6, 3, 5, 7).contiguous()
-        # -> [B, C, nd*nh*nw, pd, ph, pw]
-        x = x.view(B, C, nd * nh * nw, self.pd, self.ph, self.pw)
-        return x
+    def patches_to_img(self, x):
+        patches_orig = x.view(x.shape[0], *self.unfold_shape)
+        output_h = self.unfold_shape[1] * self.unfold_shape[3]
+        output_w = self.unfold_shape[2] * self.unfold_shape[4]
+        patches_orig = patches_orig.permute(0, 1, 2, 4, 3, 5).contiguous()
+        patches_orig = patches_orig.view(-1, self.cdim, output_h, output_w)
+        return patches_orig
 
-    def patches_to_vox(self, patches: torch.Tensor) -> torch.Tensor:
-        """[B,C,N,pd,ph,pw] -> [B,C,D,H,W]"""
-        if patches.ndim != 6:
-            raise ValueError(f"Expected [B,C,N,pd,ph,pw], got {tuple(patches.shape)}")
-        B, C, N, pd, ph, pw = patches.shape
-        nd, nh, nw = self._num_tiles()
-        if N != nd * nh * nw:
-            raise ValueError(f"N={N} != nd*nh*nw={nd*nh*nw}")
-        if (pd, ph, pw) != (self.pd, self.ph, self.pw):
-            raise ValueError(f"Patch size mismatch: {(pd,ph,pw)} vs {(self.pd,self.ph,self.pw)}")
+    def forward(self, x, patches=True):
+        # x [batch_size, 3, image_size, image_size] or [batch_size, 3, num_patches, image_size, image_size]
+        if patches:
+            return self.img_to_patches(x)
+        else:
+            return self.patches_to_img(x)
 
-        # [B, C, nd, nh, nw, pd, ph, pw]
-        x = patches.view(B, C, nd, nh, nw, pd, ph, pw)
-        # -> [B, C, nd, pd, nh, ph, nw, pw]
-        x = x.permute(0, 1, 1, 5, 2, 6, 3, 7).contiguous()
-        # -> [B, C, D, H, W]
-        x = x.view(B, C, nd * pd, nh * ph, nw * pw)
-        return x
-
-    def forward(self, x: torch.Tensor, patches: bool = True) -> torch.Tensor:
-        return self.vox_to_patches(x) if patches else self.patches_to_vox(x)
 
 """
 Normalization
@@ -1532,7 +1468,7 @@ class ParticleFeatureProjection(torch.nn.Module):
         return z_processed
 
 
-class ParticleAttributesProjection(nn.Module):
+class ParticleAttributesProjection(torch.nn.Module):
     def __init__(self, n_particles, in_features_dim, hidden_dim, output_dim, bg_features_dim, add_ctx_token=False,
                  base_dim=32, depth=True, obj_on=True, base_var=False, bg=True, activation='gelu', init_std=0.2,
                  cat_particle_num=False, norm_layer=True, particle_score=False,
@@ -1555,240 +1491,179 @@ class ParticleAttributesProjection(nn.Module):
         self.mask_obj_on = mask_obj_on
         self.use_z_orig = use_z_orig
         self.obj_on_film = obj_on_film
-
         activation_f = nn.GELU if activation == 'gelu' else nn.ReLU
-
-        # ==== 3D CHANGES: positions & scales are length-3 ====
-        pos_dim   = 3
-        scale_dim = 3
-        origin_dim = 2 * pos_dim  # (orig_xyz, offset_xyz) when use_z_orig
-
+        # self.particle_dim = 2 + 2 + 2 + in_features_dim
+        # [z, z_scale, z_features]
         self.base_dim = base_dim
-        self.n_entities = 3  # z, z_scale, z_features
-        if self.with_depth:      self.n_entities += 1
-        if self.with_obj_on and not self.obj_on_film: self.n_entities += 1
-        if self.with_var:        self.n_entities += 1
-        if self.with_score:      self.n_entities += 1
-        if self.use_z_orig:      self.n_entities += 1
+        self.n_entities = 3
+        if self.with_depth:
+            self.n_entities += 1
+        if self.with_obj_on and not self.obj_on_film:
+            self.n_entities += 1
+        if self.with_var:
+            self.n_entities += 1
+        if self.with_score:
+            self.n_entities += 1
+        if self.use_z_orig:
+            self.n_entities += 1
         if self.cat_particle_num:
             self.n_entities += 1
             self.particle_num_embed = nn.Parameter(0.02 * torch.randn(1, self.n_particles, self.base_dim))
         self.particle_dim = self.base_dim * self.n_entities
 
-        # --- projections ---
-        Norm = (lambda d: RMSNorm(d)) if norm_layer else (lambda d: nn.Identity())
-
-        self.xy_projection = nn.Sequential(
-            nn.Linear(pos_dim, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, self.base_dim)
-        )
-        self.scale_projection = nn.Sequential(
-            nn.Linear(scale_dim, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, self.base_dim)
-        )
-
-        # NOTE: keep var projection shape as in your code (you control z_base_var):
+        self.xy_projection = nn.Sequential(nn.Linear(2, hidden_dim),
+                                           RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                           activation_f(),
+                                           nn.Linear(hidden_dim, self.base_dim))
+        self.scale_projection = nn.Sequential(nn.Linear(2, hidden_dim),
+                                              RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                              activation_f(),
+                                              nn.Linear(hidden_dim, self.base_dim))
         if self.with_var:
-            self.var_projection = nn.Sequential(
-                nn.Linear(5, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, self.base_dim)
-            )
-
+            self.var_projection = nn.Sequential(nn.Linear(5, hidden_dim),
+                                                RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                                activation_f(),
+                                                nn.Linear(hidden_dim, self.base_dim))
         if self.with_obj_on:
             if self.obj_on_film:
-                self.obj_on_projection = nn.Sequential(
-                    nn.Linear(1, hidden_dim),
-                    activation_f(),
-                    nn.Linear(hidden_dim, 2 * hidden_dim)
-                )
+                self.obj_on_projection = nn.Sequential(nn.Linear(1, hidden_dim),
+                                                       activation_f(),
+                                                       nn.Linear(hidden_dim, 2 * hidden_dim))
                 nn.init.constant_(self.obj_on_projection[-1].weight, 0.0)
                 nn.init.constant_(self.obj_on_projection[-1].bias[:hidden_dim], 1.0)
                 nn.init.constant_(self.obj_on_projection[-1].bias[hidden_dim:], 0.0)
             else:
-                self.obj_on_projection = nn.Sequential(
-                    nn.Linear(1, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, self.base_dim)
-                )
+                self.obj_on_projection = nn.Sequential(nn.Linear(1, hidden_dim),
+                                                       # ParticleNorm2(self.n_particles),
+                                                       RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                                       activation_f(),
+                                                       nn.Linear(hidden_dim, self.base_dim))
 
             if self.mask_inputs:
-                # ==== 3D CHANGES: mask lengths ====
-                self.xy_mask       = nn.Parameter(2 * torch.ones(pos_dim))
-                self.scale_mask    = nn.Parameter(0.1 * torch.ones(scale_dim))
+                self.xy_mask = nn.Parameter(2 * torch.ones(2))
+                self.scale_mask = nn.Parameter(0.1 * torch.ones(2))
                 self.features_mask = nn.Parameter(init_std * torch.randn(in_features_dim))
                 if self.mask_obj_on:
                     self.obj_on_mask = nn.Parameter(torch.zeros(1))
-
         if self.with_depth:
-            self.depth_projection = nn.Sequential(
-                nn.Linear(1, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, self.base_dim)
-            )
+            self.depth_projection = nn.Sequential(nn.Linear(1, hidden_dim),
+                                                  RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                                  activation_f(),
+                                                  nn.Linear(hidden_dim, self.base_dim))
             if self.with_obj_on and self.mask_inputs:
                 self.depth_mask = nn.Parameter(init_std * torch.randn(1))
-
-        self.features_projection = nn.Sequential(
-            nn.Linear(in_features_dim, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, self.base_dim)
-        )
-
+        self.features_projection = nn.Sequential(nn.Linear(in_features_dim, hidden_dim),
+                                                 RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                                 activation_f(),
+                                                 nn.Linear(hidden_dim, self.base_dim))
         if self.with_score:
-            self.score_projection = nn.Sequential(
-                nn.Linear(1, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, self.base_dim)
-            )
-
+            self.score_projection = nn.Sequential(nn.Linear(1, hidden_dim),
+                                                  RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                                  activation_f(),
+                                                  nn.Linear(hidden_dim, self.base_dim))
         if self.with_bg:
-            self.bg_projection = nn.Sequential(
-                nn.Linear(bg_features_dim, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, output_dim)
-            )
-
+            self.bg_projection = nn.Sequential(nn.Linear(bg_features_dim, hidden_dim),
+                                               RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                               activation_f(),
+                                               nn.Linear(hidden_dim, output_dim))
         if self.use_z_orig:
-            # ==== 3D CHANGES: 6 inputs (orig_xyz + offset_xyz) ====
-            self.origin_projection = nn.Sequential(
-                nn.Linear(origin_dim, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, base_dim)
-            )
+            self.origin_projection = nn.Sequential(nn.Linear(4, hidden_dim),
+                                                   RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                                   activation_f(),
+                                                   nn.Linear(hidden_dim, base_dim))
             if self.mask_inputs:
-                self.orig_mask = nn.Parameter(2 * torch.ones(origin_dim))
-
+                self.orig_mask = nn.Parameter(2 * torch.ones(4))
         if self.obj_on_film:
-            self.particle_projection_0 = nn.Sequential(
-                nn.Linear(self.particle_dim, hidden_dim), RMSNorm(hidden_dim)
-            )
-            self.particle_projection = nn.Sequential(
-                activation_f(), nn.Linear(hidden_dim, output_dim)
-            )
+            self.particle_projection_0 = nn.Sequential(nn.Linear(self.particle_dim, hidden_dim),
+                                                       RMSNorm(hidden_dim))
+            self.particle_projection = nn.Sequential(activation_f(),
+                                                     nn.Linear(hidden_dim, output_dim))
         else:
-            self.particle_projection = nn.Sequential(
-                nn.Linear(self.particle_dim, hidden_dim), Norm(hidden_dim), activation_f(), nn.Linear(hidden_dim, output_dim)
-            )
-
+            self.particle_projection = nn.Sequential(nn.Linear(self.particle_dim, hidden_dim),
+                                                     RMSNorm(hidden_dim) if norm_layer else nn.Identity(),
+                                                     activation_f(),
+                                                     nn.Linear(hidden_dim, output_dim))
         if self.add_ctx_token:
             self.ctx_embedding = nn.Parameter(init_std * torch.randn(1, 1, 1, output_dim))
+
+        self.init_weights()
 
     def init_weights(self):
         pass
 
     def forward(self, z, z_scale, z_obj_on, z_depth, z_features, z_bg_features=None, z_base_var=None, z_score=None,
                 z_orig=None):
-        """
-        Shapes (3D):
-          z:         [B, T, N, 3] or [B, N, 3]
-          z_scale:   [B, T, N, 3] or [B, N, 3]
-          z_obj_on:  [B, T, N, 1] or [B, N, 1]
-          z_depth:   [B, T, N, 1] or [B, N, 1]
-          z_features:[B, T, N, F] or [B, N, F]
-          z_bg_features: [B, Fbg]
-          z_orig:    [B, T, N, 3] (orig) if use_z_orig, else None
-        Returns:
-          [B, T, N(+bg)(+ctx), output_dim]
-        """
-        # add origin and offset if requested
+        # def forward(self, z, z_scale, z_obj_on, z_features, z_base_var, z_bg_features):
+        # z, z_scale, z_velocity: [bs, n_particles, 2]
+        # z_depth, z_obj_on: [bs, n_particles, 1]
+        # z_features: [bs, n_particles, in_features_dim]
+        # z_bg_features: [bs, bg_features_dim]
+        # z_context: [bs, context_dim]
+        # bs, n_particles, feat_dim = z_features.shape
+
+        # add origin and offset
         if self.use_z_orig and z_orig is not None:
-            z_offset   = z - z_orig                       # [.., 3]
-            z_orig_tot = torch.cat([z_orig, z_offset], dim=-1)  # [.., 6]
+            z_offset = z - z_orig
+            z_orig_tot = torch.cat([z_orig, z_offset], dim=-1)
         else:
             z_orig_tot = z_orig
 
-        # optional gating based on objectness
         if self.with_obj_on and self.mask_inputs:
             z_gate = torch.where(z_obj_on > 0.2, 1.0, 0.0)
-            z         = z_gate * z         + (1 - z_gate) * self.xy_mask
-            z_scale   = z_gate * z_scale   + (1 - z_gate) * self.scale_mask
-            z_features= z_gate * z_features+ (1 - z_gate) * self.features_mask
+            z = z_gate * z + (1 - z_gate) * self.xy_mask
+            z_scale = z_gate * z_scale + (1 - z_gate) * self.scale_mask
+            z_features = z_gate * z_features + (1 - z_gate) * self.features_mask
             if self.use_z_orig and z_orig is not None:
-                z_orig_tot = z_gate * z_orig_tot + (1 - z_gate) * self.orig_mask
+                z_orig_mask = self.orig_mask
+                z_orig_tot = z_gate * z_orig_tot + (1 - z_gate) * z_orig_mask
             if self.mask_obj_on:
                 z_obj_on = z_gate * z_obj_on + (1 - z_gate) * self.obj_on_mask
 
-        # project parts
-        z_proj         = self.xy_projection(z)
-        z_scale_proj   = self.scale_projection(z_scale)
-        z_features_proj= self.features_projection(z_features)
-
+        z_proj = self.xy_projection(z)
+        z_scale_proj = self.scale_projection(z_scale)
+        z_features_proj = self.features_projection(z_features)
         z_all = torch.cat([z_proj, z_scale_proj, z_features_proj], dim=-1)
-
         if self.with_obj_on:
             z_obj_on_proj = self.obj_on_projection(z_obj_on)
             if not self.obj_on_film:
                 z_all = torch.cat([z_all, z_obj_on_proj], dim=-1)
-
         if self.with_depth:
             if self.with_obj_on and self.mask_inputs:
                 z_depth = z_gate * z_depth + (1 - z_gate) * self.depth_mask
             z_depth_proj = self.depth_projection(z_depth)
             z_all = torch.cat([z_all, z_depth_proj], dim=-1)
-
         if self.with_var and z_base_var is not None:
-            z_var_proj = self.var_projection(z_base_var)   # you control z_base_var's last dim
+            z_var_proj = self.var_projection(z_base_var)
             z_all = torch.cat([z_all, z_var_proj], dim=-1)
-
         if self.with_score and z_score is not None:
             z_score_proj = self.score_projection(z_score)
             z_all = torch.cat([z_all, z_score_proj], dim=-1)
-
         if self.use_z_orig and z_orig is not None:
-            z_orig_proj = self.origin_projection(z_orig_tot)  # [.., base_dim]
+            z_orig_proj = self.origin_projection(z_orig_tot)
             z_all = torch.cat([z_all, z_orig_proj], dim=-1)
-
         if self.cat_particle_num:
-            if len(z.shape) == 4:  # [B,T,N,3]
+            if len(z.shape) == 4:
                 p_embed = self.particle_num_embed.unsqueeze(1).repeat(z.shape[0], z.shape[1], 1, 1)
-            else:                  # [B,N,3]
+            else:
                 p_embed = self.particle_num_embed.repeat(z.shape[0], 1, 1)
             z_all = torch.cat([z_all, p_embed], dim=-1)
 
-        # final projection (with optional FiLM by obj_on)
+        # z_all: [bs, n_particles, 2 + 2 + in_features_dim]
         if self.with_obj_on and self.obj_on_film:
             oscale, oshift = z_obj_on_proj.chunk(2, dim=-1)
             z_all_proj = self.particle_projection(oscale * self.particle_projection_0(z_all) + oshift)
         else:
-            z_all_proj = self.particle_projection(z_all)  # [..., output_dim]
-
-        # append bg token
-        # ----- append bg token (robust to extra dims) -----
+            z_all_proj = self.particle_projection(
+                z_all)  # [bs, n_particles, output_dim]  or [bs, n_particle, hidden_dim]
         if self.with_bg:
-            assert z_bg_features is not None, "z_bg_features required when bg=True"
-
-            def _normalize_bg_feats(x):
-                # Accepts [B,F], [B,1,F], [B,T,F], [B,T,1,F], [B,T,N,F], [B,1,1,F], [B,1,1,1,F]
-                if x.dim() == 2:             # [B,F]
-                    return x
-                if x.dim() == 3:             # [B,?,F]  (T or 1)
-                    return x                 # keep [B,?,F]
-                if x.dim() == 4:             # [B, T, N, F] or [B,1,1,F]
-                    return x.mean(dim=-2)    # -> [B, T, F]  (or [B,1,F])
-                if x.dim() == 5:             # [B, T, 1, 1, F] etc.
-                    return x.squeeze(-2).squeeze(-2)  # -> [B, T, F]
-                raise RuntimeError(f"Unexpected z_bg_features shape: {tuple(x.shape)}")
-
-            bgf = _normalize_bg_feats(z_bg_features)                # [B,F] or [B,T,F]
-            bgp = self.bg_projection(bgf)                           # [B,D] or [B,T,D]
-
-            if z_all_proj.dim() == 4:                               # [B,T,N,D]
-                B, T, _, D = z_all_proj.shape
-                if bgp.dim() == 2:                                  # [B,D] -> tile over T
-                    bgp = bgp[:, None, :].expand(B, T, D)           # [B,T,D]
-                # now [B,T,D] -> [B,T,1,D]
-                bgp = bgp.unsqueeze(2)
-                z_all_proj = torch.cat([z_all_proj, bgp], dim=2)    # append 1 BG token per timestep
-            elif z_all_proj.dim() == 3:                             # [B,N,D]
-                B, _, D = z_all_proj.shape
-                if bgp.dim() == 3:                                  # [B,T,D] -> pick T=1 or mean over T
-                    bgp = bgp.mean(dim=1)                           # [B,D]
-                # [B,D] -> [B,1,D]
-                z_all_proj = torch.cat([z_all_proj, bgp[:, None, :]], dim=1)
-            else:
-                raise RuntimeError(f"Unexpected z_all_proj shape: {tuple(z_all_proj.shape)}")
-
-
-        # optional ctx token
+            z_bg_features_proj = self.bg_projection(z_bg_features)  # [bs, output_dim]
+            z_all_proj = torch.cat([z_all_proj, z_bg_features_proj.unsqueeze(-2)], dim=-2)
+        # [bs, T,  n_particles + 1, output_dim]
         if self.add_ctx_token:
-            if len(z_all_proj.shape) == 4:  # [B,T,N,D]
-                B, T = z_all_proj.shape[:2]
-                z_all_proj = torch.cat(
-                    [z_all_proj, self.ctx_embedding.expand(B, T, 1, -1)], dim=2
-                )
-            else:                            # [B,N,D]
-                B = z_all_proj.shape[0]
-                z_all_proj = torch.cat(
-                    [z_all_proj, self.ctx_embedding.expand(B, 1, -1)], dim=1
-                )
-
+            z_all_proj = torch.cat([z_all_proj,
+                                    self.ctx_embedding.repeat(z.shape[0], z.shape[1], 1, 1)], dim=-2)
+            # [bs, T,  n_particles + 2, output_dim]
         return z_all_proj
-
 
 
 class ParticlePool(nn.Module):
@@ -2156,18 +2031,26 @@ class ParticleFeatureDecoderDyn(nn.Module):
 CNN-based modules
 """
 
+
 class ObjectDecoderCNN(nn.Module):
-    def __init__(self, patch_size, num_chans=4, bottleneck_size=128, pad_mode='replicate',
-                 embed_position=False, use_resblock=False, context_dim=0, normalize_rgb=False,
-                 res_from_fc=8, activation='gelu', ch_mult=(1, 2, 3), base_ch=32, final_cnn_ch=32,
-                 num_res_blocks=2, cnn_mid_blocks=False, mlp_hidden_dim=256,
-                 init_zero_bias=True, init_conv_layers=True, init_conv_fg_std=0.02):
+    def __init__(self, patch_size, num_chans=4, bottleneck_size=128, pad_mode='replicate', embed_position=False,
+                 use_resblock=False, context_dim=0, normalize_rgb=False, res_from_fc=8, activation='gelu',
+                 ch_mult=(1, 2, 3), base_ch=32, final_cnn_ch=32, num_res_blocks=2, cnn_mid_blocks=False,
+                 mlp_hidden_dim=256,
+                 # initialization
+                 init_zero_bias=True,  # zero bias for conv and linear layers
+                 init_conv_layers=True,  # initialize conv layers with normal dist
+                 init_conv_fg_std=0.02,  # std for conv fg normal dist
+                 ):
         super().__init__()
 
-        # ---- config / flags ----
-        self.init_zero_bias = init_zero_bias
-        self.init_conv_layers = init_conv_layers
-        self.init_conv_fg_std = init_conv_fg_std
+        # initialization
+        self.init_zero_bias = init_zero_bias  # zero bias for conv and linear layers
+        self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
+        self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
+
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
         self.patch_size = patch_size
         self.num_chans = num_chans
         self.embed_position = embed_position
@@ -2176,78 +2059,55 @@ class ObjectDecoderCNN(nn.Module):
         self.activation = activation
         self.cnn_mid_blocks = cnn_mid_blocks
         self.mlp_hidden_dim = mlp_hidden_dim
+
         self.context_dim = context_dim
         self.normalize_rgb = normalize_rgb
 
-        # ---- 3D seed (fc_res³) ----
         self.in_ch = final_cnn_ch
-        self.fc_res = res_from_fc                           # e.g., 6 or 8
-        feature_map_size = self.fc_res ** 3                 # *** 3D ***
+        self.fc_res = res_from_fc
+        fc_out_dim = self.in_ch * (self.fc_res ** 2)
+        fc_in_dim = bottleneck_size if not self.embed_position else 2 * bottleneck_size
+
+        feature_map_size = self.fc_res ** 2
+
         if self.features_dim % feature_map_size == 0:
-            self.ch_feature_dim = max(1, math.ceil(self.features_dim / feature_map_size))
+            self.ch_feature_dim = math.ceil(max(self.features_dim / (res_from_fc ** 2), 1))
+            output_z_cnn = (self.ch_feature_dim, self.fc_res, self.fc_res)
+            flattened_z_cnn = np.prod(output_z_cnn)
+
+            self.projection_mode = 'fcn'
             self.from_latent_lin = nn.Identity()
+            # self.from_latent = nn.Conv2d(in_channels=self.ch_feature_dim, out_channels=self.in_ch, kernel_size=1)
+            self.from_latent = nn.Identity()
         else:
             self.ch_feature_dim = final_cnn_ch
-            flattened = self.ch_feature_dim * (self.fc_res ** 3)
-            self.from_latent_lin = self.get_mlp(self.features_dim, flattened)
+            output_z_cnn = (self.ch_feature_dim, self.fc_res, self.fc_res)
+            flattened_z_cnn = np.prod(output_z_cnn)
 
-        # optional extra processing on the seed block (keep as identity by default)
-        self.from_latent = nn.Identity()
+            self.projection_mode = 'fc'
+            self.from_latent_lin = self.get_mlp(self.features_dim, flattened_z_cnn)
+            self.from_latent = nn.Identity()
 
-        # ---- 3D decoder ----
-        self.num_upsample = max(int(np.log2(patch_size)) - int(np.log2(self.fc_res)), 0)
-        attn_res = [max(self.patch_size // 16, 1)]
+        self.info = (f'ObjectDecoderCNN: requested latent size: {self.features_dim}, '
+                     f'cnn input (h*w): {feature_map_size}, (latent_size / h*w)={self.features_dim / feature_map_size} ->'
+                     f' latent projection mode: {self.projection_mode},'
+                     f' project {self.features_dim} -> {output_z_cnn} ({flattened_z_cnn})')
+
+        self.num_upsample = max(int(np.log2(patch_size[0])) - int(np.log2(self.fc_res)), 0)
+        # print(f'ObjDecCNN: fc to cnn num upsample: {num_upsample}')
+        attn_res = [max(self.patch_size[0] // 16, 1)]
         ch_mult = ch_mult[:self.num_upsample + 1]
         z_channels = self.ch_feature_dim
-        self.cnn = Decoder(  # your Decoder must be the 3D version
-            ch=base_ch, out_ch=self.num_chans, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
-            attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
-            resolution=self.patch_size, z_channels=z_channels, give_pre_end=False,
-            padding_mode=pad_mode, residual=self.use_resblock, upsample_method='nearest',
-            mid_blocks=cnn_mid_blocks
-        )
-
-        # final channel projector (lazy-init because C' depends on runtime)
-        self._cnn_out_proj_inited = False
-        self.cnn_out_proj = None
-
-        # init
+        self.cnn = Decoder(ch=base_ch, out_ch=self.num_chans, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+                           attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
+                           resolution=self.patch_size[0], z_channels=z_channels, give_pre_end=False,
+                           padding_mode=pad_mode, residual=self.use_resblock, upsample_method='nearest',
+                           mid_blocks=cnn_mid_blocks)
         self.init_weights()
-
-    def forward(self, x, context=None):
-        """
-        x: [B, N, feat]
-        returns: [B*N, num_chans, patch_size, patch_size, patch_size]
-        """
-        import torch.nn.functional as F
-        B, N = x.shape[0], x.shape[1]
-        D = H = W = self.patch_size
-
-        # latent -> 3D seed
-        x = self.from_latent_lin(x)  # [B, N, ch_feature_dim * (fc_res^3)]
-        x = x.view(-1, self.ch_feature_dim, self.fc_res, self.fc_res, self.fc_res)  # [B*N,C,fr,fr,fr]
-
-        z = self.from_latent(x)      # identity by default
-        y = self.cnn(z)              # [B*N, C', D', H', W']  (3D decoder)
-
-        # force channels to num_chans
-        Cprime = y.shape[1]
-        if not self._cnn_out_proj_inited:
-            self.cnn_out_proj = nn.Conv3d(Cprime, self.num_chans, kernel_size=1, bias=True).to(y.device)
-            self._cnn_out_proj_inited = True
-        if Cprime != self.num_chans:
-            y = self.cnn_out_proj(y)
-
-        # force spatial size to (patch_size)^3
-        if y.shape[2:] != (D, H, W):
-            y = F.interpolate(y, size=(D, H, W), mode="trilinear", align_corners=False)
-
-        return y
-
 
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0.0, self.init_conv_fg_std)
                 if self.init_zero_bias and m.bias is not None:
@@ -2265,7 +2125,22 @@ class ObjectDecoderCNN(nn.Module):
 
             return mlp
 
+    def forward(self, x, context=None):
+        # x: [bs, n_kp, feat]
+        # context: [bs, feat]
+        bs, n_kp = x.shape[0], x.shape[1]
 
+        x = self.from_latent_lin(x)
+        x = x.view(-1, self.ch_feature_dim, self.fc_res, self.fc_res)
+        z = self.from_latent(x)
+        conv_in = z
+        out = self.cnn(conv_in).view(-1, self.num_chans, *self.patch_size)
+        out_a, out_rgb = torch.split(out, [1, out.shape[1] - 1], dim=1)
+
+        rgb_func = torch.tanh if self.normalize_rgb else torch.sigmoid
+        out = torch.cat([torch.sigmoid(out_a), rgb_func(out_rgb)], dim=1)
+
+        return out
 
 
 class ObjectDecoderCNNFILM(nn.Module):
@@ -2345,7 +2220,7 @@ class ObjectDecoderCNNFILM(nn.Module):
 
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0.0, self.init_conv_fg_std)
                 if self.init_zero_bias and m.bias is not None:
@@ -2364,46 +2239,27 @@ class ObjectDecoderCNNFILM(nn.Module):
             return mlp
 
     def forward(self, x, context=None):
-        # x: [bs, n_kp, feat] ; context: [bs, ctx_dim]
+        # x: [bs, n_kp, feat]
+        # context: [bs, feat]
         bs, n_kp = x.shape[0], x.shape[1]
-        D, H, W = (self.patch_size if isinstance(self.patch_size, tuple)
-                else (self.patch_size, self.patch_size, self.patch_size))
 
-        # FiLM params -> broadcast over 3D
-        ctx_param = self.film_layer(context)                  # [bs, 2*in_ch]
-        ctx_param = ctx_param.view(bs, 1, 2, self.in_ch)      # [bs,1,2,C]
-        ctx_param = ctx_param.repeat(1, n_kp, 1, 1)           # [bs,n_kp,2,C]
-        ctx_param = ctx_param.view(-1, 2, self.in_ch, 1, 1, 1)  # [bs*N,2,C,1,1,1]
-        ctx_gammas, ctx_betas = ctx_param[:, 0], ctx_param[:, 1]  # [bs*N,C,1,1,1]
+        ctx_param = self.film_layer(context)  # [bs, n_layers * 2 * hidden_size]
+        ctx_param = ctx_param.view(ctx_param.shape[0], 1, -1, 2 * self.in_ch)
+        ctx_param = ctx_param[:, :, :, :, None, None].repeat(1, n_kp, 1, 1, self.fc_res, self.fc_res)
+        ctx_param = ctx_param.view(-1, *ctx_param.shape[2:])
+        ctx_gammas, ctx_betas = ctx_param.chunk(2, dim=2)  # [bs, n_layers, hidden_size]
 
         x = self.from_latent_lin(x)
-        x = x.view(-1, self.ch_feature_dim, self.fc_res, self.fc_res, self.fc_res)  # [B*N,C,fd,fh,fw]
+        x = x.view(-1, self.ch_feature_dim, self.fc_res, self.fc_res)
         z = self.from_latent(x)
+        conv_in = ctx_gammas[:, 0] * z + ctx_betas[:, 0]
+        out = self.cnn(conv_in).view(-1, self.num_chans, *self.patch_size)
+        out_a, out_rgb = torch.split(out, [1, out.shape[1] - 1], dim=1)
 
-        conv_in = ctx_gammas * z + ctx_betas
-        out = self.cnn(conv_in).view(-1, self.num_chans, D, H, W)  # [B*N,C,D,H,W]
+        rgb_func = torch.tanh if self.normalize_rgb else torch.sigmoid
+        out = torch.cat([torch.sigmoid(out_a), rgb_func(out_rgb)], dim=1)
 
-        if self.num_chans == 1:
-            # Occupancy logits
-            return out
-
-        out_a  = torch.sigmoid(out[:, :1])
-        out_rem = out[:, 1:]
-
-        if self.num_chans == 4:
-            rgb_act = torch.tanh if self.normalize_rgb else torch.sigmoid
-            out_rgb = rgb_act(out_rem)
-            return torch.cat([out_a, out_rgb], dim=1)
-
-        if self.num_chans == 5:
-            rgb_act = torch.tanh if self.normalize_rgb else torch.sigmoid
-            out_rgb, out_d = out_rem[:, :3], out_rem[:, 3:]
-            out_rgb = rgb_act(out_rgb)
-            out_d   = torch.sigmoid(out_d)
-            return torch.cat([out_a, out_rgb, out_d], dim=1)
-
-        return torch.cat([out_a, torch.sigmoid(out_rem)], dim=1)
-
+        return out
 
 
 class ObjectDecoderCNNConcat(nn.Module):
@@ -2448,7 +2304,7 @@ class ObjectDecoderCNNConcat(nn.Module):
                      f' latent projection mode: {self.projection_mode},'
                      f' project {self.features_dim} -> {output_z_cnn} ({flattened_z_cnn})')
 
-        self.from_latent = nn.Conv3d(in_channels=self.ch_feature_dim, out_channels=self.in_ch, kernel_size=1)
+        self.from_latent = nn.Conv2d(in_channels=self.ch_feature_dim, out_channels=self.in_ch, kernel_size=1)
         self.context_projection = nn.Sequential(nn.Linear(self.context_dim, mlp_hidden_dim),
                                                 nn.GELU(),
                                                 nn.Linear(mlp_hidden_dim, self.in_ch))
@@ -2482,144 +2338,191 @@ class ObjectDecoderCNNConcat(nn.Module):
         out = torch.cat([torch.sigmoid(out_a), rgb_func(out_rgb)], dim=1)
         return out
 
-# -------- 3D latent -> seed feature-map projectors --------
 
-class FCToCNN3D(nn.Module):
-    def __init__(self, target_hw=16, n_ch=8, pad_mode='replicate',
-                 features_dim=2, use_resblock=False, context_dim=0,
+class FCToCNN(nn.Module):
+    def __init__(self, target_hw=16, n_ch=8, pad_mode='replicate', features_dim=2, use_resblock=False, context_dim=0,
                  res_from_fc=8, activation='gelu', mlp_hidden_dim=256):
-        super().__init__()
-        self.features_dim = features_dim
+        super(FCToCNN, self).__init__()
+        # features_dim : 2 [logvar] + additional features
+        self.features_dim = features_dim  # logvar, features
         self.n_ch = n_ch
-        self.fmap_size = res_from_fc         # fd = fh = fw
+        self.fmap_size = res_from_fc
         self.use_resblock = use_resblock
         self.context_dim = context_dim
         self.activation = activation
-        self.mlp_hidden_dim = mlp_hidden_dim
+        self.mlp_hidden_fim = mlp_hidden_dim
+        fc_out_dim = self.n_ch * (self.fmap_size ** 2)
 
-        feature_map_size = self.fmap_size ** 3
+        feature_map_size = self.fmap_size ** 2
 
         if self.features_dim % feature_map_size == 0:
-            self.ch_features_dim = max(self.features_dim // feature_map_size, 1)
+            self.ch_features_dim = math.ceil(max(self.features_dim / feature_map_size, 1))
+            output_z_cnn = (self.ch_features_dim, self.fmap_size, self.fmap_size)
+            flattened_z_cnn = np.prod(output_z_cnn)
+
+            self.projection_mode = 'fcn'
+            self.from_latent_lin = nn.Identity()
+            self.from_latent = nn.Identity()
+        else:
+            self.ch_features_dim = self.n_ch
+            output_z_cnn = (self.ch_features_dim, self.fmap_size, self.fmap_size)
+            flattened_z_cnn = np.prod(output_z_cnn)
+
+            self.projection_mode = 'fc'
+            self.from_latent_lin = self.get_mlp(self.features_dim, flattened_z_cnn)
+            self.from_latent = nn.Identity()
+
+        self.info = (f'FCToCNN: requested latent size: {self.features_dim}, '
+                     f'cnn input (h*w): {feature_map_size}, (latent_size / h*w)={self.features_dim / feature_map_size} ->'
+                     f' latent projection mode: {self.projection_mode},'
+                     f' project {self.features_dim} -> {output_z_cnn} ({flattened_z_cnn})')
+
+    def get_mlp(self, in_dim, out_dim, linear=False):
+        if linear:
+            return nn.Linear(in_dim, out_dim)
+        else:
+            activation_f = nn.GELU if self.activation == 'gelu' else nn.ReLU
+            hidden_dim = self.mlp_hidden_fim
+            mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim),
+                                activation_f(),
+                                nn.Linear(hidden_dim, out_dim))
+
+            return mlp
+
+    def forward(self, features, context=None):
+        # features [batch_size, features_dim]
+        batch_size = features.shape[0]
+        features = self.from_latent_lin(features)
+        x = features.view(-1, self.ch_features_dim, self.fmap_size, self.fmap_size)
+        z = self.from_latent(x)
+        cnn_out = z
+        return cnn_out
+
+
+class FCToCNNFILM(nn.Module):
+    def __init__(self, target_hw=16, n_ch=8, pad_mode='replicate', features_dim=2, use_resblock=False, context_dim=0,
+                 res_from_fc=8, activation='gelu', mlp_hidden_dim=256):
+        super(FCToCNNFILM, self).__init__()
+        # features_dim : 2 [logvar] + additional features
+        self.features_dim = features_dim  # logvar, features
+        self.n_ch = n_ch
+        self.fmap_size = res_from_fc
+        self.use_resblock = use_resblock
+        self.context_dim = context_dim
+        self.activation = activation
+        self.mlp_hidden_fim = mlp_hidden_dim
+        fc_out_dim = self.n_ch * (self.fmap_size ** 2)
+
+        feature_map_size = self.fmap_size ** 2
+
+        if self.features_dim % feature_map_size == 0:
+            self.ch_features_dim = math.ceil(max(self.features_dim / feature_map_size, 1))
+            output_z_cnn = (self.ch_features_dim, self.fmap_size, self.fmap_size)
+            flattened_z_cnn = np.prod(output_z_cnn)
+
+            self.projection_mode = 'fcn'
+            self.from_latent_lin = nn.Identity()
+            self.from_latent = nn.Identity()
+        else:
+            self.ch_features_dim = self.n_ch
+            output_z_cnn = (self.ch_features_dim, self.fmap_size, self.fmap_size)
+            flattened_z_cnn = np.prod(output_z_cnn)
+
+            self.projection_mode = 'fc'
+            self.from_latent_lin = self.get_mlp(self.features_dim, flattened_z_cnn)
+            self.from_latent = nn.Identity()
+
+        self.info = (f'FCToCNNFILM: requested latent size: {self.features_dim}, '
+                     f'cnn input (h*w): {feature_map_size}, (latent_size / h*w)={self.features_dim / feature_map_size} ->'
+                     f' latent projection mode: {self.projection_mode},'
+                     f' project {self.features_dim} -> {output_z_cnn} ({flattened_z_cnn})')
+
+        n_film_layers = 1
+        self.film_layer = self.get_mlp(in_dim=self.context_dim, out_dim=n_film_layers * 2 * self.ch_features_dim)
+
+    def get_mlp(self, in_dim, out_dim, linear=False):
+        if linear:
+            return nn.Linear(in_dim, out_dim)
+        else:
+            activation_f = nn.GELU if self.activation == 'gelu' else nn.ReLU
+            hidden_dim = self.mlp_hidden_fim
+            mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim),
+                                activation_f(),
+                                nn.Linear(hidden_dim, out_dim))
+
+            return mlp
+
+    def forward(self, features, context=None):
+        # features [batch_size, features_dim]
+        batch_size = features.shape[0]
+
+        ctx_param = self.film_layer(context)  # [bs, n_layers * 2 * hidden_size]
+        ctx_param = ctx_param.view(ctx_param.shape[0], -1, 2 * self.ch_features_dim)
+        ctx_param = ctx_param[:, :, :, None, None].repeat(1, 1, 1, self.fmap_size, self.fmap_size)
+        ctx_gammas, ctx_betas = ctx_param.chunk(2, dim=2)  # [bs, n_layers, hidden_size]
+
+        features = self.from_latent_lin(features)
+        x = features.view(-1, self.ch_features_dim, self.fmap_size, self.fmap_size)
+        z = self.from_latent(x)
+        cnn_out = ctx_gammas[:, 0] * z + ctx_betas[:, 0]
+        return cnn_out
+
+
+class FCToCNNConcat(nn.Module):
+    def __init__(self, target_hw=16, n_ch=8, pad_mode='replicate', features_dim=2, use_resblock=False, context_dim=0,
+                 res_from_fc=8, mlp_hidden_dim=256):
+        super(FCToCNNConcat, self).__init__()
+        # features_dim : 2 [logvar] + additional features
+        assert context_dim > 0, f'FCToCNNFILM: context dim - {context_dim} must be > 0'
+        self.features_dim = features_dim  # logvar, features
+        self.n_ch = n_ch
+        self.fmap_size = res_from_fc
+        self.use_resblock = use_resblock
+        self.context_dim = context_dim
+        self.mlp_hidden_dim = mlp_hidden_dim
+        fc_out_dim = self.n_ch * (self.fmap_size ** 2)
+
+        feature_map_size = self.fmap_size ** 2
+
+        if self.features_dim % feature_map_size == 0:
+            self.ch_features_dim = math.ceil(max(self.features_dim / feature_map_size, 1))
+            output_z_cnn = (self.ch_features_dim, self.fmap_size, self.fmap_size)
+            flattened_z_cnn = np.prod(output_z_cnn)
+
             self.projection_mode = 'fcn'
             self.from_latent_lin = nn.Identity()
         else:
             self.ch_features_dim = self.n_ch
+            output_z_cnn = (self.ch_features_dim, self.fmap_size, self.fmap_size)
+            flattened_z_cnn = np.prod(output_z_cnn)
+
             self.projection_mode = 'fc'
-            flattened = self.ch_features_dim * feature_map_size
-            self.from_latent_lin = self._mlp(self.features_dim, flattened)
+            self.from_latent_lin = self.get_mlp(self.features_dim, flattened_z_cnn)
 
-        self.info = (f'FCToCNN3D: requested latent {self.features_dim}, seed edge={self.fmap_size}, '
-                     f'mode={self.projection_mode}, outC={self.ch_features_dim}')
-
-    def _mlp(self, in_dim, out_dim, linear=False):
-        if linear:
-            return nn.Linear(in_dim, out_dim)
-        act = nn.GELU if self.activation == 'gelu' else nn.ReLU
-        return nn.Sequential(nn.Linear(in_dim, self.mlp_hidden_dim), act(), nn.Linear(self.mlp_hidden_dim, out_dim))
+        self.info = (f'FCToCNNConcat: requested latent size: {self.features_dim}, '
+                     f'cnn input (h*w): {feature_map_size}, (latent_size / h*w)={self.features_dim / feature_map_size} ->'
+                     f' latent projection mode: {self.projection_mode},'
+                     f' project {self.features_dim} -> {output_z_cnn} ({flattened_z_cnn})')
+        # new
+        self.from_latent = nn.Conv2d(in_channels=self.ch_features_dim, out_channels=self.n_ch, kernel_size=1)
+        self.context_projection = nn.Sequential(nn.Linear(self.context_dim, mlp_hidden_dim),
+                                                nn.ReLU(True),
+                                                nn.Linear(mlp_hidden_dim, self.n_ch))
 
     def forward(self, features, context=None):
-        B = features.shape[0]
-        x = self.from_latent_lin(features)
-        x = x.view(B, self.ch_features_dim, self.fmap_size, self.fmap_size, self.fmap_size)
-        return x  # [B, C0, D0, H0, W0]
+        # features [batch_size, features_dim]
+        batch_size = features.shape[0]
 
+        # new
+        ctx_param = self.context_projection(context)  # [bs, hidden_size]
+        ctx_param = ctx_param.view(ctx_param.shape[0], self.n_ch)
+        ctx_param = ctx_param[:, :, None, None].repeat(1, 1, self.fmap_size, self.fmap_size)
+        features = self.from_latent_lin(features)
+        x = features.view(-1, self.ch_features_dim, self.fmap_size, self.fmap_size)
+        z = self.from_latent(x)
+        cnn_out = torch.cat([z, ctx_param], dim=1)
+        return cnn_out
 
-class FCToCNNFILM3D(nn.Module):
-    def __init__(self, target_hw=16, n_ch=8, pad_mode='replicate',
-                 features_dim=2, use_resblock=False, context_dim=0,
-                 res_from_fc=8, activation='gelu', mlp_hidden_dim=256):
-        super().__init__()
-        self.features_dim = features_dim
-        self.n_ch = n_ch
-        self.fmap_size = res_from_fc
-        self.use_resblock = use_resblock
-        self.context_dim = context_dim
-        self.activation = activation
-        self.mlp_hidden_dim = mlp_hidden_dim
-
-        feature_map_size = self.fmap_size ** 3
-
-        if self.features_dim % feature_map_size == 0:
-            self.ch_features_dim = max(self.features_dim // feature_map_size, 1)
-            self.from_latent_lin = nn.Identity()
-        else:
-            self.ch_features_dim = self.n_ch
-            flattened = self.ch_features_dim * feature_map_size
-            self.from_latent_lin = self._mlp(self.features_dim, flattened)
-
-        # one FiLM layer on the seed channels
-        self.film = self._mlp(self.context_dim, 2 * self.ch_features_dim, linear=True)
-
-        self.info = (f'FCToCNNFILM3D: latent {self.features_dim}, seed edge={self.fmap_size}, outC={self.ch_features_dim}')
-
-    def _mlp(self, in_dim, out_dim, linear=False):
-        if linear:
-            return nn.Linear(in_dim, out_dim)
-        act = nn.GELU if self.activation == 'gelu' else nn.ReLU
-        return nn.Sequential(nn.Linear(in_dim, self.mlp_hidden_dim), act(), nn.Linear(self.mlp_hidden_dim, out_dim))
-
-    def forward(self, features, context):
-        B = features.shape[0]
-        x = self.from_latent_lin(features)
-        x = x.view(B, self.ch_features_dim, self.fmap_size, self.fmap_size, self.fmap_size)  # [B,C,D,H,W]
-
-        gam_beta = self.film(context)                             # [B, 2*C]
-        gamma, beta = gam_beta.chunk(2, dim=-1)                  # [B, C], [B, C]
-        gamma = gamma.view(B, -1, 1, 1, 1)
-        beta  = beta.view(B, -1, 1, 1, 1)
-        return gamma * x + beta                                   # [B,C,D,H,W]
-
-
-class FCToCNNConcat3D(nn.Module):
-    def __init__(self, target_hw=16, n_ch=8, pad_mode='replicate',
-                 features_dim=2, use_resblock=False, context_dim=0,
-                 res_from_fc=8, mlp_hidden_dim=256, activation='gelu'):
-        super().__init__()
-        assert context_dim > 0
-        self.features_dim = features_dim
-        self.n_ch = n_ch
-        self.fmap_size = res_from_fc
-        self.context_dim = context_dim
-        self.mlp_hidden_dim = mlp_hidden_dim
-        self.activation = activation
-
-        feature_map_size = self.fmap_size ** 3
-
-        if self.features_dim % feature_map_size == 0:
-            self.ch_features_dim = max(self.features_dim // feature_map_size, 1)
-            self.from_latent_lin = nn.Identity()
-        else:
-            self.ch_features_dim = self.n_ch
-            flattened = self.ch_features_dim * feature_map_size
-            self.from_latent_lin = self._mlp(self.features_dim, flattened)
-
-        # 1×1×1 conv to map seed channels -> n_ch
-        self.from_latent = nn.Conv3d(self.ch_features_dim, self.n_ch, kernel_size=1)
-        # project context to a spatial volume with n_ch channels
-        self.context_projection = nn.Sequential(
-            nn.Linear(self.context_dim, mlp_hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(mlp_hidden_dim, self.n_ch)
-        )
-
-        self.info = (f'FCToCNNConcat3D: latent {self.features_dim}, seed edge={self.fmap_size}, outC={self.n_ch}')
-
-    def _mlp(self, in_dim, out_dim, linear=False):
-        if linear:
-            return nn.Linear(in_dim, out_dim)
-        act = nn.GELU if self.activation == 'gelu' else nn.ReLU
-        return nn.Sequential(nn.Linear(in_dim, self.mlp_hidden_dim), act(), nn.Linear(self.mlp_hidden_dim, out_dim))
-
-    def forward(self, features, context):
-        B = features.shape[0]
-        x = self.from_latent_lin(features)
-        x = x.view(B, -1, self.fmap_size, self.fmap_size, self.fmap_size)   # [B,Cs,D,H,W]
-        z = self.from_latent(x)                                             # [B,n_ch,D,H,W]
-
-        ctx = self.context_projection(context).view(B, self.n_ch, 1, 1, 1)
-        ctx = ctx.repeat(1, 1, self.fmap_size, self.fmap_size, self.fmap_size)  # [B,n_ch,D,H,W]
-        return torch.cat([z, ctx], dim=1)                                   # [B, 2*n_ch, D,H,W]
 
 class BgDecoder(nn.Module):
     def __init__(self, cdim=3, image_size=64,
@@ -2627,13 +2530,28 @@ class BgDecoder(nn.Module):
                  use_resblock=False, context_dim=0, film=False, timestep_horizon=1,
                  bg_res_from_fc=8, bg_ch_mult=(1, 2, 3), bg_base_ch=32, bg_final_cnn_ch=32, num_res_blocks=2,
                  decode_with_ctx=False, normalize_rgb=False, cnn_mid_blocks=False, mlp_hidden_dim=256,
-                 init_zero_bias=True, init_conv_layers=True, init_conv_bg_std=0.005):
-        super().__init__()
-
+                 init_zero_bias=True,  # zero bias for conv and linear layers
+                 init_conv_layers=True,  # initialize conv layers with normal dist
+                 init_conv_bg_std=0.005,  # std for conv fg normal dist
+                 ):
+        super(BgDecoder, self).__init__()
+        """
+        DLP Background Module -- decodes bg from latent
+        cdim: channels of the input image (3...)
+        cnn_channels: channels for the posterior CNN (takes in the whole image)
+        n_kp_enc: number of posterior kp to be learned (this is the actual number of kp that will be learnt)
+        pad_mode: padding for the CNNs, 'zeros' or  'replicate' (default)
+        learned_feature_dim: the latent visual features dimensions extracted from glimpses.
+        learned_bg_feature_dim: the latent visual features dimensions extracted from bg.
+        anchor_s: defines the glimpse size as a ratio of image_size (e.g., 0.25 for image_size=128 -> glimpse_size=32)
+        film: use FiLM conditioning method for context conditioning
+        """
         self.image_size = image_size
-        self.feature_map_edge = int(image_size // (2 ** (len(bg_ch_mult) - 1)))  # seed edge
+        self.feature_map_size = image_size
         self.dropout = dropout
+        self.features_dim = int(image_size // (2 ** (len(bg_ch_mult) - 1)))
         self.learned_bg_feature_dim = learned_bg_feature_dim
+        assert self.learned_bg_feature_dim > 0, "learned_bg_feature_dim must be greater than 0"
         self.context_dim = context_dim
         self.cdim = cdim
         self.use_resblock = use_resblock
@@ -2644,76 +2562,58 @@ class BgDecoder(nn.Module):
         self.cnn_mid_blocks = cnn_mid_blocks
         self.mlp_hidden_dim = mlp_hidden_dim
 
-        self.init_zero_bias = init_zero_bias
-        self.init_conv_layers = init_conv_layers
-        self.init_conv_bg_std = init_conv_bg_std
+        # initialization
+        self.init_zero_bias = init_zero_bias  # zero bias for conv and linear layers
+        self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
+        self.init_conv_bg_std = init_conv_bg_std  # std for conv fg normal dist
 
-        # ------- 3D latent -> seed -------
+        # bg decoder
+        decoder_n_kp = bg_final_cnn_ch
         if self.context_dim > 0 and self.decode_with_ctx:
-            latent_proj_net = FCToCNNFILM3D if self.film else FCToCNNConcat3D
+            latent_proj_net = FCToCNNFILM if self.film else FCToCNNConcat
         else:
-            latent_proj_net = FCToCNN3D
-
-        decoder_base_ch = bg_final_cnn_ch  # just a label for Decoder "ch" param
-
-        self.latent_to_feat_map = latent_proj_net(
-            target_hw=self.feature_map_edge,
-            n_ch=decoder_base_ch,
-            features_dim=self.learned_bg_feature_dim,
-            pad_mode=pad_mode,
-            use_resblock=self.use_resblock,
-            context_dim=self.context_dim,
-            res_from_fc=bg_res_from_fc,
-            mlp_hidden_dim=mlp_hidden_dim
-        )
-
-        # ------- upsampling depth & channel multipliers -------
-        self.num_bg_upsample = max(int(np.log2(self.image_size)) - int(np.log2(self.feature_map_edge)), 0)
+            latent_proj_net = FCToCNN
+        self.latent_to_feat_map = latent_proj_net(target_hw=self.features_dim, n_ch=decoder_n_kp,
+                                                  features_dim=self.learned_bg_feature_dim, pad_mode=pad_mode,
+                                                  use_resblock=self.use_resblock, context_dim=self.context_dim,
+                                                  res_from_fc=bg_res_from_fc, mlp_hidden_dim=mlp_hidden_dim)
+        self.num_bg_upsample = max(int(np.log2(image_size)) - int(np.log2(self.features_dim)), 0)
         attn_res = [max(self.image_size // 16, 1)]
         bg_ch_mult = bg_ch_mult[:self.num_bg_upsample + 1]
-
-        # in_z_ch depends on projector (Concat doubles it)
-        if self.decode_with_ctx and self.context_dim > 0 and not self.film:
-            in_z_ch = 2 * self.latent_to_feat_map.n_ch
+        if self.decode_with_ctx and self.context_dim > 0 and not film:
+            in_z_ch = 2 * self.latent_to_feat_map.ch_features_dim
         else:
-            # FILM3D and plain 3D keep channels = ch_features_dim (FILM uses same C)
-            in_z_ch = getattr(self.latent_to_feat_map, 'ch_features_dim', decoder_base_ch)
-
-            # For Concat3D we returned 2*n_ch; for FILM3D and FCToCNN3D we used ch_features_dim
-            if isinstance(self.latent_to_feat_map, FCToCNN3D):
-                in_z_ch = self.latent_to_feat_map.ch_features_dim
-            elif isinstance(self.latent_to_feat_map, FCToCNNFILM3D):
-                in_z_ch = self.latent_to_feat_map.ch_features_dim
-            elif isinstance(self.latent_to_feat_map, FCToCNNConcat3D):
-                in_z_ch = 2 * self.latent_to_feat_map.n_ch
-
-        # ------- 3D decoder -------
-        self.cnn = Decoder(
-            ch=decoder_base_ch, out_ch=self.cdim, ch_mult=bg_ch_mult, num_res_blocks=num_res_blocks,
-            attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
-            resolution=self.image_size, z_channels=in_z_ch, give_pre_end=False,
-            padding_mode=pad_mode, residual=self.use_resblock, upsample_method='nearest',
-            mid_blocks=cnn_mid_blocks
-        )
-
+            in_z_ch = self.latent_to_feat_map.ch_features_dim
+        self.cnn = Decoder(ch=decoder_n_kp, out_ch=self.cdim, ch_mult=bg_ch_mult, num_res_blocks=num_res_blocks,
+                           attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
+                           resolution=self.image_size, z_channels=in_z_ch, give_pre_end=False,
+                           padding_mode=pad_mode, residual=self.use_resblock, upsample_method='nearest',
+                           mid_blocks=cnn_mid_blocks)
         self.info = self.latent_to_feat_map.info
         self.init_weights()
 
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0, self.init_conv_bg_std)
                 if self.init_zero_bias and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                # use pytorch's default
+                pass
 
     def decode_all(self, z_bg_features, z_ctx=None, warmup=False):
-        feature_vol = self.latent_to_feat_map(z_bg_features, z_ctx)   # [B, C0, D0, H0, W0]
-        bg_rec = self.cnn(feature_vol)                                # [B, cdim, D, H, W]
-        if self.cdim == 1:
-            return bg_rec  # logits
-        act = torch.tanh if self.normalize_rgb else torch.sigmoid
-        return act(bg_rec)
+        feature_maps = self.latent_to_feat_map(z_bg_features, z_ctx)
+        bg_rec = self.cnn(feature_maps)
+
+        out_func = torch.tanh if self.normalize_rgb else torch.sigmoid
+        decoder_out = out_func(bg_rec)
+
+        return decoder_out
 
     def forward(self, z_bg_features, z_ctx=None, warmup=False):
         return self.decode_all(z_bg_features, z_ctx, warmup)
@@ -2725,18 +2625,28 @@ class BgEncoder(nn.Module):
                  ch_mult=(1, 2, 3), base_ch=32, final_cnn_ch=32, num_res_blocks=2, interaction_features=False,
                  mlp_hidden_dim=256, timestep_horizon=1, add_particle_temp_embed=False, init_std=0.2,
                  features_dist='gauss', n_bg_categories=4, n_bg_classes=4,
-                 # init
-                 init_zero_bias=True, init_conv_layers=True, init_conv_bg_std=0.005):
-        super().__init__()
-
-        # ----- core config -----
-        self.image_size = image_size              # assume cubic volume: H=W=L=image_size
+                 # initialization
+                 init_zero_bias=True,  # zero bias for conv and linear layers
+                 init_conv_layers=True,  # initialize conv layers with normal dist
+                 init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
+                 ):
+        super(BgEncoder, self).__init__()
+        """
+        DLP Background Module -- encode a latent for the (masked) background, z_bg
+        Basically, just a convolutional-based encoder used in standard VAEs
+        cdim: channels of the input image (3...)
+        enc_channels: channels for the posterior CNN (takes in the whole image)
+        pad_mode: padding for the CNNs, 'zeros' or  'replicate' (default)
+        learned_feature_dim: the latent visual features dimensions extracted from glimpses.
+        """
+        self.image_size = image_size
         self.dropout = dropout
+        self.output_feat_map_size = int(image_size // (2 ** (len(ch_mult) - 1)))
         self.features_dim = learned_feature_dim
         self.features_dist = features_dist
         self.n_bg_categories = n_bg_categories
         self.n_bg_classes = n_bg_classes
-        assert learned_feature_dim > 0
+        assert learned_feature_dim > 0, "learned_feature_dim must be greater than 0"
         self.cdim = cdim
         self.n_kp_enc = final_cnn_ch
         self.interaction_features = interaction_features
@@ -2747,43 +2657,37 @@ class BgEncoder(nn.Module):
         self.timestep_horizon = (timestep_horizon + 1) if timestep_horizon > 1 else 1
         self.add_particle_temp_embed = add_particle_temp_embed
 
-        # init flags
-        self.init_zero_bias = init_zero_bias
-        self.init_conv_layers = init_conv_layers
-        self.init_conv_bg_std = init_conv_bg_std
+        # initialization
+        self.init_zero_bias = init_zero_bias  # zero bias for conv and linear layers
+        self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
+        self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
 
-        # output fmap size per axis after the 3D encoder pyramid
-        self.out_axis = int(image_size // (2 ** (len(ch_mult) - 1)))
-        feature_map_size = self.out_axis * self.out_axis * self.out_axis
-
-        # ----- 3D CNN encoder -----
         attn_res = [max(self.image_size // 16, 1)]
-        self.bg_cnn_enc = Encoder(
-            ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
-            attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
-            in_channels=self.cdim, resolution=self.image_size, z_channels=final_cnn_ch, double_z=False,
-            padding_mode=pad_mode, residual=self.use_resblock, in_conv_kernel_size=3, mid_blocks=cnn_mid_blocks
-        )
-        self.cnn_out_shape = self.get_cnn_shape_3d()  # (C_out, D_out, H_out, W_out)
+        self.bg_cnn_enc = Encoder(ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+                                  attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
+                                  in_channels=self.cdim,
+                                  resolution=self.image_size, z_channels=final_cnn_ch, double_z=False,
+                                  padding_mode=pad_mode, residual=self.use_resblock, in_conv_kernel_size=3,
+                                  mid_blocks=cnn_mid_blocks)
+        self.cnn_out_shape = self.get_cnn_shape()
 
-        # whether we output logvar
-        self.output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
+        # new cnn
+        feature_map_size = self.output_feat_map_size ** 2
+        output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
+        self.output_logvar = output_logvar
 
-        # ----- projection head (FCN vs FC) -----
+        # new - FCN
         if self.features_dim % feature_map_size == 0:
-            # FCN mode: 1x1x1 conv to reduce channels, keep spatial
             self.ch_learned_feature_dim = math.ceil(max(self.features_dim / feature_map_size, 1))
-            out_ch = 2 * self.ch_learned_feature_dim if self.output_logvar else self.ch_learned_feature_dim
-            self.to_latent = nn.Conv3d(in_channels=final_cnn_ch, out_channels=out_ch, kernel_size=1)
-            output_z_cnn = (self.ch_learned_feature_dim, *self.cnn_out_shape[-3:])
-            flattened_z_cnn = int(np.prod(output_z_cnn))
-
+            out_ch = 2 * self.ch_learned_feature_dim if output_logvar else self.ch_learned_feature_dim
+            self.to_latent = nn.Conv2d(in_channels=final_cnn_ch,
+                                       out_channels=out_ch, kernel_size=1)
+            output_z_cnn = (self.ch_learned_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
+            flattened_z_cnn = np.prod(output_z_cnn)
             if self.timestep_horizon > 1 and self.add_particle_temp_embed:
-                # [1, T, C, D, H, W] to broadcast over batch
                 self.temp_embed = nn.Parameter(
-                    init_std * torch.randn(1, self.timestep_horizon, final_cnn_ch,
-                                           self.cnn_out_shape[-3], self.cnn_out_shape[-2], self.cnn_out_shape[-1])
-                )
+                    init_std * torch.randn(1, self.timestep_horizon, final_cnn_ch, self.cnn_out_shape[-1],
+                                           self.cnn_out_shape[-1]))
             else:
                 self.temp_embed = None
 
@@ -2791,11 +2695,10 @@ class BgEncoder(nn.Module):
             self.to_mu = nn.Identity()
             self.to_logvar = nn.Identity()
         else:
-            # FC mode: flatten and MLP
             self.ch_learned_feature_dim = final_cnn_ch
             self.to_latent = nn.Identity()
-            output_z_cnn = (self.ch_learned_feature_dim, *self.cnn_out_shape[-3:])
-            flattened_z_cnn = int(np.prod(output_z_cnn))
+            output_z_cnn = (self.ch_learned_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
+            flattened_z_cnn = np.prod(output_z_cnn)
 
             if self.timestep_horizon > 1 and self.add_particle_temp_embed:
                 self.temp_embed = nn.Parameter(init_std * torch.randn(1, self.timestep_horizon, flattened_z_cnn))
@@ -2804,107 +2707,108 @@ class BgEncoder(nn.Module):
 
             self.projection_mode = 'fc'
             self.to_mu = self.get_mlp(flattened_z_cnn, self.features_dim)
-            self.to_logvar = self.get_mlp(flattened_z_cnn, self.features_dim) if self.output_logvar else nn.Identity()
+            self.to_logvar = self.get_mlp(flattened_z_cnn,
+                                          self.features_dim) if output_logvar else nn.Identity()
 
-        self.info = (f'BgEncoder3D: requested latent={self.features_dim}, '
-                     f'cnn (D*H*W)={feature_map_size}, mode={self.projection_mode}, '
-                     f'project {output_z_cnn} ({flattened_z_cnn}) -> {self.features_dim}')
+        self.info = (f'BgEncoder: requested latent size: {self.features_dim}, '
+                     f'cnn output (h*w): {feature_map_size}, (latent_size / h*w)={self.features_dim / feature_map_size} ->'
+                     f' latent projection mode: {self.projection_mode},'
+                     f' project {output_z_cnn} ({flattened_z_cnn}) -> {self.features_dim}')
 
         self.init_weights()
 
-    # ---------- inits ----------
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
+                # pass
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0, self.init_conv_bg_std)
                 if self.init_zero_bias and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
-                if hasattr(m, 'weight') and m.weight is not None:
-                    nn.init.constant_(m.weight, 1)
-                if hasattr(m, 'bias') and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                # leave defaults
+                # use pytorch's default
                 pass
+        # pass
 
     def get_mlp(self, in_dim, out_dim, linear=False):
         if linear:
             return nn.Linear(in_dim, out_dim)
-        activation_f = nn.GELU if self.activation == 'gelu' else nn.ReLU
-        hidden_dim = self.mlp_hidden_dim
-        return nn.Sequential(nn.Linear(in_dim, hidden_dim), activation_f(), nn.Linear(hidden_dim, out_dim))
+        else:
+            activation_f = nn.GELU if self.activation == 'gelu' else nn.ReLU
+            hidden_dim = self.mlp_hidden_dim
+            mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim),
+                                activation_f(),
+                                nn.Linear(hidden_dim, out_dim))
 
-    def get_cnn_shape_3d(self):
-        dummy = torch.rand(1, self.cdim, self.image_size, self.image_size, self.image_size)
-        out = self.bg_cnn_enc(dummy)
+            return mlp
+
+    def get_cnn_shape(self):
+        dummy_input = torch.rand(1, self.cdim, self.image_size, self.image_size)
+        out = self.bg_cnn_enc(dummy_input)
         if isinstance(out, tuple):
             out = out[1]
-        return out.shape[1:]  # (C_out, D_out, H_out, W_out)
+        return out.shape[1:]
 
-    # ---------- forward pieces ----------
     def encode_bg_features(self, x, masks=None, timesteps=None):
-        """
-        x:      [B, C, H, W, L]
-        masks:  [B, 1, H, W, L]  (optional, background mask)
-        """
+        # x: [bs, ch, image_size, image_size]
+        # masks: [bs, 1, image_size, image_size]
+        batch_size, _, features_dim, _ = x.shape
+        # bg features
         if masks is not None:
             x_in = x * masks
         else:
             x_in = x
-
         enc_out = self.bg_cnn_enc(x_in)
-        cnn_features = enc_out[1] if isinstance(enc_out, tuple) else enc_out  # [B, C', D', H', W']
-
-        if self.projection_mode == 'fcn' and self.temp_embed is not None:
-            # add temporal embedding across timesteps if provided
-            # reshape to [B, T, C', D', H', W'], add, then back
-            B = cnn_features.shape[0]
-            if timesteps is None:
-                timesteps = 1
-            feat = cnn_features.view(-1, timesteps, *cnn_features.shape[1:]) + self.temp_embed[:, :timesteps]
-            cnn_features = feat.view(B, *cnn_features.shape[1:])
-
-        z_feat = self.to_latent(cnn_features)  # [B, out_ch(or C'), D', H', W']
-
-        if self.projection_mode == 'fc':
-            flat = z_feat.view(z_feat.shape[0], -1)  # [B, C'*D'*H'*W']
-            if self.temp_embed is not None and timesteps is not None and timesteps > 1:
-                B = flat.shape[0]
-                feat = flat.view(-1, timesteps, *flat.shape[1:]) + self.temp_embed[:, :timesteps]
-                flat = feat.view(B, -1)
-            if self.interaction_features:
-                mu_bg = self.to_mu(flat); logvar_bg = None
-            else:
-                mu_bg = self.to_mu(flat); logvar_bg = self.to_logvar(flat)
+        if isinstance(enc_out, tuple):
+            cnn_features = enc_out[1]
         else:
-            # FCN mode: collapse spatial to vector at the end
-            flat = z_feat.view(z_feat.shape[0], -1)
-            if self.interaction_features:
-                mu_bg = self.to_mu(flat); logvar_bg = None
-            else:
-                mu_bg = self.to_mu(flat); logvar_bg = self.to_logvar(flat)
+            cnn_features = enc_out
+
+        # new cnn
+        if self.projection_mode == 'fcn' and self.temp_embed is not None:
+            orig_shape = cnn_features.shape  # [batch_size * n_kp, ch, patch_size, patch_size]
+            new_feat = cnn_features.view(-1, timesteps, *cnn_features.shape[1:])
+            new_feat = new_feat + self.temp_embed[:, :timesteps]
+            cnn_features = new_feat.view(orig_shape)
+        features = self.to_latent(cnn_features)
+        features = features.view(features.shape[0], -1)
+        if self.projection_mode == 'fc' and self.temp_embed is not None:
+            orig_shape = features.shape  # [batch_size * n_kp, ch, patch_size, patch_size]
+            new_feat = features.view(-1, timesteps, *features.shape[1:])
+            new_feat = new_feat + self.temp_embed[:, :timesteps]
+            features = new_feat.view(orig_shape)
+        if self.interaction_features:
+            mu_bg = features
+            logvar_bg = None
+            mu_bg = self.to_mu(mu_bg)
+        else:
+            mu_bg = self.to_mu(features)
+            logvar_bg = self.to_logvar(features)
 
         return mu_bg, logvar_bg
 
     def encode_all(self, x, masks=None, deterministic=False, timesteps=None):
-        """
-        x: [B, C, H, W, L]
-        """
+        # encode background
         mu_bg, logvar_bg = self.encode_bg_features(x, masks, timesteps)
         if self.interaction_features:
             z_bg = mu_bg
         else:
-            z_bg = mu_bg if deterministic else self.reparameterize(mu_bg, logvar_bg)
-        # 3D: z_kp placeholder is 3D coords
-        z_kp = torch.zeros(mu_bg.shape[0], 1, 3, device=x.device, dtype=torch.float)
-        return {'mu_bg': mu_bg, 'logvar_bg': logvar_bg, 'z_bg': z_bg, 'z_kp': z_kp}
+            z_bg = reparameterize(mu_bg, logvar_bg) if not deterministic else mu_bg
+        z_kp = torch.zeros(mu_bg.shape[0], 1, 2, device=x.device, dtype=torch.float)
+        encode_dict = {'mu_bg': mu_bg, 'logvar_bg': logvar_bg, 'z_bg': z_bg, 'z_kp': z_kp}
+        return encode_dict
 
     def forward(self, x, masks=None, deterministic=False, timesteps=None):
-        out = self.encode_all(x, masks, deterministic, timesteps)
-        return {'mu_bg': out['mu_bg'], 'logvar_bg': out['logvar_bg'],
-                'z_bg': out['z_bg'], 'z_kp': out['z_kp']}
+        encoder_out = self.encode_all(x, masks, deterministic, timesteps)
+        mu_bg = encoder_out['mu_bg']
+        logvar_bg = encoder_out['logvar_bg']
+        z_bg = encoder_out['z_bg']
+        z_kp = encoder_out['z_kp']
+        output_dict = {'mu_bg': mu_bg, 'logvar_bg': logvar_bg, 'z_bg': z_bg, 'z_kp': z_kp}
+        return output_dict
 
 
 class ParticleAttributeEncoder(nn.Module):
@@ -2956,8 +2860,8 @@ class ParticleAttributeEncoder(nn.Module):
                            resolution=self.crop_size, z_channels=final_cnn_ch, double_z=False, padding_mode=pad_mode,
                            residual=self.use_resblock, mid_blocks=cnn_mid_blocks)
 
-        c_out, fD, fH, fW = self.cnn.conv_output_size  # from your Encoder3D.calc_conv_output_size()
-        fc_in_dim = c_out * fD * fH * fW
+        feature_map_size = (self.crop_size // 2 ** (len(ch_mult) - 1)) ** 2
+        fc_in_dim = final_cnn_ch * feature_map_size
         if self.add_particle_temp_embed and self.timestep_horizon > 1:
             self.temp_embed = nn.Parameter(init_std * torch.randn(1, self.timestep_horizon, 1, fc_in_dim))
         else:
@@ -2965,17 +2869,14 @@ class ParticleAttributeEncoder(nn.Module):
         activation_f = nn.GELU if activation == 'gelu' else nn.ReLU
 
         self.backbone = nn.Identity()
-        self.xy_head = nn.Sequential(
-            nn.Linear(fc_in_dim, self.hidden_dim),
-            (nn.GELU() if activation == 'gelu' else nn.ReLU()),
-            nn.Linear(self.hidden_dim, 6)  # mu_x, mu_y, mu_z, logvar_x, logvar_y, logvar_z
-        )
-        scale_output = 6 if self.with_scale else 3
-        self.scale_xy_head = nn.Sequential(
-            nn.Linear(fc_in_dim, self.hidden_dim),
-            (nn.GELU() if activation == 'gelu' else nn.ReLU()),
-            nn.Linear(self.hidden_dim, scale_output)  # mu_sx, mu_sy, mu_sz, logvar_sx, logvar_sy, logvar_sz
-        )
+        self.xy_head = nn.Sequential(nn.Linear(fc_in_dim, self.hidden_dim),
+                                     activation_f(),
+                                     nn.Linear(self.hidden_dim, 4))  # mu_x, logvar_s, mu_y, logvar_y
+        scale_output = 4 if self.with_scale else 2
+        self.scale_xy_head = nn.Sequential(nn.Linear(fc_in_dim, self.hidden_dim),
+                                           activation_f(),
+                                           nn.Linear(self.hidden_dim,
+                                                     scale_output))  # mu_sx, logvar_sx, mu_sy, logvar_sy
         if self.with_obj_on:
             self.obj_on_head = nn.Sequential(nn.Linear(fc_in_dim, self.hidden_dim),
                                              activation_f(),
@@ -2994,7 +2895,7 @@ class ParticleAttributeEncoder(nn.Module):
     def init_weights(self):
         # pass
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 # pass
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0.0, self.init_conv_fg_std)
@@ -3049,36 +2950,21 @@ class ParticleAttributeEncoder(nn.Module):
             # torch.nn.init.constant_(self.obj_on_head_2[-1].bias[1], 6.0)  # beta(,b)
 
     def forward(self, x, kp, z_scale=None, timesteps=None, deterministic=False):
-        # x: [batch_size, ch, H, W, L]
-        # kp: [batch_size, n_kp, 3] in [-1, 1]
-        batch_size, C, D, H, W = x.shape
+        # x: [bs, ch, image_size, image_size]
+        # kp: [bs, n_kp, 2] in [-1, 1]
+        batch_size, _, _, img_size = x.shape
         _, n_kp, _ = kp.shape
-
-        x_repeated = x.unsqueeze(1).repeat(1, n_kp, 1, 1, 1, 1)   # [B, n_kp, C, D, H, W]
-        x_repeated = x_repeated.view(-1, C, D, H, W)    
-
+        x_repeated = x.unsqueeze(1).repeat(1, n_kp, 1, 1, 1)  # [batch_size, n_kp, ch, image_size, image_size]
+        x_repeated = x_repeated.view(-1, *x.shape[1:])  # [batch_size * n_kp, ch, image_size, image_size]
         if z_scale is None:
-            frac = torch.tensor(
-                [self.patch_size / W,   # sx (x-axis)
-                self.patch_size / H,   # sy (y-axis)
-                self.patch_size / D],  # sz (z-axis)
-                device=x.device, dtype=kp.dtype
-            ).view(1, 1, 3)
-            z_scale = frac.expand_as(kp)     # [B, n_kp, 3] (sx,sy,sz)
+            z_scale = (self.patch_size / img_size) * torch.ones_like(kp)
         else:
+            # assume unnormalized z_scale
             z_scale = torch.sigmoid(z_scale)
-
-
-        z_pos   = kp.reshape(-1, kp.shape[-1])                        # [B*n_kp, 3]
-        z_scale = z_scale.view(-1, z_scale.shape[-1])                 # [B*n_kp, 3]
-
-        out_dims = (batch_size * n_kp, C, self.patch_size, self.patch_size, self.patch_size)  # (N,C,D,H,W)
-        cropped_objects = spatial_transform(
-            x_repeated, kp.reshape(-1,3), z_scale.view(-1,3),
-            out_dims, inverse=False, padding_mode='border'
-        )
-        # cropped_objects: [B*n_kp, C, pd, ph, pw]
-
+        z_pos = kp.reshape(-1, kp.shape[-1])
+        z_scale = z_scale.view(-1, z_scale.shape[-1])
+        out_dims = (batch_size * n_kp, x.shape[1], self.patch_size, self.patch_size)
+        cropped_objects = spatial_transform(x_repeated, z_pos, z_scale, out_dims, inverse=False, padding_mode='border')
         # [batch_size * n_kp, ch, patch_size, patch_size]
 
         # encode objects - fc
@@ -3088,9 +2974,9 @@ class ParticleAttributeEncoder(nn.Module):
         else:
             cropped_objects_cnn = enc_out
 
-        cropped_objects_flat = cropped_objects_cnn.view(batch_size, n_kp, -1)
-        backbone_features = self.backbone(cropped_objects_flat)
-
+        cropped_objects_flat = cropped_objects_cnn.reshape(batch_size, n_kp, -1)  # flatten
+        # backbone features
+        backbone_features = cropped_objects_flat
         # projection
         backbone_features = self.backbone(backbone_features)
         if timesteps is not None and self.temp_embed is not None:
@@ -3119,15 +3005,19 @@ class ParticleAttributeEncoder(nn.Module):
             lobj_on_a = lobj_on_b = obj_on = None
             obj_on_a = obj_on_b = z_obj_on = mu_obj_on = None
 
-        xyz = self.xy_head(backbone_features).view(batch_size, n_kp, -1)
-        mu, logvar = torch.chunk(xyz, chunks=2, dim=-1)  # each [..., 3]
+        xy = self.xy_head(backbone_features)
+        xy = xy.view(batch_size, n_kp, -1)
+        mu, logvar = torch.chunk(xy, chunks=2, dim=-1)
+        # logvar = logvar.clamp_max(math.log(0.02 ** 2))
 
-        scale_vec = self.scale_xy_head(backbone_features).view(batch_size, n_kp, -1)
+        scale_xy = self.scale_xy_head(backbone_features)
+        scale_xy = scale_xy.view(batch_size, n_kp, -1)
         if self.with_scale:
-            mu_scale, logvar_scale = torch.chunk(scale_vec, chunks=2, dim=-1)  # each [..., 3]
+            mu_scale, logvar_scale = torch.chunk(scale_xy, chunks=2, dim=-1)
+            # logvar_scale = logvar_scale.clamp_max(math.log(0.2 ** 2))
         else:
-            mu_scale, logvar_scale = scale_vec, None
-
+            mu_scale = scale_xy
+            logvar_scale = None
 
         if self.kp_activation == "tanh":
             mu = self.max_offset * torch.tanh(mu)
@@ -3147,27 +3037,29 @@ class ParticleAttributeEncoder(nn.Module):
                        'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on}
         return spatial_out
 
+
 class ParticleFeaturesEncoder(nn.Module):
     """
-    Glimpse-encoder for voxel patches: encodes visual features (mu, logvar) from 3D crops
-    centered at 3D keypoints.
-
-    x:  [B, C, D, H, W]   (D=z, H=y, W=x)
-    kp: [B, K, 3]         (x, y, z) in [-1, 1]
+    Glimpse-encoder: encodes patches visual features in a variational fashion (mu, log-variance).
+    Useful for object-based scenes.
     """
 
     def __init__(self, anchor_size, features_dim, image_size, margin=0, ch=3,
                  use_resblock=False, hidden_dim=256, pad_mode='replicate', activation='gelu',
                  ch_mult=(1, 2, 3), base_ch=32, final_cnn_ch=32, num_res_blocks=2, output_logvar=True,
                  cnn_mid_blocks=False, timestep_horizon=1, add_particle_temp_embed=False, init_std=0.2,
-                 init_zero_bias=True, init_conv_layers=True, init_conv_fg_std=0.02):
+                 # initialization
+                 init_zero_bias=True,  # zero bias for conv and linear layers
+                 init_conv_layers=True,  # initialize conv layers with normal dist
+                 init_conv_fg_std=0.02,  # std for conv fg normal dist
+                 ):
         super().__init__()
         self.anchor_size = anchor_size
-        self.image_size  = image_size              # assume cubic D=H=W=image_size
-        self.patch_size  = int(np.round(anchor_size * (image_size - 1)))
-        self.margin      = margin
-        self.crop_size   = self.patch_size + 2 * margin
-        self.ch          = ch
+        self.image_size = image_size
+        self.patch_size = np.round(anchor_size * (image_size - 1)).astype(int)
+        self.margin = margin
+        self.crop_size = self.patch_size + 2 * margin
+        self.ch = ch
         self.use_resblock = use_resblock
         self.features_dim = features_dim
         self.output_logvar = output_logvar
@@ -3176,175 +3068,152 @@ class ParticleFeaturesEncoder(nn.Module):
         self.cnn_mid_blocks = cnn_mid_blocks
         self.timestep_horizon = timestep_horizon
         self.add_particle_temp_embed = add_particle_temp_embed
-
-        self.init_zero_bias = init_zero_bias
-        self.init_conv_layers = init_conv_layers
-        self.init_conv_fg_std = init_conv_fg_std
+        # initialization
+        self.init_zero_bias = init_zero_bias  # zero bias for conv and linear layers
+        self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
+        self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
 
         attn_res = [max(self.crop_size // 16, 1)]
-        self.cnn = Encoder(
-            ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
-            attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True, in_channels=self.ch,
-            resolution=self.crop_size, z_channels=final_cnn_ch, double_z=False,
-            padding_mode=pad_mode, residual=self.use_resblock, mid_blocks=cnn_mid_blocks
-        )
+        self.cnn = Encoder(ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+                           attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True, in_channels=self.ch,
+                           resolution=self.crop_size, z_channels=final_cnn_ch, double_z=False, padding_mode=pad_mode,
+                           residual=self.use_resblock, mid_blocks=cnn_mid_blocks)
 
-        # ---- Use actual CNN output shape on correct device ----
-        self.cnn_out_shape = self.get_cnn_shape()                 # [C_out, fD, fH, fW]
-        C_out, fD, fH, fW = self.cnn_out_shape
-        fmap_elems = fD * fH * fW                                  # <-- use this, not a heuristic
-
-        # ---- Decide projection path using true fmap size ----
-        if self.features_dim % fmap_elems == 0:
-            self.ch_feature_dim = max(self.features_dim // fmap_elems, 1)
+        self.cnn_out_shape = self.get_cnn_shape()
+        feature_map_size = (self.crop_size // 2 ** (len(ch_mult) - 1)) ** 2
+        # new - FCN
+        if self.features_dim % feature_map_size == 0:
+            self.ch_feature_dim = math.ceil(max(self.features_dim / feature_map_size, 1))
             z_out_channels = 2 * self.ch_feature_dim if self.output_logvar else self.ch_feature_dim
-            self.to_latent = nn.Conv3d(in_channels=final_cnn_ch, out_channels=z_out_channels, kernel_size=1)
+            self.to_latent = nn.Conv2d(in_channels=final_cnn_ch, out_channels=z_out_channels, kernel_size=1)
+            output_z_cnn = (self.ch_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
+            flattened_z_cnn = np.prod(output_z_cnn)
+            if self.timestep_horizon > 1 and self.add_particle_temp_embed:
+                self.temp_embed = nn.Parameter(
+                    init_std * torch.randn(1, self.timestep_horizon, 1, final_cnn_ch, self.cnn_out_shape[-1],
+                                           self.cnn_out_shape[-1]))
+            else:
+                self.temp_embed = None
+
             self.projection_mode = 'fcn'
             self.to_mu = nn.Identity()
             self.to_logvar = nn.Identity()
-            if self.timestep_horizon > 1 and self.add_particle_temp_embed:
-                self.temp_embed = nn.Parameter(
-                    init_std * torch.randn(1, self.timestep_horizon, 1, final_cnn_ch, fD, fH, fW)
-                )
-            else:
-                self.temp_embed = None
         else:
             self.ch_feature_dim = final_cnn_ch
             self.to_latent = nn.Identity()
-            flattened = self.ch_feature_dim * fmap_elems
+            output_z_cnn = (self.ch_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
+            flattened_z_cnn = np.prod(output_z_cnn)
             self.projection_mode = 'fc'
-            self.to_mu = self.get_mlp(flattened, self.features_dim)
-            self.to_logvar = self.get_mlp(flattened, self.features_dim) if self.output_logvar else nn.Identity()
+            self.to_mu = self.get_mlp(flattened_z_cnn, self.features_dim)
+            self.to_logvar = self.get_mlp(flattened_z_cnn, self.features_dim) if self.output_logvar else nn.Identity()
             if self.timestep_horizon > 1 and self.add_particle_temp_embed:
-                self.temp_embed = nn.Parameter(init_std * torch.randn(1, self.timestep_horizon, 1, flattened))
+                self.temp_embed = nn.Parameter(init_std * torch.randn(1, self.timestep_horizon, 1, flattened_z_cnn))
             else:
                 self.temp_embed = None
-
         self.init_weights()
 
-        self.info = (f'ParticleFeaturesEncoder3D: requested latent size: {self.features_dim}, '
-                     f'cnn output (C,fD,fH,fW)=({C_out},{fD},{fH},{fW}), '
-                     f'(latent / fmap_elems)={self.features_dim / max(fmap_elems,1):.3f} -> '
-                     f'projection: {self.projection_mode}')
+        self.info = (f'ParticleFeaturesEncoder: requested latent size: {self.features_dim}, '
+                     f'cnn output (h*w): {feature_map_size}, (latent_size / h*w)={self.features_dim / feature_map_size} ->'
+                     f' latent projection mode: {self.projection_mode},'
+                     f' project {output_z_cnn} ({flattened_z_cnn}) -> {self.features_dim}')
 
-    def get_cnn_shape(self):
-        # build dummy on same device/dtype as module
-        p = next(self.parameters(), None)
-        dev = p.device if p is not None else torch.device('cpu')
-        dt  = p.dtype  if p is not None else torch.float32
-        dummy = torch.zeros(1, self.ch, self.crop_size, self.crop_size, self.crop_size, device=dev, dtype=dt)
-        out = self.cnn(dummy)
-        if isinstance(out, tuple): out = out[1]
-        return out.shape[1:]  # [C, fD, fH, fW]
-    
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0.0, self.init_conv_fg_std)
                 if self.init_zero_bias and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        # pass
+        # if self.output_logvar and self.projection_mode == 'fc':
+        #     nn.init.constant_(self.to_logvar[-1].weight, 0.0)
+        #     nn.init.constant_(self.to_logvar[-1].bias, math.log(0.1 ** 2))
 
     def get_mlp(self, in_dim, out_dim, linear=False):
-            if linear:
-                return nn.Linear(in_dim, out_dim)
+        if linear:
+            return nn.Linear(in_dim, out_dim)
+        else:
             activation_f = nn.GELU if self.activation == 'gelu' else nn.ReLU
             hidden_dim = self.hidden_dim
-            return nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                activation_f(),
-                nn.Linear(hidden_dim, out_dim)
-            )
+
+            mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim),
+                                activation_f(),
+                                nn.Linear(hidden_dim, out_dim))
+            return mlp
+
+    def get_cnn_shape(self):
+        dummy_input = torch.rand(1, self.ch, self.patch_size, self.patch_size)
+        out = self.cnn(dummy_input)
+        if isinstance(out, tuple):
+            out = out[1]
+        return out.shape[1:]
+
     def forward(self, x, kp, z_scale=None, timesteps=None, obj_on=None):
-        """
-        x:   [B, C, D, H, W]     (D=z, H=y, W=x)
-        kp:  [B, K, 3]           (x,y,z) in [-1,1]
-        """
-        B, C, D, H, W = x.shape
-        K = kp.shape[1]
-
-        # repeat per keypoint
-        x_rep = x.unsqueeze(1).repeat(1, K, 1, 1, 1, 1)     # [B, K, C, D, H, W]
-        x_rep = x_rep.view(-1, C, D, H, W)                 # [B*K, C, D, H, W]
-
-        # per-axis scales (sx, sy, sz)
+        # x: [bs, ch, image_size, image_size]
+        # kp: [bs, n_kp, 2] in [-1, 1]
+        batch_size = x.shape[0]
+        n_kp = kp.shape[1]
+        img_size = x.shape[-1]
+        x_repeated = x.unsqueeze(1).repeat(1, n_kp, 1, 1, 1)  # [batch_size, n_kp, ch, image_size, image_size]
+        x_repeated = x_repeated.view(-1, *x.shape[1:])  # [batch_size * n_kp, ch, image_size, image_size]
         if z_scale is None:
-            frac = torch.tensor(
-                [self.patch_size / W,   # sx  (x-axis)
-                 self.patch_size / H,   # sy  (y-axis)
-                 self.patch_size / D],  # sz  (z-axis)
-                device=x.device, dtype=kp.dtype
-            ).view(1, 1, 3)
-            z_scale = frac.expand_as(kp)                   # [B, K, 3]
+            z_scale = (self.patch_size / img_size) * torch.ones_like(kp)
         else:
+            # assume unnormalized z_scale
             z_scale = torch.sigmoid(z_scale)
+        z_pos = kp.reshape(-1, kp.shape[-1])
+        z_scale = z_scale.view(-1, z_scale.shape[-1])
+        out_dims = (batch_size * n_kp, x.shape[1], self.patch_size, self.patch_size)
+        cropped_objects = spatial_transform(x_repeated, z_pos, z_scale, out_dims, inverse=False, padding_mode='border')
+        # [batch_size * n_kp, ch, patch_size, patch_size]
 
-        z_pos   = kp.reshape(-1, 3)                        # [B*K, 3]
-        z_scale = z_scale.view(-1, 3)                      # [B*K, 3]
-
-        out_dims = (B * K, C, self.patch_size, self.patch_size, self.patch_size)  # (N,C,D,H,W)
-        crops = spatial_transform(x_rep, z_pos, z_scale, out_dims, inverse=False, padding_mode='border')
-        # [B*K, C, ps, ps, ps]
-
-        # encode crops
-        enc = self.cnn(crops)
-        crops_cnn = enc[1] if isinstance(enc, tuple) else enc   # [B*K, C', fD, fH, fW]
+        # encode objects - fc
+        enc_out = self.cnn(cropped_objects)
+        if isinstance(enc_out, tuple):
+            cropped_objects_cnn = enc_out[1]
+        else:
+            cropped_objects_cnn = enc_out
 
         if obj_on is not None:
-            obj_on = obj_on.view(-1)                            # [B*K]
-            crops_cnn = crops_cnn * obj_on[:, None, None, None, None]
+            obj_on = obj_on.view(-1)
+            cropped_objects_cnn = cropped_objects_cnn * obj_on[:, None, None, None]
 
-        # temporal embed (FCN path)
+        # new with cnn
         if self.projection_mode == 'fcn' and self.temp_embed is not None:
-            orig = crops_cnn.shape
-            crops_cnn = crops_cnn.view(B, K, *orig[1:])         # [B, K, C', fD, fH, fW]
-            crops_cnn = crops_cnn.view(B // max(timesteps or 1), timesteps or 1, K, *orig[1:])
-            crops_cnn = crops_cnn + self.temp_embed[:, : (timesteps or 1)]
-            crops_cnn = crops_cnn.view(orig)
+            orig_shape = cropped_objects_cnn.shape  # [batch_size * n_kp, ch, patch_size, patch_size]
+            new_feat = cropped_objects_cnn.view(-1, timesteps, n_kp, *cropped_objects_cnn.shape[1:])
+            new_feat = new_feat + self.temp_embed[:, :timesteps]
+            cropped_objects_cnn = new_feat.view(orig_shape)
 
-        z_feat = self.to_latent(crops_cnn)                      # [B*K, Cz, fD, fH, fW] or Identity
-        z_flat = z_feat.view(B, K, -1)                          # [B, K, *]
-
-        # temporal embed (FC path)
+        features = self.to_latent(cropped_objects_cnn)
+        features = features.view(batch_size, n_kp, -1)
         if self.projection_mode == 'fc' and self.temp_embed is not None:
-            orig = z_flat.shape                                  # [B, K, F]
-            z_flat = z_flat.view(B // max(timesteps or 1), timesteps or 1, K, *orig[2:])
-            z_flat = z_flat + self.temp_embed[:, : (timesteps or 1)]
-            z_flat = z_flat.view(orig)
-
+            orig_shape = features.shape  # [batch_size * n_kp, ch, patch_size, patch_size]
+            new_feat = features.view(-1, timesteps, n_kp, *features.shape[2:])
+            new_feat = new_feat + self.temp_embed[:, :timesteps]
+            features = new_feat.view(orig_shape)
         if self.output_logvar:
-            mu_features    = self.to_mu(z_flat)
-            logvar_features = self.to_logvar(z_flat)
+            mu_features = self.to_mu(features)
+            logvar_features = self.to_logvar(features)
         else:
-            mu_features    = self.to_mu(z_flat)
+            mu_features = features
+            mu_features = self.to_mu(mu_features)
             logvar_features = None
 
-        crops_batched = crops.view(B, K, *crops.shape[1:])      # [B, K, C, ps, ps, ps]
-
-        return {
-            'mu_features': mu_features,
-            'logvar_features': logvar_features,
-            'cropped_objects': crops_batched
-        }
-
+        cropped_objects = cropped_objects.view(batch_size, -1, *cropped_objects.shape[1:])
+        # [batch_size, n_kp, ch, crop_size, crop_size]
+        spatial_out = {'mu_features': mu_features, 'logvar_features': logvar_features,
+                       'cropped_objects': cropped_objects}
+        return spatial_out
 
 
 """
 DLP components
 """
 
-import math
-import numpy as np
-import torch
-import torch.nn as nn
-
-# expects you already have:
-#   - VoxelPatcher(cdim, volume_size, patch_size) with attributes ph,pw,pl
-#   - Encoder(...)
-#   - AlternativeSpatialSoftmaxKP3D(...)
 
 class DLPPrior(nn.Module):
-    def __init__(self, cdim=3, volume_size=64, n_kp=1,
+    def __init__(self, cdim=3, image_size=64, n_kp=1,
                  pad_mode='replicate',
                  patch_size=16, n_kp_prior=64,
                  kp_range=(-1, 1),
@@ -3352,196 +3221,222 @@ class DLPPrior(nn.Module):
                  filtering_heuristic='none',
                  ch_mult=(1, 2, 3), base_ch=32, num_res_blocks=2, cnn_mid_blocks=False,
                  init_zero_bias=True,
-                 init_ssm_last_layer=True,
-                 init_conv_layers=True,
-                 init_conv_fg_std=0.02):
-        super().__init__()
-
-        # ---- fixed grid shape (no per-batch dependence) ----
-        if isinstance(volume_size, int):
-            D = H = W = int(volume_size)
-        else:
-            assert len(volume_size) == 3, "volume_size must be int or (D,H,W)"
-            D, H, W = map(int, volume_size)
-        self.D, self.H, self.W = D, H, W
-        self.volume_size = (D, H, W)
-
-        self.kp_range = kp_range  # typically (-1,1)
-        self.n_kp = int(n_kp)
-        self.n_kp_prior = int(n_kp_prior)
-        self.patch_size = int(patch_size)
+                 init_ssm_last_layer=True,  # spatial softmax initialization
+                 init_conv_layers=True,  # initialize conv layers with normal dist
+                 init_conv_fg_std=0.02,  # std for conv fg normal dist
+                 ):
+        super(DLPPrior, self).__init__()
+        """
+        DLP Prior Module -- extract object location proposals from an image via SSM
+        cdim: channels of the input image (3...)
+        prior_channels: channels for prior CNN (takes in patches)
+        n_kp: number of kp to extract from each (!) patch
+        n_kp_prior: number of kp to filter from the set of prior kp (of size n_kp x num_patches)
+        pad_mode: padding for the CNNs, 'zeros' or  'replicate' (default)
+        patch_size: patch size for the prior KP proposals network (not to be confused with the glimpse size)
+        kp_range: the range of keypoints, can be [-1, 1] (default) or [0,1]
+        kp_activation: the type of activation to apply on the keypoints: "tanh" for kp_range [-1, 1], "sigmoid" for [0, 1]
+        filtering heuristic: filtering heuristic to filter prior keypoints,['distance', 'variance', 'random', 'none']
+        """
+        self.image_size = image_size
+        self.kp_range = kp_range
+        self.num_patches = int((image_size // patch_size) ** 2)
+        self.n_kp = n_kp
+        self.n_kp_total = self.n_kp * self.num_patches
+        self.n_kp_prior = min(self.n_kp_total, n_kp_prior)
+        self.patch_size = patch_size
         self.cdim = cdim
         self.use_resblock = use_resblock
         self.cnn_mid_blocks = cnn_mid_blocks
-        assert filtering_heuristic in ['distance', 'variance', 'random', 'none']
+        assert filtering_heuristic in ['distance', 'variance',
+                                       'random', 'none'], f'unknown filtering heuristic: {filtering_heuristic}'
         self.filtering_heuristic = filtering_heuristic
 
-        # inits
-        self.init_zero_bias = init_zero_bias
-        self.init_ssm_last_layer = init_ssm_last_layer
-        self.init_conv_layers = init_conv_layers
-        self.init_conv_fg_std = init_conv_fg_std
+        # initialization
+        self.init_zero_bias = init_zero_bias  # zero bias for conv and linear layers
+        self.init_ssm_last_layer = init_ssm_last_layer  # spatial softmax initialization
+        self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
+        self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
 
-        # 3D patcher (fixed grid)
-        self.patcher = VoxelPatcher(cdim=cdim, volume_size=(D, H, W), patch_size=self.patch_size)
-        pd, ph, pw = self.patcher.pd, self.patcher.ph, self.patcher.pw
-        self.nz, self.ny, self.nx = D // pd, H // ph, W // pw   # counts along (z,y,x)
-        self.num_patches = self.nx * self.ny * self.nz
-        self.n_kp_total = self.n_kp * self.num_patches
-        self.n_kp_prior = min(self.n_kp_total, self.n_kp_prior)
-
-        # CNN encoder over patches
+        # prior
+        self.patcher = ImagePatcher(cdim=cdim, image_size=image_size, patch_size=patch_size)
+        # self.features_dim = int(patch_size // (2 ** (len(prior_channels) - 1)))
+        self.features_dim = int(patch_size // (2 ** (len(ch_mult) - 1)))
         attn_res = [max(self.patch_size // 16, 1)]
         self.enc = Encoder(ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                            attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True, in_channels=cdim,
-                           resolution=self.patch_size, z_channels=self.n_kp, double_z=False, padding_mode='replicate',
+                           resolution=patch_size, z_channels=n_kp, double_z=False, padding_mode='replicate',
                            residual=self.use_resblock, mid_blocks=cnn_mid_blocks)
 
-        # 3D spatial softmax -> per-patch KPs (local coords) + covariance
-        self.ssm = AlternativeSpatialSoftmaxKP3D(kp_range=kp_range)
+        self.ssm = AlternativeSpatialSoftmaxKP(kp_range=kp_range)
 
-        # -------- precompute tile origins/centers in voxel-index space; keep as buffers --------
-        origins = self._precompute_patch_origins_xyz(
-            W, H, D, pw, ph, pd
-        ) 
-        centers = origins + torch.tensor([(pw - 1) / 2.0, (ph - 1) / 2.0, (pd - 1) / 2.0], dtype=torch.float32).view(1, 3)
-        self.register_buffer("patch_origins_xyz_idx", origins)
-        self.register_buffer("patch_centers_xyz_idx", centers)
-        self.register_buffer("size_minus1", torch.tensor([W - 1, H - 1, D - 1], dtype=torch.float32))  # (x,y,z)
-        self.register_buffer("patch_size_vec", torch.tensor([pw, ph, pd], dtype=torch.float32))
         self.init_weights()
 
-    # ---------- init helpers ----------
+    def init_conv_with_spatial_priors(self, conv: nn.Conv2d, gaussian_sigma=0.4, noise_std=0.05):
+        """
+        Initializes a conv layer with spatially structured filters for RGB or single-channel input.
+        Supports Sobel, Prewitt, Laplacian, and Gaussian blobs with noise.
+        """
+        out_channels, in_channels, H, W = conv.weight.shape
+
+        sobel_x = torch.tensor([[-1, 0, 1],
+                                [-2, 0, 2],
+                                [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = sobel_x.T
+
+        prewitt_x = torch.tensor([[-1, 0, 1],
+                                  [-1, 0, 1],
+                                  [-1, 0, 1]], dtype=torch.float32)
+        prewitt_y = prewitt_x.T
+
+        laplacian = torch.tensor([[0, 1, 0],
+                                  [1, -4, 1],
+                                  [0, 1, 0]], dtype=torch.float32)
+
+        edge_filters = [sobel_x, sobel_y, prewitt_x, prewitt_y, laplacian]
+
+        def make_gaussian_blob(size, sigma, center):
+            x = torch.linspace(-1, 1, size)
+            y = torch.linspace(-1, 1, size)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            grid = torch.stack([xx, yy], dim=0)
+            diff = grid - torch.tensor(center).view(2, 1, 1)
+            return torch.exp(-torch.sum(diff ** 2, dim=0) / (2 * sigma ** 2))
+
+        weight = torch.zeros_like(conv.weight)
+
+        for i in range(out_channels):
+            filter_type = i % (len(edge_filters) + 1)
+            if filter_type < len(edge_filters):
+                ef = edge_filters[filter_type]
+                ef_padded = torch.zeros((H, W))
+                h0 = (H - ef.shape[0]) // 2
+                w0 = (W - ef.shape[1]) // 2
+                ef_padded[h0:h0 + ef.shape[0], w0:w0 + ef.shape[1]] = ef
+                base_filter = ef_padded
+            else:
+                cx, cy = np.random.uniform(-0.5, 0.5, size=2)
+                base_filter = make_gaussian_blob(H, gaussian_sigma, (cx, cy))
+
+            noisy_filter = base_filter + noise_std * torch.randn_like(base_filter)
+
+            # Apply the same (or slightly varied) filter across input channels
+            for c in range(in_channels):
+                # Option 1: same for all channels
+                weight[i, c] = noisy_filter.clone()
+                # Option 2 (optional): add slight channel-specific noise
+                # weight[i, c] = noisy_filter + noise_std * torch.randn_like(noisy_filter)
+
+        with torch.no_grad():
+            conv.weight.copy_(weight)
+            if conv.bias is not None:
+                conv.bias.zero_()
+
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
+                # pass
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0.0, self.init_conv_fg_std)
                 if self.init_zero_bias and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                # use pytorch's default
+                pass
+        # initialize input filters with spatial priors
         if self.init_ssm_last_layer:
-            # bias the final conv slightly negative like your original
             m = self.enc.conv_out
-            nn.init.constant_(m.weight, -1.0 * self.init_conv_fg_std)
+            # nn.init.normal_(m.weight, -0.2, 0.02)
+            # d = -1 * math.sqrt(1 / (m.in_channels + m.out_channels))
+            d = -1.0 * self.init_conv_fg_std
+            nn.init.constant_(m.weight, d)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+        # self.init_conv_with_spatial_priors(self.enc.conv_in)
 
-    @staticmethod
-    def _precompute_patch_origins_xyz(W, H, L, pw, ph, pl):
-        xs = torch.arange(0, W, step=pw, dtype=torch.float32)
-        ys = torch.arange(0, H, step=ph, dtype=torch.float32)
-        zs = torch.arange(0, L, step=pl, dtype=torch.float32)
-        X, Y, Z = torch.meshgrid(xs, ys, zs, indexing='ij')  # [nx,ny,nz]
-        return torch.stack([X.reshape(-1), Y.reshape(-1), Z.reshape(-1)], dim=-1)  # [N,3]
+    def img_to_patches(self, x):
+        return self.patcher.img_to_patches(x)
 
-    # ---------- mapping utilities (no last_shape) ----------
+    def patches_to_img(self, x):
+        return self.patcher.patches_to_img(x)
+
     def get_global_kp(self, local_kp):
-        """
-        local_kp: [B, N, K, 3] in kp_range (e.g., (-1,1)).
-        Returns global coords in kp_range, using fixed grid shape and precomputed patch origins.
-        """
-        xmin, xmax = self.kp_range
-        px, py, pz = self.patch_size_vec.unbind(-1)
-        # map local (-1,1) -> [0, ps-1]
-        scale = torch.stack([px - 1.0, py - 1.0, pz - 1.0]).to(local_kp).view(1,1,1,3)
-        lk01   = (local_kp - xmin) / (xmax - xmin)         # (x,y,z) in [0,1]
-        lk_idx = lk01 * scale                               # voxel index units (x,y,z)
-
-        origins_xyz = self.patch_origins_xyz_idx.to(local_kp).view(1, -1, 1, 3)  # (x,y,z)
-        idx_xyz = lk_idx + origins_xyz
-
-        size_m1_xyz = self.size_minus1.to(local_kp).view(1,1,1,3)                # [W-1,H-1,D-1] (x,y,z)
-        g_xyz01 = idx_xyz / size_m1_xyz
-        g_xyz   = g_xyz01 * (xmax - xmin) + xmin     
-        return g_xyz
+        # local_kp: [batch_size, num_patches, n_kp, 2]
+        # returns the global coordinates of a KP within the original image.
+        batch_size, num_patches, n_kp, _ = local_kp.shape
+        global_coor = self.patcher.get_patch_location_idx().to(local_kp.device)  # [num_patches, 2]
+        global_coor = global_coor[:, None, :].repeat(1, n_kp, 1)
+        global_coor = (((local_kp - self.kp_range[0]) / (self.kp_range[1] - self.kp_range[0])) * (
+                self.patcher.patch_size - 1) + global_coor) / (self.image_size - 1)
+        global_coor = global_coor * (self.kp_range[1] - self.kp_range[0]) + self.kp_range[0]
+        return global_coor
 
     def get_patch_centers(self):
-        """
-        Returns patch centers in global kp_range coords, shape [N,3].
-        """
-        xmin, xmax = self.kp_range
-        centers = self.patch_centers_xyz_idx
-        g01 = centers / self.size_minus1  # [N,3] / [3]
-        return g01 * (xmax - xmin) + xmin
+        # get the resepective coordinates of the patches
+        centers = self.patcher.get_patch_centers() / (self.image_size - 1)
+        return centers
 
-    def get_distance_from_patch_centers(self, kp_global):
-        """
-        kp_global: [B,N,K,3] already in global kp_range.
-        Returns squared L2 distance to each patch center: [B,N,K]
-        """
-        centers = self.get_patch_centers().to(kp_global.device, kp_global.dtype)  # [N,3]
-        centers_b = centers.view(1, -1, 1, 3)
-        return ((kp_global - centers_b) ** 2).sum(dim=-1)
-
-    # ---------- main API ----------
-    def vox_to_patches(self, x):
-        return self.patcher.vox_to_patches(x)
-
-    def patches_to_vox(self, x):
-        return self.patcher.patches_to_vox(x)
+    def get_distance_from_patch_centers(self, kp, global_kp=False):
+        # calculates the distance of a KP from the center of its parent patch. This is useful to understand (and filter)
+        # if SSM detected something, otherwise, the KP will probably land in the center of the patch
+        # (e.g., a solid-color patch will have the same activation in all pixels).
+        if not global_kp:
+            global_coor = self.get_global_kp(kp).view(kp.shape[0], -1, 2)
+        else:
+            global_coor = kp
+        centers = 0.5 * (self.kp_range[1] + self.kp_range[0]) * torch.ones_like(kp).to(kp.device)
+        global_centers = self.get_global_kp(centers.view(kp.shape[0], -1, self.n_kp, 2)).view(kp.shape[0], -1, 2)
+        return ((global_coor - global_centers) ** 2).sum(-1)
 
     def encode_prior(self, x, filtering_heuristic='none', k=None):
-        """
-        x: [B, C, D, H, W]  (D=z, H=y, W=x)
-        """
-        B, C, D, H, W = x.shape
-        assert (D, H, W) == self.volume_size, f"got {(D,H,W)}, expected {self.volume_size}"
-
-        # patchify (DHW) -> [B, C, N, pd, ph, pw]
-        patches = self.vox_to_patches(x)                          # DHW patcher
-        patches = patches.permute(0, 2, 1, 3, 4, 5).contiguous()  # [B, N, C, pd, ph, pw]
-        N = patches.shape[1]
-        pd, ph, pw = self.patcher.pd, self.patcher.ph, self.patcher.pw
-
-        # encode
-        patches_bn = patches.view(-1, C, pd, ph, pw)              # [B*N, C, pd, ph, pw]
-        print("PATCHES BN: ", patches_bn.shape)
-        enc_out = self.enc(patches_bn)                            # -> [B*N, K, pd, ph, pw]
-        print("ENCODER OUT: ", enc_out.shape)
-        z = enc_out[1] if isinstance(enc_out, tuple) else enc_out
-        assert z.dim() == 5 and z.shape[1] == self.n_kp, f"expected [B*, {self.n_kp}, Dp, Hp, Wp], got {z.shape}"
-
-        kp_local, cov_local = self.ssm(z, probs=False, variance=True)  # [B*N,K,3], [B*N,K,3,3]
-        kp_local  = kp_local.view(B, N, self.n_kp, 3)                  # (x,y,z) in patch-normalized coords
-        cov_local = cov_local.view(B, N, self.n_kp, 3, 3)
-
-        kp_global = self.get_global_kp(kp_local)                       # [B,N,K,3]  (x,y,z) in global kp_range
-        cov_global = cov_local                                         # (optionally rescale to global units)
-
-        # ---- filtering ----
-        if filtering_heuristic == 'distance':
-            scores = self.get_distance_from_patch_centers(kp_global)       # [B,N,K]
-            scores = scores.view(B, -1)
-            M = scores.shape[1]
-            k_keep = min(k if k is not None else self.n_kp_prior, M)
-            _, idx = torch.topk(scores, k=k_keep, dim=-1, largest=True)    # farthest
-        elif filtering_heuristic == 'variance':
-            tr = cov_global[..., 0, 0] + cov_global[..., 1, 1] + cov_global[..., 2, 2]
-            scores = tr.view(B, -1)
-            M = scores.shape[1]
-            k_keep = min(k if k is not None else self.n_kp_prior, M)
-            _, idx = torch.topk(scores, k=k_keep, dim=-1, largest=False)   # smallest var
-        elif filtering_heuristic == 'random':
-            kp_flat = kp_global.view(B, -1, 3)
-            M = kp_flat.shape[1]
-            k_keep = min(k if k is not None else self.n_kp_prior, M)
-            idx = torch.rand(B, M, device=x.device).argsort(dim=-1)[:, :k_keep]
-            b = torch.arange(B, device=x.device)[:, None]
-            return kp_flat[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
+        # encodes prior keypoints by patchifying the image and applying spatial-softmax
+        # x: [batch_size, cdim, image_size, image_size]
+        # global_kp: set True to get the global coordinates within the image (instead of local KP inside the patch)
+        batch_size, cdim, image_size, image_size = x.shape
+        x_patches = self.img_to_patches(x)  # [batch_size, cdim, num_patches, patch_size, patch_size]
+        x_patches = x_patches.permute(0, 2, 1, 3, 4)  # [batch_size, num_patches, cdim, patch_size, patch_size]
+        x_patches = x_patches.contiguous().view(-1, cdim, self.patcher.patch_size, self.patcher.patch_size)
+        enc_out = self.enc(x_patches)  # [batch_size*num_patches, n_kp, features_dim, features_dim]
+        if isinstance(enc_out, tuple):
+            z = enc_out[1]
         else:
-            # none: return all
-            return kp_global.view(B, -1, 3), cov_global.view(B, -1, 3, 3)
+            z = enc_out
+        kp_p, var_kp = self.ssm(z, probs=False, variance=True)  # [batch_size * num_patches, n_kp, 2]
+        kp_p = kp_p.view(batch_size, -1, self.n_kp, 2)  # [batch_size, num_patches, n_kp, 2]
+        kp_p = self.get_global_kp(kp_p)
+        var_kp = var_kp.view(batch_size, kp_p.shape[1], self.n_kp, -1)  # [batch_size, num_patches, n_kp, 3]
 
-        # gather filtered
-        b = torch.arange(B, device=x.device)[:, None]
-        return kp_global.view(B, -1, 3)[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
+        if k is None:
+            k = self.n_kp_prior
+        kp_p = kp_p.view(x.shape[0], -1, 2)  # [batch_size, n_kp_total, 2]
+        var_kp = var_kp.view(x.shape[0], kp_p.shape[1], -1)  # [batch_size, n_kp_total, 3]
+        if filtering_heuristic == 'distance':
+            # filter proposals by distance to the patches' center
+            dist_from_center = self.prior.get_distance_from_patch_centers(kp_p, global_kp=True)
+            _, indices = torch.topk(dist_from_center, k=k, dim=-1, largest=True)
+            batch_indices = torch.arange(kp_p.shape[0], device=kp_p.device).view(-1, 1)
+            kp_p = kp_p[batch_indices, indices]
+            var_kp = var_kp[batch_indices, indices]
+        elif filtering_heuristic == 'variance':
+            total_var = var_kp.sum(-1)
+            _, indices = torch.topk(total_var, k=k, dim=-1, largest=False)
+            batch_indices = torch.arange(kp_p.shape[0], device=kp_p.device).view(-1, 1)
+            kp_p = kp_p[batch_indices, indices]
+        elif filtering_heuristic == 'none':
+            return kp_p, var_kp
+        else:
+            # alternatively, just sample random kp
+            kp_p = kp_p[:, torch.randperm(kp_p.shape[1])[:k]]
+            var_kp = var_kp[:, torch.randperm(kp_p.shape[1])[:k]]
+        return kp_p, var_kp
 
     def forward(self, x):
-        return self.encode_prior(x, filtering_heuristic=self.filtering_heuristic)
-
+        # prior proposals
+        kp_p, var_kp = self.encode_prior(x, filtering_heuristic=self.filtering_heuristic)
+        return kp_p, var_kp
 
 
 class ParticleInteractionEncoder(nn.Module):
@@ -3603,7 +3498,7 @@ class ParticleInteractionEncoder(nn.Module):
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
 
         if particle_anchors is None:
-            self.register_buffer('particles_anchor', torch.zeros(1, self.n_kp_enc, 3))
+            self.register_buffer('particles_anchor', torch.zeros(1, 1, self.n_kp_enc))
             self.use_z_orig = False
         else:
             self.register_buffer('particles_anchor', particle_anchors)
@@ -3625,35 +3520,32 @@ class ParticleInteractionEncoder(nn.Module):
                                        padding_mode=pad_mode, residual=use_resblock, in_conv_kernel_size=3,
                                        mid_blocks=cnn_mid_blocks)
             self.cnn_out_shape = self.get_cnn_shape()
+            feature_map_size = self.output_feat_map_size ** 2
 
-            print("cnn_out_shape:", self.cnn_out_shape)
+            # FCN or Linear
+            if self.ctx_pre_pte_latent_dim % feature_map_size == 0:
+                self.ch_learned_feature_dim = math.ceil(max(self.ctx_pre_pte_latent_dim / feature_map_size, 1))
+                out_ch = self.ch_learned_feature_dim
+                self.to_latent = nn.Conv2d(in_channels=final_cnn_ch,
+                                           out_channels=out_ch, kernel_size=1)
+                output_z_cnn = (self.ch_learned_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
+                flattened_z_cnn = np.prod(output_z_cnn)
 
-            # Detect 3D context encoder from output shape (C,D,H,W) vs (C,H,W)
-            self.is_3d_ctx = (len(self.cnn_out_shape) == 4)
+                self.projection_mode = 'fcn'
+                self.to_latent_lin = nn.Identity()
+            else:
+                self.ch_learned_feature_dim = final_cnn_ch
+                self.to_latent = nn.Identity()
+                output_z_cnn = (self.ch_learned_feature_dim, self.cnn_out_shape[-2], self.cnn_out_shape[-1])
+                flattened_z_cnn = np.prod(output_z_cnn)
 
-            if self.is_3d_ctx:
-                C_out, D_out, H_out, W_out = self.cnn_out_shape
-                vox_elems = D_out * H_out * W_out
-
-                # FCN-style projection (1x1x1 conv) if divisible, else flatten+MLP
-                if self.ctx_pre_pte_latent_dim % vox_elems == 0:
-                    self.ch_learned_feature_dim = self.ctx_pre_pte_latent_dim // vox_elems
-                    # 3D 1x1x1 conv to reach desired channels before flatten
-                    self.to_latent = nn.Conv3d(in_channels=final_cnn_ch,
-                                            out_channels=self.ch_learned_feature_dim,
-                                            kernel_size=1)
-                    flattened_z_cnn = self.ch_learned_feature_dim * vox_elems
-                    self.projection_mode = 'fcn3d'
-                    self.to_latent_lin = nn.Identity()
-                else:
-                    self.ch_learned_feature_dim = final_cnn_ch
-                    self.to_latent = nn.Identity()
-                    flattened_z_cnn = final_cnn_ch * vox_elems
-                    self.projection_mode = 'fc3d'
-                    self.to_latent_lin = self.get_mlp(flattened_z_cnn, self.ctx_pre_pte_latent_dim)
+                self.projection_mode = 'fc'
+                self.to_latent_lin = self.get_mlp(flattened_z_cnn, self.ctx_pre_pte_latent_dim)
 
             self.info = (f'ParticleInteractionEncoder: requested latent size: {self.ctx_pre_pte_latent_dim}, '
-                         f' latent projection mode: {self.projection_mode},')
+                         f'cnn output (h*w): {feature_map_size}, (latent_size / h*w)={self.ctx_pre_pte_latent_dim / feature_map_size} ->'
+                         f' latent projection mode: {self.projection_mode},'
+                         f' project {output_z_cnn} ({flattened_z_cnn}) -> {self.ctx_pre_pte_latent_dim}')
 
             # end cnn stuff
             n_particles += 1  # [ctx + n_kp_enc]
@@ -3722,7 +3614,7 @@ class ParticleInteractionEncoder(nn.Module):
     def init_weights(self):
         # initialization
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0, self.init_conv_fg_std)
                 if self.init_zero_bias and m.bias is not None:
@@ -3745,51 +3637,32 @@ class ParticleInteractionEncoder(nn.Module):
             return mlp
 
     def get_cnn_shape(self):
-
-        # Heuristic: check whether the ctx encoder is 3D
-        is_3d = any(isinstance(m, nn.Conv3d) for m in self.ctx_cnn_enc.modules())
-
-        if is_3d:
-            # 3D conv path: B,C,D,H,W
-            depth = getattr(self, "image_depth", self.image_size)  # fallback if you don't set image_depth
-            dummy_input = torch.rand(1, self.cdim, depth, self.image_size, self.image_size)
-        else:
-            # 2D conv path: B,C,H,W
-            dummy_input = torch.rand(1, self.cdim, self.image_size, self.image_size)
-
+        dummy_input = torch.rand(1, self.cdim, self.image_size, self.image_size)
         out = self.ctx_cnn_enc(dummy_input)
         if isinstance(out, tuple):
             out = out[1]
         return out.shape[1:]
 
-
     def encode_ctx_features(self, x, masks=None):
-        """
-        x: [B,C,D,H,W] (3D) or [B,C,H,W] (2D)
-        returns: [B, projection_dim]
-        """
+        # x: [bs, ch, image_size, image_size]
+        # masks: [bs, 1, image_size, image_size]
+        batch_size, _, features_dim, _ = x.shape
+        # bg features
         if masks is not None:
             x_in = x * masks
         else:
             x_in = x
-
         enc_out = self.ctx_cnn_enc(x_in)
-        cnn_features = enc_out[1] if isinstance(enc_out, tuple) else enc_out  # 5D for 3D, 4D for 2D
+        if isinstance(enc_out, tuple):
+            cnn_features = enc_out[1]
+        else:
+            cnn_features = enc_out
 
-        # 3D path
-        if cnn_features.dim() == 5:
-            # to_latent is Conv3d or Identity sized for (B,C,D,H,W)
-            feat = self.to_latent(cnn_features)                 # [B,C',D,H,W]
-            feat = feat.reshape(feat.shape[0], -1)              # [B, C'*D*H*W]
-            feat = self.to_latent_lin(feat)                     # [B, proj_dim]
-            return feat
-
-        # 2D path (unchanged)
-        feat = self.to_latent(cnn_features)                     # [B,C',H,W]
-        feat = feat.view(feat.shape[0], -1)                     # [B, C'*H*W]
-        feat = self.to_latent_lin(feat)                         # [B, proj_dim]
-        return feat
-
+        # new cnn
+        features = self.to_latent(cnn_features)
+        features = features.view(features.shape[0], -1)
+        features = self.to_latent_lin(features)
+        return features
 
     def encode_all(self, x, z, z_scale, z_obj_on, z_depth, z_features, z_bg_features=None, z_base_var=None,
                    z_score=None, patch_id_embed=None, deterministic=False, warmup=False,
@@ -3839,18 +3712,16 @@ class ParticleInteractionEncoder(nn.Module):
         particle_projection = particle_projection + p_embeddings
 
         if self.use_img_input:
-            # Keep shape as-is; encode_ctx_features will handle 2D vs 3D
-            x_in = x
-            ctx_features = self.encode_ctx_features(x_in)      # [B, proj_dim] or [B,T,proj_dim] if you ever add time here
-            # Match the temporal dims you expect downstream:
-            # Your code expects [B, T, 1, proj_dim]. If you don't have time, synthesize T=1.
-            if ctx_features.dim() == 2:                         # [B, D]
-                ctx_features = ctx_features[:, None, :]         # [B, 1, D]
-            ctx_features = ctx_features[:, :, None, :]          # [B, T, 1, D]
-            ctx_features = ctx_features + self.ctx_embeddings.repeat(ctx_features.shape[0],
-                                                                    ctx_features.shape[1], 1, 1)
+            # add context
+            if len(x.shape) == 5:
+                # x: [bs, t, ch, h, w]
+                x_in = x.view(-1, *x.shape[2:])
+            else:
+                x_in = x
+            ctx_features = self.encode_ctx_features(x_in)
+            ctx_features = ctx_features.view(bs, timestep_horizon, 1, -1)  # [bs, T, 1, projection_dim]
+            ctx_features = ctx_features + self.ctx_embeddings.repeat(bs, timestep_horizon, 1, 1)
             particle_projection = torch.cat([particle_projection, ctx_features], dim=2)
-
             # [bs, t, n_p + 2, proj_dim] if with_bg else [bs, t, n_p + 1, proj_dim]
         #     # [bs, t, n_p + 2, proj_dim]
 
@@ -4384,8 +4255,7 @@ class ParticleEncoder(nn.Module):
                  init_ssm_last_layer=True,  # spatial softmax initialization
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
-                 separate_depth_features=False,
-                 depth_feature_dim=16,):
+                 ):
         super(ParticleEncoder, self).__init__()
         """
         DLP Foreground Module – Extracts objects from an image using keypoints and learned features. 
@@ -4452,7 +4322,7 @@ class ParticleEncoder(nn.Module):
         self.embed_init_std = embed_init_std
         self.projection_dim = projection_dim
         self.timestep_horizon = (timestep_horizon + 1) if timestep_horizon > 1 else 1
-        self.num_patches = int((image_size // self.patch_size) ** 3)
+        self.num_patches = int((image_size // self.patch_size) ** 2)
         self.interaction_features = interaction_features
         self.interaction_depth = interaction_depth
         self.interaction_obj_on = interaction_obj_on
@@ -4470,12 +4340,8 @@ class ParticleEncoder(nn.Module):
         self.init_ssm_last_layer = init_ssm_last_layer  # spatial softmax initialization
         self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
-        
-        self.separate_depth_features = separate_depth_features
-        self.depth_feature_dim = depth_feature_dim
 
-        print("Creating DLP Prior with cdim: ", cdim)
-        self.prior_encoder = DLPPrior(cdim=cdim, volume_size=image_size, n_kp=self.n_kp_per_patch,
+        self.prior_encoder = DLPPrior(cdim=cdim, image_size=image_size, n_kp=self.n_kp_per_patch,
                                       patch_size=patch_size, kp_range=kp_range, pad_mode=pad_mode,
                                       n_kp_prior=n_kp_prior,
                                       filtering_heuristic=filtering_heuristic,
@@ -4509,50 +4375,34 @@ class ParticleEncoder(nn.Module):
                                                                init_conv_fg_std=init_conv_fg_std)
         # appearance encoder - visual features encoder (z_f)
         output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
-        
-        print("Output logvar for feature encoder: ", output_logvar)
-        # Split RGB and Depth Feature Encoder when RGBD
-
         self.particle_features_enc = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
-                                                        image_size,
-                                                        margin=0, ch=cdim, pad_mode=pad_mode,
-                                                        ch_mult=obj_ch_mult, base_ch=obj_base_ch,
-                                                        final_cnn_ch=obj_final_cnn_ch,
-                                                        num_res_blocks=num_res_blocks,
-                                                        output_logvar=output_logvar,
-                                                        use_resblock=use_resblock, cnn_mid_blocks=cnn_mid_blocks,
-                                                        hidden_dim=mlp_hidden_dim,
-                                                        timestep_horizon=self.timestep_horizon,
-                                                        add_particle_temp_embed=add_particle_temp_embed,
-                                                        init_zero_bias=init_zero_bias,
-                                                        init_conv_layers=init_conv_layers,
-                                                        init_conv_fg_std=init_conv_fg_std
-                                                        )
-        num_patches = self.prior_encoder.num_patches  # nx * ny * nz
-
+                                                             image_size,
+                                                             margin=0, pad_mode=pad_mode,
+                                                             ch_mult=obj_ch_mult, base_ch=obj_base_ch,
+                                                             final_cnn_ch=obj_final_cnn_ch,
+                                                             num_res_blocks=num_res_blocks,
+                                                             output_logvar=output_logvar,
+                                                             use_resblock=use_resblock, cnn_mid_blocks=cnn_mid_blocks,
+                                                             hidden_dim=mlp_hidden_dim,
+                                                             timestep_horizon=self.timestep_horizon,
+                                                             add_particle_temp_embed=add_particle_temp_embed,
+                                                             init_zero_bias=init_zero_bias,
+                                                             init_conv_layers=init_conv_layers,
+                                                             init_conv_fg_std=init_conv_fg_std
+                                                             )
+        # embed the source patch of the particles
         if self.embed_prior_patch_pos:
-            # one embed per patch (+1 for the null slot if you want a null-embed too)
-            self.patch_id_embed = nn.Parameter(
-                self.embed_init_std * torch.randn(1, num_patches + 1, mlp_hidden_dim)
-            )
+            self.patch_id_embed = nn.Parameter(self.embed_init_std * torch.randn(1, self.n_kp_prior, mlp_hidden_dim))
         else:
             self.patch_id_embed = None
-
-        # centers already in kp_range, shape [N, 3]
-        pc = self.prior_encoder.get_patch_centers().unsqueeze(0)     # [1, N, 3]
-        patch_centers = pc                                            # no extra scaling
-
-        # append 3D null center
-        null_center = torch.zeros(1, 1, 3, device=pc.device, dtype=pc.dtype)
-        patch_centers = torch.cat([patch_centers, null_center], dim=1)  # [1, N+1, 3]
-
+        patch_centers = self.prior_encoder.get_patch_centers().unsqueeze(0) * (
+                self.kp_range[1] - self.kp_range[0]) + self.kp_range[0]
+        # append null particle
+        patch_centers = torch.cat([patch_centers, torch.zeros(1, 1, 2)], dim=1)
+        if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
+            self.null_feature_embed = nn.Parameter(self.embed_init_std * torch.randn(1, 1, self.learned_feature_dim))
         self.register_buffer('patch_centers', patch_centers)
-
-        # scale prior stays the same
-        self.register_buffer(
-            'mu_scale_prior',
-            torch.tensor(np.log(self.anchor_s / (1 - self.anchor_s + 1e-5)), dtype=torch.float32)
-        )
+        self.register_buffer('mu_scale_prior', torch.tensor(np.log(self.anchor_s / (1 - self.anchor_s + 1e-5))))
         self.init_weights()
 
     def init_weights(self):
@@ -4576,373 +4426,274 @@ class ParticleEncoder(nn.Module):
         return self.prior_encoder(x)
 
     def encode_pos_scale_with_prior(self, x, deterministic=False, warmup=False, timesteps=None):
-        batch_size, ch, d, h, w = x.shape
-
-        # prior now returns (x,y,z) and full covariance
-        kp_p, cov_kp = self.encode_prior(x)  # kp_p: [B, n_kp_prior, 3], cov_kp: [B, n_kp_prior, 3, 3]
-
-        # kp_init: [B, n_kp_prior, 3] in [-1, 1]
+        batch_size, ch, h, w = x.shape
+        kp_p, var_kp = self.encode_prior(x)
+        # kp_init: [batch_size, n_kp, 2] in [-1, 1]
         kp_init = kp_p
-
-        # 0) create or filter anchors
+        # 0. create or filter anchors
         if kp_init is None:
-            # randomly sample n_kp_prior kp in 3D
-            mu = torch.rand(batch_size, self.n_kp_prior, 3, device=x.device) * 2 - 1
+            # randomly sample n_kp_enc kp
+            mu = torch.rand(batch_size, self.n_kp_prior, 2, device=x.device) * 2 - 1  # in [-1, 1]
         else:
-            mu = kp_init  # [B, n_kp_prior, 3]
+            mu = kp_init
+        logvar = torch.zeros_like(mu)
+        z_base = mu + 0.0 * logvar  # deterministic value for chamfer-kl
+        # 1. posterior offsets and scale, it is okay of scale_prev is None
+        particle_stats_dict = self.particle_attribute_enc(x, z_base, timesteps=timesteps, deterministic=deterministic)
 
-        # keep logvar simple (zero) unless you want to use diag(cov_kp)
-        logvar = torch.zeros_like(mu)  # [B, n_kp_prior, 3]
-
-        # deterministic base for Chamfer-KL (unchanged behavior)
-        z_base = mu + 0.0 * logvar  # [B, n_kp_prior, 3]
-
-        # 1) posterior offsets and scale
-        particle_stats_dict = self.particle_attribute_enc(
-            x, z_base, timesteps=timesteps, deterministic=deterministic
-        )
-
-        mu_offset     = particle_stats_dict['mu']           # [..., 3]
-        logvar_offset = particle_stats_dict['logvar']       # [..., 3]
-        mu_scale      = particle_stats_dict['mu_scale']     # [..., 3]
-        logvar_scale  = particle_stats_dict['logvar_scale'] # [..., 3] or None
-
+        mu_offset = particle_stats_dict['mu']
+        # logvar_offset = particle_stats_dict['logvar'].clamp_max(math.log(0.02 ** 2))  # 0.02
+        logvar_offset = particle_stats_dict['logvar']
+        mu_scale = particle_stats_dict['mu_scale']
+        logvar_scale = particle_stats_dict['logvar_scale']
+        # logvar_scale = particle_stats_dict['logvar_scale'].clamp_max(math.log(0.2 ** 2))
         if not self.interaction_obj_on:
-            lobj_on_a   = particle_stats_dict['lobj_on_a']
-            lobj_on_b   = particle_stats_dict['lobj_on_b']
-            obj_on_a    = particle_stats_dict['obj_on_a']
-            obj_on_b    = particle_stats_dict['obj_on_b']
-            mu_obj_on   = particle_stats_dict['mu_obj_on']
-            z_obj_on    = particle_stats_dict['z_obj_on']
+            lobj_on_a = particle_stats_dict['lobj_on_a']
+            lobj_on_b = particle_stats_dict['lobj_on_b']
+            obj_on_a = particle_stats_dict['obj_on_a']
+            obj_on_b = particle_stats_dict['obj_on_b']
+            mu_obj_on = particle_stats_dict['mu_obj_on']
+            z_obj_on = particle_stats_dict['z_obj_on']
         else:
             obj_on_a = obj_on_b = z_obj_on = mu_obj_on = None
-
         if not self.interaction_depth:
-            mu_depth     = particle_stats_dict['mu_depth']
+            mu_depth = particle_stats_dict['mu_depth']
             logvar_depth = particle_stats_dict['logvar_depth']
-            z_depth      = mu_depth if deterministic else reparameterize(mu_depth, logvar_depth)
+            if deterministic:
+                z_depth = mu_depth
+            else:
+                z_depth = reparameterize(mu_depth, logvar_depth)
         else:
             mu_depth = logvar_depth = z_depth = None
 
         # final position
-        mu_tot    = z_base + mu_offset
+        mu_tot = z_base + mu_offset
         logvar_tot = logvar_offset
-        mu_scale   = self.mu_scale_prior + mu_scale
+        mu_scale = self.mu_scale_prior + mu_scale
 
         # reparameterize
         if deterministic:
             z_offset = mu_offset
-            z_scale  = mu_scale
+            z_scale = mu_scale
         else:
             z_offset = reparameterize(mu_offset, logvar_offset)
-            z_scale  = reparameterize(mu_scale, logvar_scale) if logvar_scale is not None else mu_scale
+            z_scale = reparameterize(mu_scale, logvar_scale)
 
-        z = z_base + z_offset  # [B, n_kp_prior, 3]
-
-        # --- NEW: use covariance properly ---
-        # per-axis variance from the prior covariance (diag)
-        var_kp = torch.diagonal(cov_kp, dim1=-2, dim2=-1)  # [B, n_kp_prior, 3]
+        z = z_base + z_offset
         z_base_var = var_kp.detach()
+        confidence_score = particle_stats_dict['logvar'].detach()
+        z_base_var = torch.cat([z_base_var, confidence_score], dim=-1)
+        z_base_id = torch.arange(z_base.shape[-2], device=z_base.device)[None, :, None]  # [1, n_patches, 1]
+        z_base_id = z_base_id.repeat(z_base.shape[0], 1, 1)  # [bs, n_patches, 1]
 
-        # optional confidence feature (same shape as logvar_offset)
-        confidence_score = particle_stats_dict['logvar'].detach()  # [B, n_kp_prior, 3]
-        # concat for a small feature vector per kp (length 6): [prior_var_xyz | posterior_logvar_xyz]
-        z_base_var = torch.cat([z_base_var, confidence_score], dim=-1)  # [B, n_kp_prior, 6]
+        if self.embed_prior_patch_pos:
+            patch_id_embed = self.patch_id_embed.repeat(mu_tot.shape[0], 1, 1)
+        else:
+            patch_id_embed = None
 
-        # simple integer id for each kp
-        z_base_id = torch.arange(z_base.shape[-2], device=z_base.device)[None, :, None]  # [1, n_kp_prior, 1]
-        z_base_id = z_base_id.repeat(z_base.shape[0], 1, 1)  # [B, n_kp_prior, 1]
-
-        patch_id_embed = self.patch_id_embed.repeat(mu_tot.shape[0], 1, 1) if self.embed_prior_patch_pos else None
-
-        # normalize to [-1,1] using feature length instead of magic number
-        feat_len = z_base_var.shape[-1]  # 6
-        mu_score = (z_base_var.sum(-1, keepdim=True) / float(feat_len)) * 2 - 1  # [B, n_kp_prior, 1]
-        logvar_score = math.log(0.2 ** 2) * torch.ones_like(mu_score)
+        mu_score = (z_base_var.sum(-1, keepdim=True) / 30) * 2 - 1  # [bs * T, n_patches, 1]
+        logvar_score = math.log(0.2 ** 2) * torch.ones_like(mu_score)  # 0.1, original without normalization: 1.0
         z_score = mu_score
 
-        # variance filtering (use summed prior variance; small is better)
-        total_var = var_kp.sum(-1)  # [B, n_kp_prior]
-
+        # variance filtering
+        total_var = z_base_var.sum(-1)  # [bs * T, n_kp]
+        # for single-image settings (self.timestep_horizon == 1), we can filter in the encoder
+        # if self.n_kp_enc < self.n_kp_prior or (warmup and self.timestep_horizon == 1):
         if self.n_kp_enc < self.n_kp_prior:
-            n_filter = self.n_kp_enc if not warmup else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior))
+            n_filter = self.n_kp_enc if not warmup else min(self.n_kp_enc,
+                                                            int(self.warmup_n_kp_ratio * self.n_kp_prior))
             _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
+            # make selection
             batch_ind = torch.arange(batch_size, device=x.device)[:, None]
-
-            mu_tot       = mu_tot[batch_ind, embed_ind]        # [B, n_kp_enc, 3]
-            z_base       = z_base[batch_ind, embed_ind]        # [B, n_kp_enc, 3]
-            z_base_var   = z_base_var[batch_ind, embed_ind]    # [B, n_kp_enc, 6]
-            z_base_id    = z_base_id[batch_ind, embed_ind]     # [B, n_kp_enc, 1]
-            mu_offset    = mu_offset[batch_ind, embed_ind]     # [B, n_kp_enc, 3]
-            logvar_offset= logvar_offset[batch_ind, embed_ind] # [B, n_kp_enc, 3]
-            z            = z[batch_ind, embed_ind]             # [B, n_kp_enc, 3]
-            z_offset     = z_offset[batch_ind, embed_ind]      # [B, n_kp_enc, 3]
-            z_scale      = z_scale[batch_ind, embed_ind]       # [B, n_kp_enc, 3]
-            mu_scale     = mu_scale[batch_ind, embed_ind]      # [B, n_kp_enc, 3]
-            mu_score     = mu_score[batch_ind, embed_ind]      # [B, n_kp_enc, 1]
-            logvar_score = logvar_score[batch_ind, embed_ind]  # [B, n_kp_enc, 1]
-            z_score      = z_score[batch_ind, embed_ind]       # [B, n_kp_enc, 1]
-
+            mu_tot = mu_tot[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            z_base = z_base[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            z_base_var = z_base_var[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            z_base_id = z_base_id[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+            mu_offset = mu_offset[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            logvar_offset = logvar_offset[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            z = z[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            z_offset = z_offset[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            z_scale = z_scale[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            mu_scale = mu_scale[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
+            mu_score = mu_score[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+            logvar_score = logvar_score[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+            z_score = z_score[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
             if logvar_scale is not None:
-                logvar_scale = logvar_scale[batch_ind, embed_ind]  # [B, n_kp_enc, 3]
-
+                logvar_scale = logvar_scale[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
             if not self.interaction_obj_on:
-                obj_on_a   = obj_on_a[batch_ind, embed_ind]
-                obj_on_b   = obj_on_b[batch_ind, embed_ind]
-                mu_obj_on  = mu_obj_on[batch_ind, embed_ind]
-                z_obj_on   = z_obj_on[batch_ind, embed_ind]
-
+                obj_on_a = obj_on_a[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+                obj_on_b = obj_on_b[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+                mu_obj_on = mu_obj_on[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+                z_obj_on = z_obj_on[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
             if not self.interaction_depth:
-                z_depth      = z_depth[batch_ind, embed_ind]
-                mu_depth     = mu_depth[batch_ind, embed_ind]
-                logvar_depth = logvar_depth[batch_ind, embed_ind]
-
+                z_depth = z_depth[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+                mu_depth = mu_depth[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
+                logvar_depth = logvar_depth[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
             if self.embed_prior_patch_pos:
                 patch_id_embed = patch_id_embed[batch_ind, embed_ind]
 
-        out_dict = {
-            'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'mu_tot': mu_tot,
-            'patch_id_embed': patch_id_embed,
-            'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
-            'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
-            'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
-            'kp_p': kp_p,
-            # keep both for convenience: full covariance + per-axis variance
-            'cov_kp': cov_kp, 'var_kp': var_kp,
-            'z_base_var': z_base_var, 'total_var': total_var,
-            'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
-            'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score
-        }
+        out_dict = {'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'mu_tot': mu_tot,
+                    'patch_id_embed': patch_id_embed,
+                    'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
+                    'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
+                    'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
+                    'kp_p': kp_p, 'var_kp': var_kp, 'z_base_var': z_base_var, 'total_var': total_var,
+                    'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
+                    'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score}
         return out_dict
 
-
-    def sample_gauss(self, mu, logvar, deterministic, interaction_features):
-        if deterministic or interaction_features or (logvar is None):
-            return mu
-        return reparameterize(mu, logvar)
-
-    def sample_categorical_logits(self, logits, deterministic, n_cat, n_cls):
-        # logits: [..., n_cat*n_cls]
-        shape = logits.shape
-        probs = logits.view(*shape[:-1], n_cat, n_cls).softmax(dim=-1)
-        if deterministic:
-            idx = torch.argmax(probs.view(-1, n_cls), dim=-1, keepdim=True)    # [M,1]
-            onehot = F.one_hot(idx.squeeze(-1), num_classes=n_cls)
-            onehot = onehot.view(*probs.shape).to(logits.dtype)
-        else:
-            # multinomial over the last dim (classes) per category
-            draws = torch.multinomial(
-                probs.view(-1, n_cls), num_samples=1, replacement=True
-            )  # [M,1]
-            onehot = F.one_hot(draws.squeeze(-1), num_classes=n_cls)
-            onehot = onehot.view(*probs.shape).to(logits.dtype)
-        # straight-through
-        st = onehot.detach() + (probs - probs.detach())
-        return st.view(*shape)  # back to [..., n_cat*n_cls]
-
-    def gate_with_null(self, mu, gate, null_embed):
-        # gate: broadcastable zeros/ones
-        if null_embed is None:
-            return mu  # no-op if you didn't set one
-        if null_embed.shape[-1] != mu.shape[-1]:
-            pad = mu.new_zeros(*null_embed.shape[:-1], mu.shape[-1] - null_embed.shape[-1])
-            null_embed = torch.cat([null_embed, pad], dim=-1)
-        return gate * mu + (1.0 - gate) * null_embed
     def encode_appearance(self, x, z, z_scale, deterministic=False, timesteps=None, obj_on=None):
-        """
-        Unified (original) behavior:
-        - one encoder self.particle_features_enc over x
-        - supports features_dist={'gauss','categorical'}
-        - gating by obj_on -> null_feature_embed
-        - interaction_features toggles sampling vs passthrough
-
-        Split behavior (if self.separate_depth_features=True):
-        - runs self.particle_features_enc_rgb on x[..., :3, :, :]
-        - runs self.particle_features_enc_depth on x[..., 3:4, :, :]
-        - returns separate depth features under '*_depth' keys
-        - keeps original keys pointing to RGB branch for back-compat
-        - also returns concatenated '*_total' (rgb||depth) when both exist & gaussian
-        """
+        # 2. posterior attributes: obj_on, depth and visual features
         obj_enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
-        mu_features     = obj_enc_out['mu_features']
+
+        mu_features = obj_enc_out['mu_features']
         logvar_features = obj_enc_out['logvar_features']
         cropped_objects = obj_enc_out['cropped_objects']
 
-        # obj_on gating
         if obj_on is not None:
-            gate = (obj_on > 0.2).to(mu_features.dtype)
-            null = self.null_feature_embed
-            mu_features = self.gate_with_null(mu_features, gate, null)
+            z_gate = torch.where(obj_on > 0.2, 1.0, 0.0)
+            mu_features = z_gate * mu_features + (1 - z_gate) * self.null_feature_embed
 
-        # sampling
         if not self.interaction_features:
+            # reparameterize
             if self.features_dist == 'categorical':
-                z_features = self.sample_categorical_logits(
-                    mu_features, deterministic, self.n_fg_categories, self.n_fg_classes
-                )
-            else:  # 'gauss'
-                z_features = self.sample_gauss(mu_features, logvar_features)
+                logits = mu_features.view(*mu_features.shape[:-1], self.n_fg_categories, self.n_fg_classes)
+                # [bs, T, n_p, n_categories, n_classes]
+                probs = logits.softmax(dim=-1)  # [bs, T, n_p, n_categories, n_classes]
+                if deterministic:
+                    samples = torch.argmax(probs.view(-1, probs.shape[-1]), dim=-1, keepdim=True)
+                    samples = F.one_hot(samples.squeeze(-1), num_classes=self.n_fg_classes)
+                    samples = samples.view(probs.shape)
+                    # straight-through
+                    z_features = samples.detach() + (probs - probs.detach())
+                    z_features = z_features.view(*mu_features.shape)  # [bs, T, n_p, n_categories * n_classes]
+                else:
+                    samples = torch.multinomial(probs.view(-1, probs.shape[-1]), num_samples=1)
+                    samples = F.one_hot(samples.squeeze(-1), num_classes=self.n_fg_classes)
+                    samples = samples.view(probs.shape)
+                    # straight-through
+                    z_features = samples.detach() + (probs - probs.detach())
+                    z_features = z_features.view(*mu_features.shape)  # [bs, T, n_p, n_categories * n_classes]
+            else:
+                z_features = reparameterize(mu_features, logvar_features) if not deterministic else mu_features
         else:
             z_features = mu_features
 
-        return {
-            'mu_features':           mu_features,
-            'logvar_features':       logvar_features,
-            'z_features':            z_features,
-            'cropped_objects':       cropped_objects,
-            # depth-specific keys None for caller uniformity
-            'mu_depth_features':     None,
-            'logvar_depth_features': None,
-            'z_depth_features':      None,
-            'cropped_objects_rgb':   cropped_objects,
-            'cropped_objects_d':     None,
-            'cropped_objects_4ch':   cropped_objects if cropped_objects.shape[2] == 4 else None,
-            # totals equal unified values
-            'mu_features_total':     mu_features,
-            'logvar_features_total': logvar_features,
-            'z_features_total':      z_features,
-        }
-
+        out_dict = {'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
+                    'cropped_objects': cropped_objects}
+        return out_dict
 
     def encode_all(self, x, deterministic=False, warmup=False):
-        # make sure x is [bs, T, ch, h, w, l]
-        if x.dim() == 5:
-            # x: [B, C, D, H, W]  -> add T=1
-            x = x.unsqueeze(1)  # -> [B, 1, C, D, H, W]
-
-        bs, timestep_horizon, ch, D, H, W = x.shape  # DHW (z,y,x)
-        x = x.view(bs * timestep_horizon, ch, D, H, W)  # [B*T, C, D, H, W]
-
-        # ---- stage 1: positions & scales (DHW throughout) ----
-        stage1_dict = self.encode_pos_scale_with_prior(
-            x, deterministic=deterministic, warmup=warmup, timesteps=timestep_horizon
-        )
-
-        # --- unpack ---
-        kp_p         = stage1_dict['kp_p']
-        cov_kp       = stage1_dict['cov_kp']          # <-- CHANGED: use covariance, not var
-        var_kp      = stage1_dict['var_kp']
-        z_base_var   = stage1_dict['z_base_var']
-        total_var    = stage1_dict['total_var']
+        # make sure x is [bs, T, ch, h, w]
+        if len(x.shape) == 4:
+            # that means x: [bs, ch, h, w]
+            x = x.unsqueeze(1)  # -> [bs, T=1, ch, h, w]
+        bs, timestep_horizon, ch, h, w = x.shape
+        x = x.view(bs * timestep_horizon, *x.shape[2:])  # [bs * T, ch, h, w]
+        # encode particles position and scale
+        stage1_dict = self.encode_pos_scale_with_prior(x, deterministic=deterministic, warmup=warmup,
+                                                       timesteps=timestep_horizon)
+        # unpack
+        kp_p = stage1_dict['kp_p']
+        var_kp = stage1_dict['var_kp']
+        z_base_var = stage1_dict['z_base_var']
+        total_var = stage1_dict['total_var']
         patch_id_embed = stage1_dict['patch_id_embed']
 
-        z_base       = stage1_dict['z_base']
-        mu_offset    = stage1_dict['mu_offset']
-        logvar_offset= stage1_dict['logvar_offset']
-        z_offset     = stage1_dict['z_offset']
-        mu_tot       = stage1_dict['mu_tot']
-        z            = stage1_dict['z']
-        mu_scale     = stage1_dict['mu_scale']
+        z_base = stage1_dict['z_base']
+        mu_offset = stage1_dict['mu_offset']
+        logvar_offset = stage1_dict['logvar_offset']
+        z_offset = stage1_dict['z_offset']
+        mu_tot = stage1_dict['mu_tot']
+        z = stage1_dict['z']
+        mu_scale = stage1_dict['mu_scale']
         logvar_scale = stage1_dict['logvar_scale']
-        z_scale      = stage1_dict['z_scale']
-
-        # may be None
-        mu_depth     = stage1_dict['mu_depth']
+        z_scale = stage1_dict['z_scale']
+        # the following may be None if they are modeled by the interaction module
+        mu_depth = stage1_dict['mu_depth']
         logvar_depth = stage1_dict['logvar_depth']
-        z_depth      = stage1_dict['z_depth']
-        obj_on_a     = stage1_dict['obj_on_a']
-        obj_on_b     = stage1_dict['obj_on_b']
-        mu_obj_on    = stage1_dict['mu_obj_on']
-        z_obj_on     = stage1_dict['z_obj_on']
+        z_depth = stage1_dict['z_depth']
+        obj_on_a = stage1_dict['obj_on_a']
+        obj_on_b = stage1_dict['obj_on_b']
+        mu_obj_on = stage1_dict['mu_obj_on']
+        z_obj_on = stage1_dict['z_obj_on']
 
-        mu_score     = stage1_dict['mu_score']
+        mu_score = stage1_dict['mu_score']
         logvar_score = stage1_dict['logvar_score']
-        z_score      = stage1_dict['z_score']
+        z_score = stage1_dict['z_score']
 
         if self.n_kp_enc != self.n_kp_dec and self.interaction_features and self.use_null_features_embed:
-            # rank by summed prior covariance trace across x,y,z (smaller = sharper/more confident)
-            total_var = cov_kp.diagonal(dim1=-2, dim2=-1).sum(-1)     # <-- CHANGED: trace(cov) per keypoint, shape [B, n_kp_enc]
+            total_var = z_base_var.sum(-1)
             n_filter = self.n_kp_dec if not warmup else min(self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc))
             _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
-
-            batch_ind   = torch.arange(z.shape[0], device=z.device)[:, None]
-            z_app       = z[batch_ind, embed_ind].contiguous()          # [B, n_kp_dec, 3]
-            z_scale_app = z_scale[batch_ind, embed_ind].contiguous()    # [B, n_kp_dec, 3]
-
-            stage2_dict = self.encode_appearance(
-                x, z_app, z_scale_app, deterministic=deterministic,
-                timesteps=timestep_horizon, obj_on=None
-            )
-
+            # make selection
+            batch_ind = torch.arange(z.shape[0], device=z.device)[:, None]
+            z_app = z[batch_ind, embed_ind].contiguous()
+            z_scale_app = z_scale[batch_ind, embed_ind].contiguous()
+            stage2_dict = self.encode_appearance(x, z_app, z_scale_app, deterministic=deterministic,
+                                                 timesteps=timestep_horizon, obj_on=None)
             # unpack
-            cropped_objects     = stage2_dict['cropped_objects']
-            mu_features_app     = stage2_dict['mu_features']
-            mu_depth_features   = stage2_dict['mu_depth_features']         # None
-            logvar_features     = stage2_dict['logvar_features']           # None
-            logvar_depth_features = stage2_dict['logvar_depth_features']   # None
-            z_features_app      = stage2_dict['z_features']
-            z_depth_features    = stage2_dict['z_depth_features']
+            cropped_objects = stage2_dict['cropped_objects']
+            mu_features_app = stage2_dict['mu_features']
+            logvar_features = stage2_dict['logvar_features']  # None
+            z_features_app = stage2_dict['z_features']
 
             mu_features = self.null_feature_embed.repeat(z.shape[0], self.n_kp_enc, 1)
             mu_features[batch_ind, embed_ind] = mu_features_app
 
-            mu_features_depth = self.null_feature_depth_embed.repeat(z.shape[0], self.n_kp_enc, 1)
-            mu_features_depth[batch_ind, embed_ind] = mu_depth_features
-
             z_features = mu_features
-            z_depth_features = mu_features_depth
 
         else:
-            stage2_dict = self.encode_appearance(
-                x, z, z_scale, deterministic=deterministic, timesteps=timestep_horizon, obj_on=None
-            )
+            stage2_dict = self.encode_appearance(x, z, z_scale, deterministic=deterministic, timesteps=timestep_horizon,
+                                                 obj_on=None)
             # unpack
-            cropped_objects       = stage2_dict['cropped_objects']
-            mu_features           = stage2_dict['mu_features']
-            logvar_features       = stage2_dict['logvar_features']
-            z_features            = stage2_dict['z_features']
-            z_depth_features      = stage2_dict['z_depth_features']
+            cropped_objects = stage2_dict['cropped_objects']
+            mu_features = stage2_dict['mu_features']
+            logvar_features = stage2_dict['logvar_features']
+            z_features = stage2_dict['z_features']
 
         # reshape to [bs, T, ...]
-        z_base       = z_base.view(bs, timestep_horizon, *z_base.shape[1:])
-        z_base_var   = z_base_var.view(bs, timestep_horizon, *z_base_var.shape[1:])
+        z_base = z_base.view(bs, timestep_horizon, *z_base.shape[1:])
+        z_base_var = z_base_var.view(bs, timestep_horizon, *z_base_var.shape[1:])
         if patch_id_embed is not None:
             patch_id_embed = patch_id_embed.view(bs, timestep_horizon, *patch_id_embed.shape[1:])
-        mu_offset    = mu_offset.view(bs, timestep_horizon, *mu_offset.shape[1:])
-        logvar_offset= logvar_offset.view(bs, timestep_horizon, *logvar_offset.shape[1:])
-        z_offset     = z_offset.view(bs, timestep_horizon, *z_offset.shape[1:])
-        mu_tot       = mu_tot.view(bs, timestep_horizon, *mu_tot.shape[1:])
-        z            = z.view(bs, timestep_horizon, *z.shape[1:])
-        mu_scale     = mu_scale.view(bs, timestep_horizon, *mu_scale.shape[1:])
+        mu_offset = mu_offset.view(bs, timestep_horizon, *mu_offset.shape[1:])
+        logvar_offset = logvar_offset.view(bs, timestep_horizon, *logvar_offset.shape[1:])
+        z_offset = z_offset.view(bs, timestep_horizon, *z_offset.shape[1:])
+        mu_tot = mu_tot.view(bs, timestep_horizon, *mu_tot.shape[1:])
+        z = z.view(bs, timestep_horizon, *z.shape[1:])
+        mu_scale = mu_scale.view(bs, timestep_horizon, *mu_scale.shape[1:])
         if logvar_scale is not None:
             logvar_scale = logvar_scale.view(bs, timestep_horizon, *logvar_scale.shape[1:])
-        z_scale      = z_scale.view(bs, timestep_horizon, *z_scale.shape[1:])
+        z_scale = z_scale.view(bs, timestep_horizon, *z_scale.shape[1:])
         if not self.interaction_features:
-            mu_features     = mu_features.view(bs, timestep_horizon, *mu_features.shape[1:])
+            mu_features = mu_features.view(bs, timestep_horizon, *mu_features.shape[1:])
             logvar_features = logvar_features.view(bs, timestep_horizon, *logvar_features.shape[1:])
-        z_features    = z_features.view(bs, timestep_horizon, *z_features.shape[1:])
-        if z_depth_features is not None:
-            z_depth_features = z_depth_features.view(bs, timestep_horizon, *z_depth_features.shape[1:])
+        z_features = z_features.view(bs, timestep_horizon, *z_features.shape[1:])
         cropped_objects = cropped_objects.view(-1, *cropped_objects.shape[2:])
         if not self.interaction_depth:
-            mu_depth     = mu_depth.view(bs, timestep_horizon, *mu_depth.shape[1:])
+            mu_depth = mu_depth.view(bs, timestep_horizon, *mu_depth.shape[1:])
             logvar_depth = logvar_depth.view(bs, timestep_horizon, *logvar_depth.shape[1:])
-            z_depth      = z_depth.view(bs, timestep_horizon, *z_depth.shape[1:])
+            z_depth = z_depth.view(bs, timestep_horizon, *z_depth.shape[1:])
         if not self.interaction_obj_on:
-            obj_on_a   = obj_on_a.view(bs, timestep_horizon, *obj_on_a.shape[1:])
-            obj_on_b   = obj_on_b.view(bs, timestep_horizon, *obj_on_b.shape[1:])
-            mu_obj_on  = mu_obj_on.view(bs, timestep_horizon, *mu_obj_on.shape[1:])
-            z_obj_on   = z_obj_on.view(bs, timestep_horizon, *z_obj_on.shape[1:])
-        mu_score     = mu_score.view(bs, timestep_horizon, *mu_score.shape[1:])
+            obj_on_a = obj_on_a.view(bs, timestep_horizon, *obj_on_a.shape[1:])
+            obj_on_b = obj_on_b.view(bs, timestep_horizon, *obj_on_b.shape[1:])
+            mu_obj_on = mu_obj_on.view(bs, timestep_horizon, *mu_obj_on.shape[1:])
+            z_obj_on = z_obj_on.view(bs, timestep_horizon, *z_obj_on.shape[1:])
+        mu_score = mu_score.view(bs, timestep_horizon, *mu_score.shape[1:])
         logvar_score = logvar_score.view(bs, timestep_horizon, *logvar_score.shape[1:])
-        z_score      = z_score.view(bs, timestep_horizon, *z_score.shape[1:])
+        z_score = z_score.view(bs, timestep_horizon, *z_score.shape[1:])
 
-        encode_dict = {
-            'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base),
-            'z_base': z_base, 'z': z,
-            'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
-            'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
-            'z_depth_features': z_depth_features,
-            'cropped_objects': cropped_objects.detach(), 'patch_id_embed': patch_id_embed,
-            'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
-            'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
-            'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
-            'kp_p': kp_p, 'cov_kp': cov_kp, 'var_kp': var_kp,             
-            'z_base_var': z_base_var, 'mu_score': mu_score,
-            'logvar_score': logvar_score, 'z_score': z_score
-        }
+        encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
+                       'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
+                       'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
+                       'cropped_objects': cropped_objects.detach(), 'patch_id_embed': patch_id_embed,
+                       'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
+                       'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
+                       'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
+                       'kp_p': kp_p, 'var_kp': var_kp, 'z_base_var': z_base_var, 'mu_score': mu_score,
+                       'logvar_score': logvar_score, 'z_score': z_score}
         return encode_dict
-
 
     def forward(self, x, deterministic=False, warmup=False):
         output_dict = self.encode_all(x, deterministic, warmup)
@@ -5044,9 +4795,6 @@ class DLPEncoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
-                 #RGBD 
-                 separate_depth_features=False, # use separate feature encoder for RGB and Depth channels
-                 depth_feature_dim=16, # feature dimension for depth channel
                  ):
         """
         DLP Encoder Module
@@ -5175,7 +4923,7 @@ class DLPEncoder(nn.Module):
         self.embed_init_std = embed_init_std
         self.projection_dim = projection_dim
         self.timestep_horizon = (timestep_horizon + 1) if timestep_horizon > 1 else 1
-        self.num_patches = int((image_size // self.patch_size) ** 3)
+        self.num_patches = int((image_size // self.patch_size) ** 2)
         self.attn_norm_type = attn_norm_type
         self.use_z_orig = use_z_orig
         self.interaction_depth = interaction_depth
@@ -5198,10 +4946,6 @@ class DLPEncoder(nn.Module):
         self.init_conv_layers = init_conv_layers  # initialize conv layers with normal dist
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
         self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
-
-        #RGBD
-        self.separate_depth_features = separate_depth_features
-        self.depth_feature_dim = depth_feature_dim
 
         self.register_buffer('scale_anchor', torch.tensor(np.log(anchor_s / (1 - anchor_s + 1e-5))))
         use_norm_layer = True  # norm layer in the pre-attention projections modules
@@ -5233,9 +4977,7 @@ class DLPEncoder(nn.Module):
                                             init_zero_bias=init_zero_bias,
                                             init_ssm_last_layer=init_ssm_last_layer,
                                             init_conv_layers=init_conv_layers,
-                                            init_conv_fg_std=init_conv_fg_std,
-                                            separate_depth_features=separate_depth_features,
-                                            depth_feature_dim=depth_feature_dim)
+                                            init_conv_fg_std=init_conv_fg_std)
 
         self.prior_encoder = self.particle_enc.prior_encoder
         self.bg_encoder = BgEncoder(cdim=cdim, image_size=image_size, pad_mode=pad_mode,
@@ -5251,23 +4993,14 @@ class DLPEncoder(nn.Module):
                                     init_conv_layers=init_conv_layers,
                                     init_conv_bg_std=init_conv_bg_std)
 
-        # centers already in kp_range, shape [N,3]
-        patch_centers = self.prior_encoder.get_patch_centers().unsqueeze(0)  # [1, N, 3]
-
-        # append 3D null particle (same device/dtype)
-        null_center = torch.zeros(1, 1, 3, device=patch_centers.device, dtype=patch_centers.dtype)
-        patch_centers = torch.cat([patch_centers, null_center], dim=1)       # [1, N+1, 3]
-
-        # keep as buffer
+        patch_centers = self.prior_encoder.get_patch_centers().unsqueeze(0) * (
+                self.kp_range[1] - self.kp_range[0]) + self.kp_range[0]
+        # append null particle
+        patch_centers = torch.cat([patch_centers, torch.zeros(1, 1, 2)], dim=1)
+        # self.patch_centers = patch_centers
         self.register_buffer('patch_centers', patch_centers)
-
-        # anchors: duplicate each patch center n_kp_per_patch times, exclude the null at the end
-        particle_anchors = (
-            patch_centers[:, :-1, :]                          # [1, N, 3]
-            .unsqueeze(2)                                     # [1, N, 1, 3]
-            .expand(-1, -1, self.n_kp_per_patch, -1)         # [1, N, n_kp_per_patch, 3]
-            .reshape(1, -1, 3)                                # [1, N*n_kp_per_patch, 3]
-        )
+        particle_anchors = patch_centers[:, :-1]  # [1, 1, n_kp_enc], no need for (0,0)-the bg
+        particle_anchors = particle_anchors.unsqueeze(-2).repeat(1, 1, self.n_kp_per_patch, 1).view(1, -1, 2)
 
         if self.use_particle_inter_enc:
             self.particle_inter_enc = ParticleInteractionEncoder(n_kp_enc=n_kp_enc, dropout=0.0,
@@ -5314,6 +5047,32 @@ class DLPEncoder(nn.Module):
 
         self.ctx_enc = ctx_enc
 
+        # if self.use_ctx_enc:
+        #     self.ctx_enc = ParticleContextSharedEncoder(n_kp_enc=n_kp_enc, dropout=dropout,
+        #                                                 learned_feature_dim=learned_feature_dim,
+        #                                                 learned_bg_feature_dim=learned_bg_feature_dim,
+        #                                                 embed_init_std=embed_init_std, projection_dim=pte_inner_dim,
+        #                                                 timestep_horizon=timestep_horizon, pte_layers=pte_ctx_layers,
+        #                                                 pte_heads=pte_ctx_heads,
+        #                                                 attn_norm_type=attn_norm_type,
+        #                                                 context_dim=context_dim,
+        #                                                 hidden_dim=pte_inner_dim,
+        #                                                 ctx_pool_mode=self.ctx_pool_mode,
+        #                                                 bg=True,
+        #                                                 particle_positional_embed=particle_positional_embed,
+        #                                                 particle_score=self.particle_score,
+        #                                                 causal=self.causal_ctx, norm_layer=use_norm_layer,
+        #                                                 shared_logvar=False, ctx_dist=ctx_dist,
+        #                                                 n_ctx_categories=n_ctx_categories, n_ctx_classes=n_ctx_classes,
+        #                                                 particle_anchors=particle_anchors, use_z_orig=self.use_z_orig,
+        #                                                 global_ctx_pool=self.global_ctx_pool,
+        #                                                 ctx_pool_dim=self.pool_ctx_dim,
+        #                                                 n_pool_ctx_categories=self.n_pool_ctx_categories,
+        #                                                 n_pool_ctx_classes=self.n_pool_ctx_classes,
+        #                                                 global_local_fuse_mode=global_local_fuse_mode,
+        #                                                 condition_local_on_global=condition_local_on_global)
+        # else:
+        #     self.ctx_enc = None
 
         self.init_weights()
 
@@ -5324,7 +5083,7 @@ class DLPEncoder(nn.Module):
         # if self.with_ctx:
         #     self.ctx_enc.init_weights()
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 pass
                 # nn.init.normal_(m.weight, 0, 0.01)
                 # if m.bias is not None:
@@ -5340,99 +5099,83 @@ class DLPEncoder(nn.Module):
                 #    nn.init.constant_(m.bias, 0)
                 # use pytorch's default
                 pass
+
     def get_bg_mask_from_particle_glimpses(self, z, z_obj_on, mask_size, z_scale=None, detach_grad=True):
         """
-        3D version.
-        z:         [B, K, 3] in [-1, 1] (x, y, z)
-        z_obj_on:  [B, K] or [B, K, 1]
-        mask_size: int or (D, H, W) of the feature/grid you want the mask for
-        z_scale:   None or [B, K, 3] (unnormalized -> sigmoid)
-        Returns:
-        bg_mask: [B, 1, D, H, W]  (1 where background, 0 in object cubes)
+        generates a mask based on particles position and the scale. Masks are squares.
         """
         if detach_grad:
             with torch.no_grad():
                 if z_scale is None:
                     obj_fmap_masks = create_masks_fast(z.detach(), anchor_s=self.anchor_s, feature_dim=mask_size)
                 else:
-                    obj_fmap_masks = create_masks_with_scale(
-                        z.detach(), anchor_s=self.anchor_s, image_size=mask_size, scale=z_scale.detach()
-                    )
-                z_gate = (z_obj_on.detach() > 0.2).to(obj_fmap_masks.dtype)
-                if z_gate.dim() == 2:
-                    z_gate = z_gate[:, :, None, None, None, None]
-                else:
-                    z_gate = z_gate[:, :, None, None, None, None]  # ensure broadcast to [B,K,1,D,H,W]
+                    obj_fmap_masks = create_masks_with_scale(z.detach(), anchor_s=self.anchor_s, image_size=mask_size,
+                                                             scale=z_scale.detach())
+                z_gate = torch.where(z_obj_on.detach() > 0.2, 1.0, 0.0)[:, :, None, None, None]
                 obj_fmap_masks = obj_fmap_masks.clamp(0, 1) * z_gate
+                # obj_fmap_masks = obj_fmap_masks.clamp(0, 1) * z_obj_on[:, :, None, None, None].detach()
                 bg_mask = 1 - obj_fmap_masks.squeeze(2).sum(1, keepdim=True).clamp(0, 1)
         else:
-            # only z_obj_on gating is detached in original; keep the same spirit
-            if z_scale is None:
-                obj_fmap_masks = create_masks_fast(z, anchor_s=self.anchor_s, feature_dim=mask_size)
-            else:
-                obj_fmap_masks = create_masks_with_scale(
-                    z, anchor_s=self.anchor_s, image_size=mask_size, scale=z_scale
-                )
-            if z_obj_on.dim() == 2:
-                z_gate = (z_obj_on > 0.2).to(obj_fmap_masks.dtype)[:, :, None, None, None, None]
-            else:
-                z_gate = (z_obj_on > 0.2).to(obj_fmap_masks.dtype)[:, :, None, None, None, None]
-            obj_fmap_masks = obj_fmap_masks.clamp(0, 1) * z_gate
+            with torch.no_grad():
+                if z_scale is None:
+                    obj_fmap_masks = create_masks_fast(z, anchor_s=self.anchor_s, feature_dim=mask_size)
+                else:
+                    obj_fmap_masks = create_masks_with_scale(z, anchor_s=self.anchor_s, image_size=mask_size,
+                                                             scale=z_scale)
+            obj_fmap_masks = obj_fmap_masks.clamp(0, 1) * z_obj_on[:, :, None, None, None]
             bg_mask = 1 - obj_fmap_masks.squeeze(2).sum(1, keepdim=True).clamp(0, 1)
-
         return bg_mask
+
     def encode_all(self, x, deterministic=False, warmup=False, actions=None, actions_mask=None, lang_embed=None,
-                x_goal=None, deterministic_goal=True):
+                   x_goal=None, deterministic_goal=True):
         """
         encoding steps:
         1. encode bg: x -> bg_enc -> [bs * T, projection_dim]
         2. encode patches: x -> patch_enc -> [bs * T, n_patches, projection_dim ]
         3. encode particles: [patches, bg, particle_tokens, bg_token, ctx_token] -> pte -> [bs, T, n_particles + 2, dim]
         """
-        # make sure x is [bs, T, ch, h, w, l]
-        if len(x.shape) == 5:
-            # that means x: [bs, ch, h, w, l]
-            x = x.unsqueeze(1)  # -> [bs, T=1, ch, h, w, l]
-        bs, timestep_horizon, ch, D, H, W = x.shape
-
+        # make sure x is [bs, T, ch, h, w]
+        if len(x.shape) == 4:
+            # that means x: [bs, ch, h, w]
+            x = x.unsqueeze(1)  # -> [bs, T=1, ch, h, w]
+        bs, timestep_horizon, ch, h, w = x.shape
         if x_goal is not None:
-            if len(x_goal.shape) == 5:
-                x_goal = x_goal.unsqueeze(1)  # -> [bs, T=1, ch, h, w, l]
+            if len(x_goal.shape) == 4:
+                # that means x: [bs, ch, h, w]
+                x_goal = x_goal.unsqueeze(1)  # -> [bs, T=1, ch, h, w]
             x = torch.cat([x, x_goal], dim=1)  # [bs, T+1, ...]
-
-        # encode particles +++++++
+        # x = x.view(bs * timestep_horizon, *x.shape[2:])  # [bs * T, ch, h, w]
+        # encode particles
         particle_dict = self.particle_enc(x, deterministic, warmup)
+        # unpack
+        kp_p = particle_dict['kp_p']
+        var_kp = particle_dict['var_kp']
+        patch_id_embed = particle_dict['patch_id_embed']
+        z_base = particle_dict['z_base']
+        z = particle_dict['z']
+        mu_offset = particle_dict['mu_offset']
+        logvar_offset = particle_dict['logvar_offset']
+        z_offset = particle_dict['z_offset']
+        mu_tot = particle_dict['mu_tot']
+        z_base_var = particle_dict['z_base_var']
+        mu_scale = particle_dict['mu_scale']
+        logvar_scale = particle_dict['logvar_scale']
+        z_scale = particle_dict['z_scale']
+        mu_depth = particle_dict['mu_depth']
+        logvar_depth = particle_dict['logvar_depth']
+        z_depth = particle_dict['z_depth']
+        obj_on_a = particle_dict['obj_on_a']
+        obj_on_b = particle_dict['obj_on_b']
+        mu_obj_on = particle_dict['mu_obj_on']
+        z_obj_on = particle_dict['z_obj_on']
+        mu_features = particle_dict['mu_features']
+        logvar_features = particle_dict['logvar_features']
+        z_features = particle_dict['z_features']
+        cropped_objects = particle_dict['cropped_objects']
 
-        kp_p              = particle_dict['kp_p']
-        cov_kp            = particle_dict['cov_kp']        # full [bs,T,n_kp,3,3]
-        var_kp            = particle_dict['var_kp']        # diag only [bs,T,n_kp,3]
-        patch_id_embed    = particle_dict['patch_id_embed']
-        z_base            = particle_dict['z_base']
-        z                 = particle_dict['z']
-        mu_offset         = particle_dict['mu_offset']
-        logvar_offset     = particle_dict['logvar_offset']
-        z_offset          = particle_dict['z_offset']
-        mu_tot            = particle_dict['mu_tot']
-        z_base_var        = particle_dict['z_base_var']
-        mu_scale          = particle_dict['mu_scale']
-        logvar_scale      = particle_dict['logvar_scale']
-        z_scale           = particle_dict['z_scale']
-        mu_depth          = particle_dict['mu_depth']
-        logvar_depth      = particle_dict['logvar_depth']
-        z_depth           = particle_dict['z_depth']
-        obj_on_a          = particle_dict['obj_on_a']
-        obj_on_b          = particle_dict['obj_on_b']
-        mu_obj_on         = particle_dict['mu_obj_on']
-        z_obj_on          = particle_dict['z_obj_on']
-        mu_features       = particle_dict['mu_features']
-        logvar_features   = particle_dict['logvar_features']
-        z_features        = particle_dict['z_features']
-        cropped_objects   = particle_dict['cropped_objects']
-
-        z_score           = particle_dict['z_score']
-        mu_score          = particle_dict['mu_score']
-        logvar_score      = particle_dict['logvar_score']
-        # -------------------------------------------
+        z_score = particle_dict['z_score']
+        mu_score = particle_dict['mu_score']
+        logvar_score = particle_dict['logvar_score']
 
         if x_goal is not None and deterministic_goal:
             z = torch.cat([z[:, :-1], mu_tot[:, -1:]], dim=1)
@@ -5444,32 +5187,28 @@ class DLPEncoder(nn.Module):
             if not self.interaction_features:
                 z_features = torch.cat([z_features[:, :-1], mu_features[:, -1:]], dim=1)
 
-        # +++++++ encode bg +++++++
-        # x: [bs, T, ch, h, w, l]  ->  [bs*T, ch, h, w, l]
-        x  = x.view(-1, *x.shape[2:])
-        z_v = z.view(-1, *z.shape[2:])  # [bs*T, n_kp_enc, 3]
-
+        # encode bg
+        # x = x.view(bs * timestep_horizon, *x.shape[2:])  # [bs * T, ch, h, w]
+        x = x.view(-1, *x.shape[2:])  # [bs * T, ch, h, w]
+        z_v = z.view(-1, *z.shape[2:])
         if self.n_kp_dec != self.n_kp_enc:
-            # variance filtering (use summed prior variance / score; last dim can be 3 or 4)
-            total_var = z_base_var.view(-1, *z_base_var.shape[2:]).sum(-1)  # [bs*T, n_kp_enc]
+            # variance filtering
+            total_var = z_base_var.view(-1, *z_base_var.shape[2:]).sum(-1)
             n_filter = self.n_kp_dec if not warmup else min(self.n_kp_dec, int(self.warmup_n_kp_ratio * self.n_kp_enc))
             _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
             # make selection
             batch_ind = torch.arange(z_v.shape[0], device=z_v.device)[:, None]
-            z_v = z_v[batch_ind, embed_ind]  # [bs*T, n_kp_dec, 3]
+            z_v = z_v[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 2]
 
         if self.interaction_obj_on:
-            z_obj_on_v = torch.ones(z_v.shape[0], z_v.shape[1], device=x.device, dtype=torch.float)
+            z_obj_on_v = torch.ones(-1, z_v.shape[1], device=x.device, dtype=torch.float)
         else:
-            # z_obj_on: [bs, T, n_kp, 1] -> [bs*T, n_kp]
             z_obj_on_v = z_obj_on.view(-1, *z_obj_on.shape[2:]).squeeze(-1)
             if self.n_kp_dec != self.n_kp_enc:
-                z_obj_on_v = z_obj_on_v[batch_ind, embed_ind]  # [bs*T, n_kp_dec]
+                z_obj_on_v = z_obj_on_v[batch_ind, embed_ind]  # [bs * T, n_kp_enc, 1]
 
         if self.mask_bg_in_enc:
-            bg_enc_mask = self.get_bg_mask_from_particle_glimpses(
-                    z_v, z_obj_on_v, mask_size=(x.shape[-3], x.shape[-2], x.shape[-1])
-                )
+            bg_enc_mask = self.get_bg_mask_from_particle_glimpses(z_v, z_obj_on_v, mask_size=x.shape[-1])
             bg_dict = self.bg_encoder(x, bg_enc_mask, deterministic, timestep_horizon)
         else:
             bg_enc_mask = None
@@ -5592,7 +5331,7 @@ class DLPEncoder(nn.Module):
             mu_score = mu_score[:, :-1].contiguous()
             logvar_score = logvar_score[:, :-1].contiguous()
             z_score = z_score[:, :-1].contiguous()
-        # TODO: Make sure all the necessary information from the depth encoding is returned and USED
+
         encode_dict = {'mu_anchor': z_base, 'logvar_anchor': torch.zeros_like(z_base), 'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset, 'mu_tot': mu_tot,
                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
@@ -5665,9 +5404,6 @@ class DLPDecoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
-                 
-                 separate_depth_features=False,  # separate depth features when using RGBD input
-                 depth_feature_dim=4,  # depth feature dimension (if separate_depth_features)
                  ):
         """
         DLP Decoder Module
@@ -5748,29 +5484,25 @@ class DLPDecoder(nn.Module):
         self.init_conv_fg_std = init_conv_fg_std  # std for conv fg normal dist
         self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
 
-        self.separate_depth_features = separate_depth_features
-        self.depth_feature_dim = depth_feature_dim
         # object decoder
         if self.context_dim > 0 and self.decode_with_ctx:
             particle_dec_net = ObjectDecoderCNNFILM
         else:
             particle_dec_net = ObjectDecoderCNN
-        
+        self.particle_dec = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=4,
+                                             bottleneck_size=learned_feature_dim,
+                                             use_resblock=self.use_resblock,
+                                             pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,
+                                             res_from_fc=obj_res_from_fc,
+                                             ch_mult=obj_ch_mult, base_ch=obj_base_ch, final_cnn_ch=obj_final_cnn_ch,
+                                             num_res_blocks=num_res_blocks, cnn_mid_blocks=cnn_mid_blocks,
+                                             mlp_hidden_dim=mlp_hidden_dim,
+                                             init_zero_bias=init_zero_bias,
+                                             init_conv_layers=init_conv_layers,
+                                             init_conv_fg_std=init_conv_fg_std
+                                             )
 
-        self.particle_dec = particle_dec_net(patch_size=self.obj_patch_size, num_chans=cdim + 1,
-                                            bottleneck_size=learned_feature_dim,
-                                            use_resblock=self.use_resblock,
-                                            pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,
-                                            res_from_fc=obj_res_from_fc,
-                                            ch_mult=obj_ch_mult, base_ch=obj_base_ch, final_cnn_ch=obj_final_cnn_ch,
-                                            num_res_blocks=num_res_blocks, cnn_mid_blocks=cnn_mid_blocks,
-                                            mlp_hidden_dim=mlp_hidden_dim,
-                                            init_zero_bias=init_zero_bias,
-                                            init_conv_layers=init_conv_layers,
-                                            init_conv_fg_std=init_conv_fg_std
-                                            )
-
-        self.num_obj_upsample = self.particle_dec.num_upsample # TODO:This never gets used
+        self.num_obj_upsample = self.particle_dec.num_upsample
         # bg decoder
         self.bg_dec = BgDecoder(cdim=cdim, image_size=image_size,
                                 pad_mode='replicate', learned_bg_feature_dim=learned_bg_feature_dim,
@@ -5788,7 +5520,7 @@ class DLPDecoder(nn.Module):
 
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, nn.Conv2d):
                 pass
             elif isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
                 nn.init.constant_(m.weight, 1)
@@ -5799,192 +5531,102 @@ class DLPDecoder(nn.Module):
 
     def translate_patches(self, kp_batch, patches_batch, scale=None, translation=None, scale_normalized=False):
         """
-        3D version.
-        kp_batch:      [B, N, 3] in [-1, 1]
-        patches_batch: [B, N, Cpatch, ps, ps, ps]
-        scale:         None or [B, N, 3] or [B, N, 1]
-        returns:       [B, N, Cpatch, H, W, L]
+        translate patches to be centered around given keypoints
+        kp_batch: [bs, n_kp, 2] in [-1, 1]
+        patches: [bs, n_kp, ch_patches, patch_size, patch_size]
+        scale: None or [bs, n_kp, 2] or [bs, n_kp, 1]
+        translation: None or [bs, n_kp, 2] or [bs, n_kp, 1] (delta from kp)
+        scale_normalized: False if scale is not in [0, 1]
+        :return: translated_padded_patches [bs, n_kp, ch, img_size, img_size]
         """
-        B, N, Cpatch, ps, _, _ = patches_batch.shape
-        H = W = self.feature_map_size
-        L = self.feature_map_size  # use one cube size for now (keeps parity with encoder)
-
+        batch_size, n_kp, ch_patch, patch_size, _ = patches_batch.shape
+        # img_size = self.image_size
+        img_size = self.feature_map_size
         if scale is None:
-            z_scale = torch.tensor([ps / H, ps / W, ps / L], device=kp_batch.device, dtype=kp_batch.dtype)
-            z_scale = z_scale.view(1, 1, 3).expand_as(kp_batch)      # [B, N, 3]
+            z_scale = (patch_size / img_size) * torch.ones_like(kp_batch)
         else:
-            z_scale = scale if scale_normalized else torch.sigmoid(scale)
-
-        z_pos   = kp_batch.reshape(-1, 3)                             # [B*N, 3]
-        z_scale = z_scale.view(-1, z_scale.shape[-1])                 # [B*N, 3]
-
-        patches_batch = patches_batch.reshape(-1, Cpatch, ps, ps, ps) # [B*N, Cpatch, ps, ps, ps]
-        out_dims = (B * N, Cpatch, H, W, L)
-
-        # uses your 3D spatial_transform (already upgraded earlier)
-        trans = spatial_transform(
-            patches_batch, z_pos, z_scale, out_dims, inverse=True, padding_mode='border'
-        )
-        return trans.view(B, N, Cpatch, H, W, L)
-
-
-    def decode_rgb_unified(self, z_kp, z_features, z_scale=None, z_ctx=None, translation=None):
-        """
-        Unified decoder path (3D) that supports arbitrary content channels.
-        Expect at least 2 channels: [alpha, content...]
-        - particle_dec outputs C over a cube [ps, ps, ps]
-        - translate to [B, N, C, H, W, L]
-        Returns:
-        dec_patches: [B,N,C,ps,ps,ps]
-        a_obj:       [B,N,1,H,W,L]
-        content_obj: [B,N,Cc,H,W,L]  (Cc can be 1 for occupancy, 3 for RGB, etc.)
-        d_obj:       [B,N,1,H,W,L] or None
-        """
-        patches = self.particle_dec(z_features, context=z_ctx)                 # [B*N, C, ps, ps, ps]
-        patches = patches.view(-1, z_kp.shape[1], *patches.shape[1:])         # [B, N, C, ps, ps, ps]
-        patches_t = self.translate_patches(z_kp, patches, z_scale, translation)  # [B,N,C,H,W,L]
-
-        C = patches_t.shape[2]
-        if C < 2:
-            raise ValueError(f"Decoder must output at least 2 channels (alpha + content). Got C={C}.")
-
-        a_obj        = patches_t[:, :, :1]            # [B,N,1,H,W,L]
-        content_obj  = patches_t[:, :, 1:]            # [B,N,Cc,H,W,L]
-        d_obj        = None                           # keep unified; handle separate depth only if you add it later
-        return patches, a_obj, content_obj, d_obj
-
-
-    def composite_with_depth(self, a_obj, content_obj, obj_on, z_depth, d_obj=None, eps=1e-5):
-        """
-        Channel-agnostic 3D compositing.
-        a_obj:       [B,N,1,H,W,L]          (alpha from each object)
-        content_obj: [B,N,Cc,H,W,L]         (Cc arbitrary: 1 for occupancy, 3 for RGB, etc.)
-        obj_on:      [B,N] or [B,N,1]
-        z_depth:     [B,N,1]
-        d_obj:       [B,N,1,H,W,L] or None
-        Returns:
-        a_used:      [B,N,1,H,W,L]
-        bg_mask:     [B,1,H,W,L]
-        content_comp:[B,Cc,H,W,L]         (Cc matches content_obj channels)
-        depth_comp:  [B,1,H,W,L] or None
-        """
-        if obj_on.dim() == 3:
-            obj_on = obj_on.squeeze(-1)               # [B,N]
-
-        gate   = obj_on[:, :, None, None, None, None] # [B,N,1,1,1,1]
-        a_obj  = gate * a_obj                         # [B,N,1,H,W,L]
-        cont   = a_obj * content_obj                  # [B,N,Cc,H,W,L]
-
-        # importance/ordering from depth
-        imp = a_obj * torch.sigmoid(-z_depth[:, :, :, None, None, None])   # [B,N,1,H,W,L]
-        imp = imp / (imp.sum(dim=1, keepdim=True) + eps)
-
-        content_comp = (cont * imp).sum(dim=1)        # [B,Cc,H,W,L]
-        depth_comp   = (d_obj * imp).sum(dim=1) if d_obj is not None else None
-        bg_mask      = 1.0 - (imp * a_obj).sum(dim=1) # [B,1,H,W,L]
-        a_used       = imp * a_obj
-        return a_used, bg_mask, content_comp, depth_comp
-
-
-    def decode_objects(
-        self, z_kp, z_features, obj_on, z_scale=None, translation=None, z_depth=None,
-        z_ctx=None,
-    ):
-        """
-        If self.separate_depth_features:
-            - use particle_dec_rgb on z_features (RGB features)
-            - use particle_dec_depth on z_depth_features (Depth features)
-        Else:
-            - use particle_dec on z_features (unified: α+RGB or α+RGB+D)
-        """
-
-        dec_rgb_patches, a_obj, rgb_obj, d_obj = self.decode_rgb_unified(
-            z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation
-        )
-        dec_depth_patches = None  # unified depth is not per-patch separate object unless you want to expose it
-
-        # Composite (always uses z_depth for ordering)
-        alpha_masks, bg_mask, dec_rgb_comp, dec_depth_comp = self.composite_with_depth(
-            a_obj, rgb_obj, obj_on=obj_on, z_depth=z_depth, d_obj=d_obj
-        )
-
-        return dec_rgb_patches, dec_rgb_comp, alpha_masks, bg_mask, dec_depth_comp, dec_depth_patches
-
-    def decode_all(
-        self, z, z_scale, z_features, obj_on, z_depth,
-        z_bg_features, z_ctx=None, warmup=False
-    ):
-        # ---- flatten time exactly like your original ----
-        if len(z.shape) == 4:
-            B, T = z.shape[0], z.shape[1]
-            z              = z.view(-1, *z.shape[2:])
-            z_scale        = z_scale.view(-1, *z_scale.shape[2:])
-            obj_on         = obj_on.view(-1, *obj_on.shape[2:])
-            z_depth        = z_depth.view(-1, *z_depth.shape[2:])
-            z_features     = z_features.view(-1, *z_features.shape[2:])
-            z_bg_features  = z_bg_features.view(-1, *z_bg_features.shape[2:])
-            if z_ctx is not None:
-                z_ctx = z_ctx.view(-1, *z_ctx.shape[2:])
-        else:
-            T = 1
-
-        # ensure obj_on is [B*, N] (drop trailing 1 if present)
-        if obj_on.dim() == 3:
-            obj_on = obj_on.squeeze(-1)
-
-        # ---- decode objects (returns comps in spatial dims; 2D or 3D handled downstream) ----
-        (dec_objects, dec_objects_trans, alpha_masks, bg_mask,
-        dec_depth_trans, dec_depth_patches) = self.decode_objects(
-            z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale, z_ctx=z_ctx
-        )
-
-        # ---- background (RGB / RGBD / occupancy) ----
-        bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C, *spatial*]
-
-        # detect spatial dimensionality (2D: nd=4, 3D: nd=5)
-        spatial = bg_rec.shape[2:]   # (... H, W) or (D, H, W)
-        C_bg    = bg_rec.shape[1]
-
-        # ---- composite RGB (only if background carries >=3 channels) ----
-        # dec_objects_trans is already the composited foreground RGB over alpha/order
-        if C_bg >= 3:
-            rec_rgb = bg_mask * bg_rec[:, :3, ...] + dec_objects_trans
-        else:
-            # no RGB channels in bg (e.g., occupancy-only). Use FG only.
-            rec_rgb = dec_objects_trans
-
-        # ---- composite DEPTH (optional) ----
-        rec_depth = None
-        have_obj_depth = (dec_depth_trans is not None)
-        have_bg_depth  = (C_bg > 3)  # bg output has a 4th channel as depth
-
-        if have_obj_depth or have_bg_depth:
-            bg_depth = bg_rec[:, 3:4, ...] if have_bg_depth else (
-                torch.zeros_like(dec_depth_trans) if dec_depth_trans is not None else None
-            )
-            if bg_depth is None:
-                rec_depth = dec_depth_trans
-            elif dec_depth_trans is None:
-                rec_depth = bg_depth
+            # normalize to [0, 1]
+            if scale_normalized:
+                z_scale = scale
             else:
-                rec_depth = bg_mask * bg_depth + dec_depth_trans
+                z_scale = torch.sigmoid(scale)  # -> [0, 1]
+        z_pos = kp_batch.reshape(-1, kp_batch.shape[-1])  # [bs * n_kp, 2]
+        z_scale = z_scale.view(-1, z_scale.shape[-1])  # [bs * n_kp, 2]
+        patches_batch = patches_batch.reshape(-1, *patches_batch.shape[2:])
+        out_dims = (batch_size * n_kp, ch_patch, img_size, img_size)
+        trans_patches_batch = spatial_transform(patches_batch, z_pos, z_scale, out_dims, inverse=True)
+        trans_padded_patches_batch = trans_patches_batch.view(batch_size, n_kp, *trans_patches_batch.shape[1:])
+        # [bs, n_kp, ch, img_size, img_size]
+        return trans_padded_patches_batch
 
-        # ---- final stack (RGB [+ depth] if present) ----
-        rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
+    def get_objects_alpha_rgb(self, z_kp, z_features, z_scale=None, z_ctx=None, translation=None):
+        # decode the latent particles into RGBA glimpses and place them on the canvas
+        dec_objects = self.particle_dec(z_features, context=z_ctx)  # [bs * n_kp, 4, patch_size, patch_size]
+        dec_objects = dec_objects.view(-1, z_kp.shape[1],
+                                       *dec_objects.shape[1:])  # [bs, n_kp, 4, patch_size, patch_size]
+        # translate patches - place the decoded glimpses on the canvas
+        dec_objects_trans = self.translate_patches(z_kp, dec_objects, z_scale, translation)
+        # dec_objects_trans: [bs, n_kp, 3, im_size, im_size]
+        # multiply by alpha channel
+        a_obj, rgb_obj = torch.split(dec_objects_trans, [1, dec_objects_trans.shape[2] - 1], dim=2)
+        return dec_objects, a_obj, rgb_obj
 
-        return {
-            'rec': rec,                               # [B*, C{3 or 4}, *spatial*]
-            'dec_objects': dec_objects,               # per-patch before translation
-            'dec_objects_trans': dec_objects_trans,   # FG RGB composite into image/volume space
-            'alpha_masks': alpha_masks,               # [B*, N, 1, *spatial*]
-            'bg_mask': bg_mask,                       # [B*, 1, *spatial*]
-            'bg_rec': bg_rec,                         # [B*, C_bg, *spatial*]
-            'rec_rgb': rec_rgb,                       # [B*, 3, *spatial*] if RGB available, else FG-only
-            'rec_depth': rec_depth,                   # [B*, 1, *spatial*] or None
-            'dec_depth_trans': dec_depth_trans,       # FG depth composite or None
-            'dec_depth_patches': dec_depth_patches,   # (kept for API parity)
-        }
+    def get_objects_alpha_rgb_with_depth(self, a_obj, rgb_obj, obj_on, z_depth, eps=1e-5):
+        # stitching the glimpses by factoring the alpha maps and the particle's inferred depth
+        # obj_on: [bs, n_kp, 1]
+        # z_depth: [bs, n_kp, 1]
+        n_kp = a_obj.shape[1]
+        # turn off inactive particles
+        a_obj = obj_on[:, :, None, None, None] * a_obj  # [bs, n_kp, 1, im_size, im_size]
+        rgba_obj = a_obj * rgb_obj
+        # normalize
+        importance_map = a_obj * torch.sigmoid(-z_depth[:, :, :, None, None])
+        importance_map = importance_map / (torch.sum(importance_map, dim=1, keepdim=True) + eps)
+        # this imitates softmax to move objects on the depth axis
+        dec_objects_trans = (rgba_obj * importance_map).sum(dim=1)
+        alpha_mask = 1.0 - (importance_map * a_obj).sum(dim=1)
+        a_obj = importance_map * a_obj
+        return a_obj, alpha_mask, dec_objects_trans
 
+    def decode_objects(self, z_kp, z_features, obj_on, z_scale=None, translation=None, z_depth=None,
+                       z_ctx=None):
+        # stitching the decoded latent particles -> RGB, factoring the alpha maps and depths
+        dec_objects, a_obj, rgb_obj = self.get_objects_alpha_rgb(z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx,
+                                                                 translation=translation)
+        alpha_masks, bg_mask, dec_objects_trans = self.get_objects_alpha_rgb_with_depth(a_obj, rgb_obj, obj_on=obj_on,
+                                                                                        z_depth=z_depth)
+        return dec_objects, dec_objects_trans, alpha_masks, bg_mask
+
+    def decode_all(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, z_ctx=None,
+                   warmup=False):
+        if len(z.shape) == 4:
+            # z: [bs, T, n_kp, 2]
+            batch_size = z.shape[0]
+            timesteps = z.shape[1]
+            z = z.view(-1, *z.shape[2:])  # [bs * T, n_kp, 2]
+            z_scale = z_scale.view(-1, *z_scale.shape[2:])  # [bs * T, n_kp, 2]
+            obj_on = obj_on.view(-1, *obj_on.shape[2:])  # [bs * T, n_kp, 1]
+            z_depth = z_depth.view(-1, *z_depth.shape[2:])  # [bs * T, n_kp, 1]
+            z_features = z_features.view(-1, *z_features.shape[2:])  # [bs * T, n_kp, feature_dim]
+            z_bg_features = z_bg_features.view(-1, *z_bg_features.shape[2:])  # [bs * T, feature_dim]
+            if z_ctx is not None:
+                z_ctx = z_ctx.view(-1, *z_ctx.shape[2:])  # [bs * T, feature_dim]
+        else:
+            timesteps = 1
+        # z: [bs * T, ...]
+        # squeeze the last dimension of `obj_on`:
+        if len(obj_on.shape) == 3:
+            obj_on = obj_on.squeeze(-1)
+        # a wrapper function to decode latent particles into and RGB image
+        object_dec_out = self.decode_objects(z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale,
+                                             z_ctx=z_ctx)
+        dec_objects, dec_objects_trans, alpha_masks, bg_mask = object_dec_out
+        bg_rec = self.bg_dec(z_bg_features, z_ctx)
+        rec = bg_mask * bg_rec + dec_objects_trans
+        decoder_out = {'rec': rec, 'dec_objects': dec_objects, 'dec_objects_trans': dec_objects_trans,
+                       'bg_mask': bg_mask, 'alpha_masks': alpha_masks, 'bg_rec': bg_rec}
+
+        return decoder_out
 
     def forward(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx=None,
                 warmup=False):

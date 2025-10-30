@@ -1238,6 +1238,7 @@ class DLP(nn.Module):
         dec_objects_trans = dec_dict['dec_objects_trans']
         alpha_masks = dec_dict['alpha_masks']
         rec = dec_dict['rec']
+
         bg_rec = dec_dict['bg_rec']
 
         rec_rgb = dec_dict['rec_rgb']

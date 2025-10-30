@@ -30,7 +30,7 @@ from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, 
                             topk_indices_from_output, wandb_log_iter_losses)
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
-from eval.eval_vox import log_vox_overlay_plotly, log_vox_isoseries, topk_kps_from_variance
+from eval.eval_vox import log_vox_overlay_plotly, log_vox_isoseries, topk_kps_from_variance, extract_volumes_for_vis, print_vol_stats
 import wandb
 
 matplotlib.use("Agg")
@@ -202,7 +202,16 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     voxel_grid_whd = config["voxel_grid_whd"]
 
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
-
+    # vox_ds = VoxelizedDataset(
+    #     base_ds=dataset,
+    #     grid_whd=voxel_grid_whd,          # (W,H,D) in your class name, but tensors come out [C,D,H,W]
+    #     mode="density",                 # "occupancy" | "density" | "moments" | "avg_rgb"
+    #     bounds_mode="global",           # "per_item" | "global" | ((pmin),(pmax))
+    #     keep_points=False,              # True to also return original points
+    #     device=torch.device("cpu"),     # keep CPU if you use DataLoader workers
+    #     cache_dir="./cache/vox_48_dense",  # speeds up future runs
+    #     force_rebuild=False
+    # )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
     # model
@@ -404,7 +413,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
             vox  = batch["voxels"].to(device)  
-
+            print("VOX SHAPE:", vox.shape)
             # mask = batch["mask"].to(device) 
 
             warmup = (epoch < warmup_epoch)
@@ -516,6 +525,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         print(log_str)
         log_line(log_dir, log_str)
 
+        wandb.log({**{f"epoch/{k}": v for k, v in means.items()},
+            "epoch_idx": epoch}, step=iteration)
+
         # choose monitored metric robustly
         monitor_map = {
             "loss": "loss",
@@ -569,13 +581,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 
-            # pull voxel volumes (logits OK; we'll just visualize isos)
-            gt_vol  = model_output.get('x', None)   # [B,C,D,H,W]
-            rec_vol = model_output.get('rec', None)        # [B,C,D,H,W]
-
-
-            gt_vol  = None if gt_vol  is None else gt_vol[b0]   # -> [D,H,W]
-            rec_vol = None if rec_vol is None else rec_vol[b0]  # -> [D,H,W]
+            gt_vol, rec_vol = extract_volumes_for_vis(model_output, occ_channel=0)
+            print_vol_stats("GT", gt_vol)
+            print_vol_stats("REC", rec_vol)
 
             # keypoints in normalized [-1,1] scene coords, shape [B,K,3]
             kp_xyz = model_output.get('kp_p', None)
@@ -596,10 +604,12 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
 
             # ------ Voxel overlay (single iso or list) ------
-            iso_main = 0.25
+            iso_main = 0.5
             log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=kp_xyz,
                                 iso_levels=[iso_main], step=iteration)
             log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=None,
+                    iso_levels=[iso_main], step=iteration)
+            log_vox_overlay_plotly("rec/rec", None, rec_vol, kps=None,
                     iso_levels=[iso_main], step=iteration)
 
 

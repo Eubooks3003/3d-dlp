@@ -1202,6 +1202,7 @@ class DLP(nn.Module):
         alpha_masks = dec_dict['alpha_masks']
         rec = dec_dict['rec']
         bg_rec = dec_dict['bg_rec']
+        print("REC SHAPE:", rec.shape)
 
         rec_rgb = dec_dict['rec_rgb']
         bg_rec_rgb = dec_dict['bg_rgb']
@@ -1912,16 +1913,29 @@ class DLP(nn.Module):
         timestep_horizon = self.timestep_horizon
         x = x.view(-1, *x.shape[2:])
 
-        if recon_loss_type == "vgg":
-            loss_rec = recon_loss_func(x, rec_x, reduction="mean")
-            loss_rec = (x.shape[1] * x.shape[2] * x.shape[3]) * loss_rec
+        if recon_loss_type == "bce":
+            print("Using BCE reconstruction loss for voxel data.")
+            # x should be binary occupancy {0,1}; if you stored density/counts, binarize:
+            # x_occ = (x_flat > 0).float()  # or use a threshold appropriate to your voxelizer
+            x_occ = x
+            # TODO: put this in loss utils, also make this work with calc reconstruction_loss
+            loss_rec = self.bce_logits_loss(x_occ, rec_x)
+            # Optional: for logging-only, compute PR/IoU later. PSNR isn't meaningful for binary.
+            with torch.no_grad():
+                probs = torch.sigmoid(rec_x)
+                # quick IoU at 0.5 threshold (for debug)
+                pred = (probs > 0.5).float()
+                inter = (pred * x_occ).sum()
+                union = ((pred + x_occ) > 0).float().sum()
+                iou = inter / (union + 1e-8)
+                psnr = iou  # placeholder so your dict has a number; PSNR not meaningful here
         else:
+            # your original MSE path (e.g., for density/moments/avg_rgb)
             loss_rec = calc_reconstruction_loss(x, rec_x, loss_type='mse', reduction='none')
-            loss_rec = loss_rec.view(batch_size, timestep_horizon, -1)
-            loss_rec = loss_rec.sum(-1).mean()
+            loss_rec = loss_rec.view(batch_size, timestep_horizon, -1).sum(-1).mean()
+            with torch.no_grad():
+                psnr = -10 * torch.log10(F.mse_loss(rec_x, x))
 
-        with torch.no_grad():
-            psnr = -10 * torch.log10(F.mse_loss(rec_x, x))
 
         # --- end reconstruction error --- #
 
@@ -2051,7 +2065,27 @@ class DLP(nn.Module):
             other_param = other.parameters()
             for p, p_other in zip(params, other_param):
                 p.data.lerp_(p_other.data, 1.0 - betta)
+    def bce_logits_loss(self, x_occ, rec_logits):
+        """
+        x_occ: [B,T,1,D,H,W] or [B,T,D,H,W] in {0,1}
+        rec_logits: same shape as x_occ (logits, not probs)
+        Returns mean over batch of per-frame summed BCE.
+        """
+        # ensure shapes match
+        assert x_occ.shape == rec_logits.shape, f"{x_occ.shape=} vs {rec_logits.shape=}"
 
+        # class imbalance handling: pos_weight = #neg/#pos (per-batch)
+        with torch.no_grad():
+            pos = x_occ.sum()
+            neg = x_occ.numel() - pos
+            pos_weight = (neg / (pos + 1e-8)).clamp(min=1.0)
+
+        bce = F.binary_cross_entropy_with_logits(
+            rec_logits, x_occ, reduction='none', pos_weight=torch.tensor(pos_weight, device=x_occ.device)
+        )
+        # sum over voxels, mean over (B,T)
+        b, t = x_occ.shape[:2]
+        return bce.view(b, t, -1).sum(-1).mean()
 
 """
 JIT scripts

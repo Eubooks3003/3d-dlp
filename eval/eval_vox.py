@@ -327,3 +327,53 @@ def topk_kps_from_variance(
     kp_topk = MU[b_idx, idx_topk]  # [B,k,3]
 
     return idx_topk, kp_topk, scores_topk, score
+
+
+
+def _as_b0_channel(vol, occ_channel=0):
+    """
+    Accept [B,C,D,H,W] or [B,D,H,W] or [D,H,W]; return [D,H,W] for b0.
+    """
+    if vol is None:
+        return None
+    if vol.dim() == 5:          # [B,C,D,H,W]
+        vol = vol[0, occ_channel]
+    elif vol.dim() == 4:        # [B,D,H,W] (or occasionally still [B,1,D,H,W] collapsed)
+        vol = vol[0]
+        if vol.dim() == 4:      # lingering channel
+            vol = vol[occ_channel]
+    elif vol.dim() == 3:        # [D,H,W]
+        pass
+    else:
+        raise ValueError(f"Unexpected vol shape {tuple(vol.shape)}")
+    return vol
+
+def extract_volumes_for_vis(model_output, *, occ_channel=0):
+    """
+    Returns (gt_vol[D,H,W], rec_vol[D,H,W]) using strictly:
+      - gt  = model_output['x']
+      - rec = sigmoid(model_output['rec'])   # convert logits -> probs for viz
+    """
+    if 'rec' not in model_output:
+        raise KeyError("model_output['rec'] is required.")
+    if 'x' not in model_output:
+        raise KeyError("model_output['x'] is required as the ground-truth volume.")
+
+    rec_logits = _as_b0_channel(model_output['rec'], occ_channel=occ_channel)
+    rec = torch.sigmoid(rec_logits)                     # probs in [0,1] for plotting
+    gt  = _as_b0_channel(model_output['x'],   occ_channel=occ_channel)
+    return gt, rec
+
+
+
+def print_vol_stats(tag, V):
+    if V is None:
+        print(f"{tag}: None"); return
+    import torch, numpy as np
+    if isinstance(V, torch.Tensor):
+        v = V.detach().float().cpu().numpy()
+    else:
+        v = np.asarray(V)
+    f_ok   = np.isfinite(v).all()
+    print(f"{tag}: shape={v.shape}, min={v.min():.4g}, max={v.max():.4g}, mean={v.mean():.4g}, finite={f_ok}")
+
