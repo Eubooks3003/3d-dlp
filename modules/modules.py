@@ -4584,7 +4584,8 @@ class ParticleEncoder(nn.Module):
 
         # prior now returns (x,y,z) and full covariance
         kp_p, cov_kp = self.encode_prior(x)  # kp_p: [B, n_kp_prior, 3], cov_kp: [B, n_kp_prior, 3, 3]
-
+        
+        print("KP PRIOR: ", kp_p)
         # kp_init: [B, n_kp_prior, 3] in [-1, 1]
         kp_init = kp_p
 

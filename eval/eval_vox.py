@@ -79,7 +79,7 @@ def _kp_norm_to_index(kps, D, H, W, order=("z","y","x")):
     kps: [K,3] in [-1,1] (can be torch or np), with components ordered by `order`.
     returns: [K,3] as plotly (x,y,z) voxel indices
     """
-    k = _np(kps)                     # <<< fix: handle CUDA tensors
+    k = _np(kps)                     
     if k.ndim == 1:
         k = k[None, :]
     size = {"x": W, "y": H, "z": D}
@@ -160,12 +160,13 @@ def _mesh_from_binary(mask_xyz, color="rgba(255,127,14,1.0)", opacity=0.9, max_v
 def log_vox_overlay_plotly(
     name, gt_vol, rec_vol, kps=None, step=None,
     iso_levels=(0.2,), gt_color="rgba(31,119,180,1.0)", rec_color="rgba(255,127,14,1.0)",
-    kp_color="#ff0000", kp_order=("z","y","x"), point_size_kp=6,
+    kp_color="#ff0000", kp_order=("x","y","z"), point_size_kp=6,
 ):
     G = _as_DHW(gt_vol)
     R = _as_DHW(rec_vol)
     fig = go.Figure()
     thr = float(np.min(iso_levels))
+
 
     if R is not None:
         maskR = np.transpose(R, (2,1,0)) > thr  # (X,Y,Z)

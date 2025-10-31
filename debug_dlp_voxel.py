@@ -20,55 +20,58 @@ import wandb
 
 
 @torch.no_grad()
+
 def filter_topk_kps_3d(
-    z_base_var,      # [B, K, 6] = [prior_var_x,y,z | posterior_logvar_x,y,z]
-    mu_tot,          # [B, K, 3]
+    z_base_var,      # [B, *G*, K, C]  (C = 3 or 6)
+    mu_tot,          # [B, *G*, K, 3]  (must align to same K as z_base_var)
     topk: int,
-    obj_on=None,     # [B, K, 1] or [B, K]; optional
+    obj_on=None,     # [B, *G*, K, 1] or [B, *G*, K] (optional)
     use_posterior_in_score: bool = False,
-    eps: float = 1e-6
+    eps: float = 1e-6,
 ):
-    print("Z BASE VAR SHAPE: ", z_base_var.shape)
-    B,_, K, C = z_base_var.shape
-    assert C in (3, 6), "z_base_var must have 3 (prior var) or 6 (prior var + posterior logvar) channels"
-    # Flatten batch for safe indexing then restore
-    zvar = z_base_var.view(B, K, C)
+    B = z_base_var.shape[0]
+    C = z_base_var.shape[-1]
+    assert C in (3, 6)
 
-    # Prior variances are already positive (from diag(cov))
-    prior_var = zvar[..., :3]                    # [B, K, 3]
+    # 1) Squeeze any extra group/time dims so both are [B, K, ·]
+    zvar = z_base_var.view(B, -1, C)          # [B, K, C]
+    mu   = mu_tot.view(B, -1, 3)              # [B, K, 3]
+    K = zvar.size(1)
 
+    # 2) Uncertainty score (prior variance sum; optionally add posterior var)
+    prior_var = zvar[..., :3]                 # [B, K, 3]  (≥ 0)
     if use_posterior_in_score and C == 6:
-        post_logvar = zvar[..., 3:6]            # [B, K, 3] (could be negative)
-        post_var    = post_logvar.exp().clamp_min(eps)
-        unc = prior_var.sum(-1) + post_var.sum(-1)  # [B, K]
+        post_var = zvar[..., 3:6].exp().clamp_min(eps)
+        unc = prior_var.sum(-1) + post_var.sum(-1)    # [B, K]
     else:
-        unc = prior_var.sum(-1)                      # [B, K]
+        unc = prior_var.sum(-1)                        # [B, K]
 
-    # Optional gating by obj_on (same as your 2D)
+    # Optional gating by obj_on
     if obj_on is not None:
         g = obj_on
-        if g.dim() == 3 and g.size(-1) == 1:
-            g = g.squeeze(-1)                      # [B, K]
-        unc = unc * g                              # [B, K]
+        if g.dim() == 4 and g.size(-1) == 1:  # [B,*G*,K,1]
+            g = g.view(B, -1)                 # [B, K]
+        else:
+            g = g.view(B, -1)
+        unc = unc * g
 
-    # Top-K lowest uncertainty
+    # 3) Top-k (smallest uncertainty)
     k = min(topk, K)
-    _, indices = torch.topk(unc, k=k, dim=-1, largest=False)   # [B, k]
+    _, idx = torch.topk(unc, k=k, dim=1, largest=False)          # [B, k]
 
-    batch_idx = torch.arange(B, device=mu_tot.device).view(-1, 1)
-    print("MU TOT SHAPE: ", mu_tot.shape)
-    topk_kp   = mu_tot[batch_idx, indices]                     # [B, k, 3]
+    # 4) Gather (no advanced indexing outer-product)
+    idx_exp = idx.unsqueeze(-1).expand(B, k, 3)                  # [B, k, 3]
+    topk_kp = torch.gather(mu, 1, idx_exp)                       # [B, k, 3]
 
-    # For your bbox scores (same sign as your 2D code)
-    bb_scores = -unc                                           # [B, K]
-    
-    print("TOPK KP SHAPE: ", topk_kp.shape)
+    bb_scores = -unc                                             # [B, K]
+    print("TOPK kp shape:", topk_kp.shape)
     return {
-        "indices":   indices,   # [B, k]
-        "topk_kp":   topk_kp,   # [B, k, 3]
-        "unc":       unc,       # [B, K] (selection score before negation)
-        "bb_scores": bb_scores  # [B, K]
+        "indices":   idx,        # [B, k] in the current K space
+        "topk_kp":   topk_kp,    # [B, k, 3]
+        "unc":       unc,        # [B, K]
+        "bb_scores": bb_scores,  # [B, K]
     }
+
 # ------------------------------- helpers -------------------------------
 
 def find_latest_checkpoint(run_save_dir: str) -> Optional[str]:
@@ -286,12 +289,14 @@ def main():
             # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
             kp_xyz = model_output.get('kp_p', None)
 
+            print("MU TOT: ", model_output["z_base"] + model_output["mu_offset"])
+
 
             with torch.no_grad():
                 # z_base_var: [B,K,6], mu_tot: [B,K,3], obj_on: [B,K,1]
                 out = filter_topk_kps_3d(
                     z_base_var=model_output["z_base_var"],
-                    mu_tot=model_output["kp_p"],
+                    mu_tot=model_output["z_base"] + model_output["mu_offset"],
                     topk=cfg['topk'],
                     obj_on=model_output.get("obj_on", None),
                     use_posterior_in_score=False  # set True to include posterior uncertainty
@@ -300,16 +305,21 @@ def main():
                 topk_kp  = out["topk_kp"]
                 bb_scores= out["bb_scores"]
 
+            b0 = 0  # first in batch
+            topk_kp_b0 = topk_kp[b0]  # [k, 3]
+
+            print("TOPK kp (b0):", topk_kp_b0.cpu().numpy())
+            print("KP_P: ", kp_xyz[b0].cpu().numpy())
             # ------ Voxel overlays (same as training) ------
             log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,
                                    iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=None,
+            log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=kp_xyz[b0],
                                    iso_levels=[iso_main], step=step)
             log_vox_overlay_plotly("rec/rec", None, rec_vol, kps=None,
                                    iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=None,
+            log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=topk_kp_b0,
                                    iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=None,
+            log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=topk_kp_b0,
                                    iso_levels=[iso_main], step=step)
 
             # --- compact KP stats ---
