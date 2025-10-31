@@ -243,6 +243,7 @@ class DLP(nn.Module):
 
         Note: Patch extraction and stitching use differentiable spatial transformer networks (STN).
         """
+        self.occupancy_mode = True
         self.cdim = cdim  # number of input image channels
         self.image_size = image_size
         self.normalize_rgb = normalize_rgb  # normalize to [-1, 1] or keep [0, 1]
@@ -1210,6 +1211,14 @@ class DLP(nn.Module):
         rec_depth = dec_dict['rec_depth']
         bg_rec_depth = dec_dict['bg_depth']
 
+        bg_prob      = dec_dict.get('bg_prob', None)            # [B*,1,...] prob
+        bg_logits    = dec_dict.get('bg_logits', None)          # [B*,1,...] logits
+
+        occ_prob_per_obj   = dec_dict.get('occ_prob_per_obj', None)     # [B*,N,1,...]
+        occ_logits_per_obj = dec_dict.get('occ_logits_per_obj', None)   # [B*,N,1,...]
+        occ_prob_comp      = dec_dict.get('occ_prob_composite', None)   # [B*,1,...]
+
+
         # dynamics - all but the last timestep
         if self.is_dynamics_model:
             detach_dyn_inputs = False
@@ -1330,6 +1339,11 @@ class DLP(nn.Module):
                        'logvar_context_global_dyn': logvar_context_global_dyn,
                        'z_context_global_dyn': z_context_global_dyn,
                        'x': x.view(-1, *x.shape[2:]),
+                        'bg_prob':             bg_prob,              # [B*,1,...] or None
+                        'bg_logits':           bg_logits,            # [B*,1,...] or None
+                        'occ_prob_per_obj':    occ_prob_per_obj,     # [B*,N,1,...] or None
+                        'occ_logits_per_obj':  occ_logits_per_obj,   # [B*,N,1,...] or None
+                        'occ_prob_composite':  occ_prob_comp,        # [B*,1,...] or None
                        }
 
         if with_loss:
@@ -1356,6 +1370,11 @@ class DLP(nn.Module):
                                       recon_loss_func,
                                       balance, beta_dyn_rec, num_static, use_kl_mask=use_kl_mask,
                                       apply_mask_on_obj_on=apply_mask_on_obj_on, beta_obj=beta_obj, done_mask=done_mask)
+        elif self.occupancy_mode:
+            return self.calc_static_elbo_occupancy(x, model_output, warmup, beta_kl, beta_rec,
+                                            kl_balance,
+                                            balance, use_kl_mask=use_kl_mask, apply_mask_on_obj_on=apply_mask_on_obj_on,
+                                            beta_obj=beta_obj)
         else:
             return self.calc_static_elbo(x, model_output, warmup, beta_kl, beta_dyn, beta_rec,
                                          kl_balance, dynamic_discount, recon_loss_type, recon_loss_func,
@@ -1863,6 +1882,231 @@ class DLP(nn.Module):
                      'loss_kl_obj_on_dyn': loss_kl_obj_on_dyn, 'loss_kl_scale_dyn': loss_kl_scale_dyn,
                      'loss_kl_depth_dyn': loss_kl_depth_dyn, 'loss_obj_reg': loss_obj_reg}
         return loss_dict
+    def calc_static_elbo_occupancy(
+        self, x, model_output, warmup=False,
+        beta_kl=0.05, beta_rec=1.0,
+        kl_balance=0.001, balance=0.5,
+        use_kl_mask=True, apply_mask_on_obj_on=False, beta_obj=0.0,
+        dice_weight=0.2,                 # weight for Dice loss on probs
+        sparsity_weight=1e-3,            # per-object occupancy sparsity reg
+        aux_bg_weight=0.1,               # optional BCE on bg_logits vs target
+    ):
+        """
+        Occupancy-only ELBO:
+        - Reconstruction on composited occupancy (probabilities in [0,1])
+        - Class-imbalanced BCEWithLogits (+ optional Dice on probs)
+        - KLs: kp base/offset, scale, obj_on (Beta), features (obj+bg); depth KL = 0
+        - Optional per-object sparsity reg on occ_prob_per_obj
+        - Optional auxiliary BCE on bg_logits (if provided)
+        Expected shapes:
+        x:            [B, T, 1, *spatial*] with targets in {0,1}
+        rec_occ:      [B*T, 1, *spatial*] probabilities (from union of bg+objects)
+        occ_prob_per_obj (opt): [B*T, N, 1, *spatial*]
+        bg_logits (opt):        [B*T, 1, *spatial*]
+        """
+        import torch
+        import torch.nn.functional as F
+
+        # --------- helpers ----------
+        def bce_logits_weighted(logits, target, pos_weight):
+            return F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight, reduction="mean")
+
+        def dice_loss(prob, target, eps=1e-6):
+            p = prob.contiguous().view(prob.shape[0], -1)
+            y = target.contiguous().view(target.shape[0], -1)
+            inter = (p * y).sum(dim=1)
+            denom = p.sum(dim=1) + y.sum(dim=1) + eps
+            return (1.0 - (2.0 * inter + eps) / denom).mean()
+
+        def logit(p, eps=1e-6):
+            p = p.clamp(eps, 1.0 - eps)
+            return torch.log(p) - torch.log1p(-p)
+
+        # --------- unpack model outputs needed for KLs ----------
+        mu_p            = model_output['kp_p']                # [B*T, K, 2 or 3]
+        mu_anchor       = model_output['mu_anchor']           # [B*T, 1, ...]
+        logvar_anchor   = model_output['logvar_anchor']       # (unused: we keep anchor deterministic as before)
+
+        z               = model_output['z']
+        z_base          = model_output['z_base']
+        mu_offset       = model_output['mu_offset']
+        logvar_offset   = model_output['logvar_offset']
+
+        mu_features     = model_output['mu_features']
+        logvar_features = model_output['logvar_features']
+        z_features      = model_output['z_features']
+        mu_bg           = model_output['mu_bg_features']
+        logvar_bg       = model_output['logvar_bg_features']
+        z_bg            = model_output['z_bg_features']
+
+        mu_scale        = model_output['mu_scale']
+        logvar_scale    = model_output['logvar_scale']
+        z_scale         = model_output['z_scale']
+
+        obj_on          = model_output['obj_on']              # [B*T, K] or [B*T, K,1]
+        obj_on_a        = model_output['obj_on_a']
+        obj_on_b        = model_output['obj_on_b']
+
+        # occupancy composites / diagnostics
+        rec_occ_prob    = model_output['rec']             # [B*T,1,*spatial*] (probabilities)
+        occ_prob_per_obj= model_output.get('occ_prob_per_obj', None)  # [B*T,N,1,*]
+        occ_logits_per_obj = model_output.get('occ_logits_per_obj', None)
+        bg_logits       = model_output.get('bg_logits', None) # [B*T,1,*] (optional)
+
+        # --------- flatten time like your RGB path ----------
+        B = x.shape[0]
+        T = getattr(self, 'timestep_horizon', x.shape[1] if x.dim() >= 2 else 1)
+        x_flat = x.view(-1, *x.shape[2:])                     # [B*T,1,*spatial*]
+        target_occ = x_flat.float().clamp(0.0, 1.0)
+
+        # --------- reconstruction: class-imbalanced BCE(+Dice) on composite ---------
+        with torch.no_grad():
+            f = torch.clamp(target_occ.mean(), 1e-6, 1 - 1e-6)         # foreground fraction
+            pos_weight = ((1.0 - f) / f).to(x_flat.device)
+
+        rec_occ_logit = logit(rec_occ_prob)                             # convert prob→logit for stable BCE
+        loss_bce = bce_logits_weighted(rec_occ_logit, target_occ, pos_weight)
+        loss_dice = dice_loss(rec_occ_prob, target_occ) if dice_weight > 0 else torch.tensor(0.0, device=x.device)
+        loss_rec = loss_bce + dice_weight * loss_dice
+
+        # Optional auxiliary BCE on background logits (helps early training of bg prior)
+        if (bg_logits is not None) and (aux_bg_weight > 0):
+            loss_bg_aux = bce_logits_weighted(bg_logits, target_occ, pos_weight) * aux_bg_weight
+            loss_rec = loss_rec + loss_bg_aux
+        else:
+            loss_bg_aux = torch.tensor(0.0, device=x.device)
+
+        # Optional per-object sparsity (keep each particle's occupancy small)
+        if (occ_prob_per_obj is not None) and (sparsity_weight > 0):
+            # mean over spatial dims, then mean over objects and batch
+            spatial_dims = tuple(range(2, occ_prob_per_obj.dim()))
+            sparsity = occ_prob_per_obj.mean(dim=spatial_dims).mean()
+            loss_rec = loss_rec + sparsity_weight * sparsity
+        else:
+            sparsity = torch.tensor(0.0, device=x.device)
+
+        # --------- KL terms (depth dropped) ----------
+        kl_loss_func = ChamferLossKL(use_reverse_kl=False)
+
+        if use_kl_mask:
+            # mask_c = 2.0 if warmup else 1.0
+            # kl_mask = obj_on.reshape(obj_on.shape[0], obj_on.shape[2]) * mask_c
+            kl_mask = obj_on.reshape(obj_on.shape[0], obj_on.shape[2])
+            # if warmup:
+            #     kl_mask = 1.0
+            # adaptive_beta_kl = kl_mask.sum(-1) + 1  # [bs]
+            adaptive_beta_kl = 1.0
+        else:
+            kl_mask = 1.0
+            adaptive_beta_kl = 1.0
+
+        # priors from module
+        logvar_kp       = self.logvar_kp.expand_as(mu_p)
+        logvar_offset_p = self.logvar_offset_p
+        logvar_scale_p  = self.logvar_scale_p
+        obj_on_a_prior  = self.obj_on_a_p
+        obj_on_b_prior  = self.obj_on_b_p
+        mu_scale_prior  = self.mu_scale_prior
+
+        # kp base (anchor posterior ~ delta at mu_anchor)
+        mu_prior   = mu_p
+        logv_prior = logvar_kp
+        mu_post    = mu_anchor.squeeze(1)
+        logv_post  = torch.zeros_like(mu_post)
+        loss_kl_kp_base = kl_loss_func(mu_preds=mu_post, logvar_preds=logv_post,
+                                    mu_gts=mu_prior, logvar_gts=logv_prior)    # [B*T]
+        loss_kl_kp_base = (loss_kl_kp_base * adaptive_beta_kl).mean()
+
+        # kp offset
+        loss_kl_kp_offset = calc_kl(
+            logvar_offset.reshape(-1, logvar_offset.shape[-1]),
+            mu_offset.reshape(-1, mu_offset.shape[-1]),
+            logvar_o=logvar_offset_p, reduce='none'
+        )
+        print("shape kl kp offset:", loss_kl_kp_offset.shape)
+        print("shape mu offset:", mu_offset.shape)
+        print("shape kl mask:", kl_mask.shape)
+        loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, mu_offset.shape[2]) * kl_mask).sum(-1)
+        loss_kl_kp_offset = (loss_kl_kp_offset * adaptive_beta_kl).mean()
+        loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset
+
+        # scale
+        loss_kl_scale = calc_kl(
+            logvar_scale.reshape(-1, logvar_scale.shape[-1]),
+            mu_scale.reshape(-1, mu_scale.shape[-1]),
+            mu_o=mu_scale_prior, logvar_o=logvar_scale_p, reduce='none'
+        )
+        loss_kl_scale = ((loss_kl_scale.view(-1, mu_scale.shape[2]) * kl_mask).sum(-1) * adaptive_beta_kl).mean()
+
+        # obj_on ~ Beta
+        loss_kl_obj_on = calc_kl_beta_dist(obj_on_a, obj_on_b, obj_on_a_prior, obj_on_b_prior)  # [B*T, K]
+        loss_kl_obj_on = (loss_kl_obj_on * kl_mask).sum(-1) if apply_mask_on_obj_on else loss_kl_obj_on.sum(-1)
+        loss_kl_obj_on = (loss_kl_obj_on * adaptive_beta_kl).mean()
+
+        # features (object + bg)
+        if getattr(self, 'features_dist', 'gaussian') == 'categorical':
+            logits_feat_post = mu_features.reshape(-1, mu_features.shape[-1])
+            logits_feat_prior = torch.log(torch.full_like(logits_feat_post, 1.0 / self.n_fg_classes))
+            loss_kl_feat_obj = calc_kl_categorical(
+                logits_feat_post, logits_feat_prior, num_classes=self.n_fg_classes, reduce='none', balance=balance
+            )
+            loss_kl_feat_obj = loss_kl_feat_obj.view(-1, mu_features.shape[2]) * kl_mask
+            loss_kl_feat_obj = (loss_kl_feat_obj.sum(-1) * adaptive_beta_kl).mean()
+
+            logits_feat_bg_post = mu_bg.reshape(-1, mu_bg.shape[-1])
+            logits_feat_bg_prior = torch.log(torch.full_like(logits_feat_bg_post, 1.0 / self.n_bg_classes))
+            loss_kl_feat_bg = calc_kl_categorical(
+                logits_feat_bg_post, logits_feat_bg_prior, num_classes=self.n_bg_classes, reduce='none', balance=balance
+            )
+            loss_kl_feat_bg = (loss_kl_feat_bg * adaptive_beta_kl).mean()
+            loss_kl_feat = loss_kl_feat_obj + loss_kl_feat_bg
+        else:
+            loss_kl_feat = calc_kl(
+                logvar_features.reshape(-1, logvar_features.shape[-1]),
+                mu_features.reshape(-1, mu_features.shape[-1]),
+                reduce='none'
+            )
+            loss_kl_feat_obj = loss_kl_feat.view(-1, mu_features.shape[2]) * kl_mask
+            loss_kl_feat_obj = (loss_kl_feat_obj.sum(-1) * adaptive_beta_kl).mean()
+
+            loss_kl_feat_bg = calc_kl(logvar_bg, mu_bg, reduce='none')
+            loss_kl_feat_bg = (loss_kl_feat_bg * adaptive_beta_kl).mean()
+            loss_kl_feat = loss_kl_feat_obj + loss_kl_feat_bg
+
+        # depth KL is zero in occupancy mode
+        loss_kl_depth = torch.tensor(0.0, device=x.device)
+
+        # total KL
+        loss_kl_static = loss_kl_kp + loss_kl_scale + loss_kl_obj_on + kl_balance * loss_kl_feat + loss_kl_depth
+
+        # regularize number of active particles (same as your RGB path)
+        loss_obj_reg = (kl_mask.sum(-1) ** 2).mean()
+
+        # total
+        loss = beta_rec * loss_rec + beta_kl * loss_kl_static + beta_obj * loss_obj_reg
+
+        # metrics / logging dictionary
+        obj_on_l1 = torch.abs(obj_on.squeeze(-1)).sum(-1).mean()
+        loss_dict = {
+            'loss': loss,
+            'loss_rec': loss_rec,
+            'loss_bce': loss_bce,
+            'loss_dice': loss_dice,
+            'loss_bg_aux': loss_bg_aux,
+            'sparsity_reg': sparsity,
+            'kl': loss_kl_static,
+            'kl_dyn': torch.tensor(0.0, device=x.device),
+            'loss_kl_kp': loss_kl_kp,
+            'loss_kl_feat': loss_kl_feat,
+            'loss_kl_obj_on': loss_kl_obj_on,
+            'loss_kl_scale': loss_kl_scale,
+            'loss_kl_depth': loss_kl_depth,
+            'loss_kl_context': torch.tensor(0.0, device=x.device),
+            'loss_obj_reg': loss_obj_reg,
+            'obj_on_l1': obj_on_l1,
+            'pos_weight': pos_weight.detach(),
+        }
+        return loss_dict
 
     def calc_static_elbo(self, x, model_output, warmup=False, beta_kl=0.05, beta_dyn=1.0, beta_rec=1.0,
                          kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
@@ -1972,6 +2216,9 @@ class DLP(nn.Module):
         loss_kl_kp_offset = calc_kl(logvar_offset.reshape(-1, logvar_offset.shape[-1]),
                                     mu_offset.reshape(-1, mu_offset.shape[-1]), logvar_o=logvar_offset_p,
                                     reduce='none')
+        print("shape kl kp offset:", loss_kl_kp_offset.shape)
+        print("shape mu offset:", mu_offset.shape)
+        print("shape kl mask:", kl_mask.shape)
         loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, mu_offset.shape[2]) * kl_mask).sum(-1)
         loss_kl_kp_offset = (loss_kl_kp_offset * adaptive_beta_kl).mean()
         loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset

@@ -206,11 +206,11 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # vox_ds = VoxelizedDataset(
     #     base_ds=dataset,
     #     grid_whd=voxel_grid_whd,          # (W,H,D) in your class name, but tensors come out [C,D,H,W]
-    #     mode="density",                 # "occupancy" | "density" | "moments" | "avg_rgb"
+    #     mode="occupancy",                 # "occupancy" | "density" | "moments" | "avg_rgb"
     #     bounds_mode="global",           # "per_item" | "global" | ((pmin),(pmax))
     #     keep_points=False,              # True to also return original points
     #     device=torch.device("cpu"),     # keep CPU if you use DataLoader workers
-    #     cache_dir="./cache/vox_48_dense",  # speeds up future runs
+    #     cache_dir="/home/ellina/Desktop/Code/voxel_ds_occupancy",  # speeds up future runs
     #     force_rebuild=False
     # )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)

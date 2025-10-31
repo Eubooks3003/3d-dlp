@@ -288,6 +288,7 @@ def topk_kps_from_variance(
     score = None
     if prefer_logvar and ("z_base_var" in model_output and model_output["z_base_var"] is not None):
         z_var = model_output["z_base_var"]
+        print("Z BASE VAR INSIDE TOPK: ", z_var)
         # reshape to [B,K,...] then sum all trailing dims -> [B,K]
         while z_var.dim() > 2:
             z_var = z_var.sum(-1)

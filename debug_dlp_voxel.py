@@ -217,7 +217,7 @@ def main():
     # ----- loop -----
     step = 0
     max_batches = args.max_batches
-    iso_main = 0.5
+    iso_main = 0.67
     iso_sweep = make_iso_sweep()
 
     with torch.no_grad():
@@ -235,6 +235,7 @@ def main():
             # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
             kp_xyz = model_output.get('kp_p', None)
 
+
             # Top-K by variance (mirrors training call)
             idx_topk, kp_topk, scores_topk, scores_all = topk_kps_from_variance(
                 model_output,
@@ -248,6 +249,9 @@ def main():
             b0 = 0
             kp_b0    = None if kp_xyz is None else kp_xyz[b0]
             kpt_b0   = None if kp_topk is None else kp_topk[b0]
+            score_b0 = None if scores_topk is None else scores_topk[b0]
+            print("KP TOPK: ", kpt_b0)
+            print("KP TOPK SCORES: ", score_b0)
 
             # ------ Voxel overlays (same as training) ------
             log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=kp_b0,
@@ -256,16 +260,10 @@ def main():
                                    iso_levels=[iso_main], step=step)
             log_vox_overlay_plotly("rec/rec", None, rec_vol, kps=None,
                                    iso_levels=[iso_main], step=step)
-
-            # Small iso sweep (same as training)
-            log_vox_isoseries("vox/rec_isos", rec_vol, kps=kp_b0,
-                              iso_levels=iso_sweep, step=step)
-
-            if kpt_b0 is not None:
-                log_vox_overlay_plotly("vox/overlay_topk", gt_vol, rec_vol, kps=kpt_b0,
-                                       iso_levels=[iso_main], step=step)
-                log_vox_isoseries("vox/rec_isos_topk", rec_vol, kps=kpt_b0,
-                                  iso_levels=iso_sweep, step=step)
+            log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=kpt_b0,
+                                   iso_levels=[iso_main], step=step)
+            log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=kpt_b0,
+                                   iso_levels=[iso_main], step=step)
 
             # --- compact KP stats ---
             kp_stats = summarize_kp(model_output)

@@ -2630,8 +2630,10 @@ class BgDecoder(nn.Module):
                  init_zero_bias=True, init_conv_layers=True, init_conv_bg_std=0.005):
         super().__init__()
 
+        print("IMAGE SIZE: ", image_size)
         self.image_size = image_size
         self.feature_map_edge = int(image_size // (2 ** (len(bg_ch_mult) - 1)))  # seed edge
+        print("FEATURE MAP EDGE: ", self.feature_map_edge)
         self.dropout = dropout
         self.learned_bg_feature_dim = learned_bg_feature_dim
         self.context_dim = context_dim
@@ -2688,6 +2690,7 @@ class BgDecoder(nn.Module):
                 in_z_ch = 2 * self.latent_to_feat_map.n_ch
 
         # ------- 3D decoder -------
+        print("RESOLUTION: ", self.image_size)
         self.cnn = Decoder(
             ch=decoder_base_ch, out_ch=self.cdim, ch_mult=bg_ch_mult, num_res_blocks=num_res_blocks,
             attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
@@ -2867,6 +2870,7 @@ class BgEncoder(nn.Module):
             cnn_features = feat.view(B, *cnn_features.shape[1:])
 
         z_feat = self.to_latent(cnn_features)  # [B, out_ch(or C'), D', H', W']
+        print("Z FEAT SHAPE: ", z_feat.shape)
 
         if self.projection_mode == 'fc':
             flat = z_feat.view(z_feat.shape[0], -1)  # [B, C'*D'*H'*W']
@@ -4644,6 +4648,8 @@ class ParticleEncoder(nn.Module):
         var_kp = torch.diagonal(cov_kp, dim1=-2, dim2=-1)  # [B, n_kp_prior, 3]
         z_base_var = var_kp.detach()
 
+        print("Z BASE VAR: ", z_base_var)
+
         # optional confidence feature (same shape as logvar_offset)
         confidence_score = particle_stats_dict['logvar'].detach()  # [B, n_kp_prior, 3]
         # concat for a small feature vector per kp (length 6): [prior_var_xyz | posterior_logvar_xyz]
@@ -5723,6 +5729,8 @@ class DLPDecoder(nn.Module):
               rendering of particles
         """
         super(DLPDecoder, self).__init__()
+        self.occupancy_mode  = True
+        self.occupancy_prior = 0.05
         self.image_size = image_size
         self.feature_map_size = image_size
         self.n_kp_enc = n_kp_enc
@@ -5756,8 +5764,8 @@ class DLPDecoder(nn.Module):
         else:
             particle_dec_net = ObjectDecoderCNN
         
-
-        self.particle_dec = particle_dec_net(patch_size=self.obj_patch_size, num_chans=cdim + 1,
+        particle_out_ch = 1 if self.occupancy_mode else (cdim + 1)
+        self.particle_dec = particle_dec_net(patch_size=self.obj_patch_size, num_chans=particle_out_ch,
                                             bottleneck_size=learned_feature_dim,
                                             use_resblock=self.use_resblock,
                                             pad_mode='replicate', context_dim=context_dim, normalize_rgb=normalize_rgb,
@@ -5772,7 +5780,7 @@ class DLPDecoder(nn.Module):
 
         self.num_obj_upsample = self.particle_dec.num_upsample # TODO:This never gets used
         # bg decoder
-        self.bg_dec = BgDecoder(cdim=cdim, image_size=image_size,
+        self.bg_dec = BgDecoder(cdim=cdim, image_size=48,
                                 pad_mode='replicate', learned_bg_feature_dim=learned_bg_feature_dim,
                                 use_resblock=use_resblock, context_dim=context_dim, film=decode_with_ctx,
                                 timestep_horizon=timestep_horizon,
@@ -5796,6 +5804,22 @@ class DLPDecoder(nn.Module):
             elif isinstance(m, nn.Linear):
                 if self.init_zero_bias and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        ### NEW: bias-init the occupancy head to logit(prior)
+        if self.occupancy_mode:
+            p0 = min(max(self.occupancy_prior, 1e-4), 1 - 1e-4)
+            logit_p0 = math.log(p0 / (1 - p0))
+            # We try a few common module names to locate the final 3D conv
+            occ_bias = None
+            for attr_name in ["final_conv", "out_conv", "to_rgb", "to_logits"]:
+                mod = getattr(self.particle_dec, attr_name, None)
+                if isinstance(mod, nn.Conv3d) and mod.bias is not None:
+                    try:
+                        with torch.no_grad():
+                            mod.bias[self.occ_channel_index].fill_(logit_p0)
+                            occ_bias = mod.bias
+                    except Exception:
+                        pass
+                    break
 
     def translate_patches(self, kp_batch, patches_batch, scale=None, translation=None, scale_normalized=False):
         """
@@ -5826,6 +5850,38 @@ class DLPDecoder(nn.Module):
             patches_batch, z_pos, z_scale, out_dims, inverse=True, padding_mode='border'
         )
         return trans.view(B, N, Cpatch, H, W, L)
+
+
+    def get_objects_occupancy(self, z_kp, z_features, z_scale=None, z_ctx=None, translation=None):
+        """
+        Decode per-object occupancy logits and place them in the volume.
+        Returns:
+        occ_logits_per_obj: [B,N,1,D,H,W]
+        occ_prob_per_obj:   [B,N,1,D,H,W]
+        occ_prob_composite: [B,1,D,H,W]   via probabilistic OR over objects
+        """
+        patches = self.particle_dec(z_features, context=z_ctx)        # [B*N, 1, ps, ps, ps] (logits)
+        B, N = z_kp.shape[:2]
+        patches = patches.view(B, N, *patches.shape[1:])              # [B,N,1,ps,ps,ps]
+        patches_t = self.translate_patches(z_kp, patches, z_scale, translation)  # [B,N,1,D,H,W]
+
+        occ_logits = patches_t                                        # logits per object
+        occ_prob   = torch.sigmoid(occ_logits)                        # probs per object
+
+        # p_total_objects = 1 - Π_k (1 - p_k * on_k)
+        obj_on = self.obj_on if hasattr(self, "obj_on") else None  # not used here; pass in decode_objects
+        return occ_logits, occ_prob
+    def composite_occupancy_no_alpha(self,occ_prob, obj_on, eps=1e-8):
+        """
+        occ_prob: [B,N,1,D,H,W] in [0,1]
+        obj_on:   [B,N] or [B,N,1]
+        -> p_obj: [B,1,D,H,W]   = 1 - Π_k (1 - p_k)
+        """
+        if obj_on.dim() == 3: obj_on = obj_on.squeeze(-1)
+        gate = obj_on[:, :, None, None, None, None]  # [B,N,1,1,1,1]
+        p_k = torch.clamp(gate * occ_prob, 0.0, 1.0)
+        log_1m = torch.log(torch.clamp(1.0 - p_k, min=eps))
+        return 1.0 - torch.exp(log_1m.sum(dim=1, keepdim=False))  # [B,1,D,H,W]
 
 
     def decode_rgb_unified(self, z_kp, z_features, z_scale=None, z_ctx=None, translation=None):
@@ -5898,6 +5954,14 @@ class DLPDecoder(nn.Module):
             - use particle_dec on z_features (unified: α+RGB or α+RGB+D)
         """
 
+        if getattr(self, "occupancy_mode", False):
+            occ_logits, occ_prob = self.get_objects_occupancy(z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation)
+            p_obj = self.composite_occupancy_no_alpha(occ_prob, obj_on)  # [B,1,D,H,W]
+            return {
+                "occ_logits_per_obj": occ_logits,
+                "occ_prob_per_obj":   occ_prob,
+                "occ_prob_composite": p_obj,
+            }
         dec_rgb_patches, a_obj, rgb_obj, d_obj = self.decode_rgb_unified(
             z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation
         )
@@ -5928,36 +5992,65 @@ class DLPDecoder(nn.Module):
         else:
             T = 1
 
-        # ensure obj_on is [B*, N] (drop trailing 1 if present)
+        # ensure obj_on is [B*, N]
         if obj_on.dim() == 3:
             obj_on = obj_on.squeeze(-1)
 
-        # ---- decode objects (returns comps in spatial dims; 2D or 3D handled downstream) ----
+        if getattr(self, "occupancy_mode", False):
+            occ_out = self.decode_objects(z, z_features, obj_on, z_scale=z_scale, z_ctx=z_ctx)
+            p_obj   = occ_out["occ_prob_composite"]                 # [B*,1,D,H,W]
+
+            # BG prior as occupancy logits in channel 0
+            bg_raw    = self.bg_dec(z_bg_features, z_ctx)           # [B*, C_bg, D,H,W]
+            bg_logits = bg_raw[:, :1, ...]                          # [B*,1,D,H,W]
+            p_bg      = torch.sigmoid(bg_logits)
+
+            print("P BG SHAPE: ", p_bg.shape)
+
+            # Ensure same spatial shape/order; resample bg if needed
+            if p_bg.shape[-3:] != p_obj.shape[-3:]:
+                p_bg = F.interpolate(p_bg, size=p_obj.shape[-3:], mode="trilinear", align_corners=False)
+
+            p_total = 1.0 - (1.0 - p_bg) * (1.0 - p_obj)            # union BG + objects
+
+            return {
+                "rec":                p_total,      
+                "occ_logits_per_obj": occ_out["occ_logits_per_obj"],
+                "occ_prob_per_obj":   occ_out["occ_prob_per_obj"],
+                "occ_prob_composite": p_obj,
+                "bg_rec":             bg_raw,
+                "bg_logits":          bg_logits,
+                "bg_prob":            p_bg,
+                "bg_mask":            1.0 - p_total,
+
+                # RGB/Depth unused here
+                "dec_objects":        None,
+                "dec_objects_trans":  None,
+                "alpha_masks":        None,
+                "rec_rgb":            None,
+                "rec_depth":          None,
+                "dec_depth_trans":    None,
+                "dec_depth_patches":  None,
+            }
+        # =========================
+        # RGB / RGBD PATH (unchanged)
+        # =========================
         (dec_objects, dec_objects_trans, alpha_masks, bg_mask,
         dec_depth_trans, dec_depth_patches) = self.decode_objects(
             z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale, z_ctx=z_ctx
         )
 
-        # ---- background (RGB / RGBD / occupancy) ----
-        bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C, *spatial*]
+        bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C_bg, *spatial*]
+        C_bg   = bg_rec.shape[1]
 
-        # detect spatial dimensionality (2D: nd=4, 3D: nd=5)
-        spatial = bg_rec.shape[2:]   # (... H, W) or (D, H, W)
-        C_bg    = bg_rec.shape[1]
-
-        # ---- composite RGB (only if background carries >=3 channels) ----
-        # dec_objects_trans is already the composited foreground RGB over alpha/order
         if C_bg >= 3:
             rec_rgb = bg_mask * bg_rec[:, :3, ...] + dec_objects_trans
         else:
-            # no RGB channels in bg (e.g., occupancy-only). Use FG only.
             rec_rgb = dec_objects_trans
 
-        # ---- composite DEPTH (optional) ----
         rec_depth = None
         have_obj_depth = (dec_depth_trans is not None)
-        have_bg_depth  = (C_bg > 3)  # bg output has a 4th channel as depth
-
+        have_bg_depth  = (C_bg > 3)
         if have_obj_depth or have_bg_depth:
             bg_depth = bg_rec[:, 3:4, ...] if have_bg_depth else (
                 torch.zeros_like(dec_depth_trans) if dec_depth_trans is not None else None
@@ -5969,21 +6062,21 @@ class DLPDecoder(nn.Module):
             else:
                 rec_depth = bg_mask * bg_depth + dec_depth_trans
 
-        # ---- final stack (RGB [+ depth] if present) ----
         rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
 
         return {
-            'rec': rec,                               # [B*, C{3 or 4}, *spatial*]
-            'dec_objects': dec_objects,               # per-patch before translation
-            'dec_objects_trans': dec_objects_trans,   # FG RGB composite into image/volume space
-            'alpha_masks': alpha_masks,               # [B*, N, 1, *spatial*]
-            'bg_mask': bg_mask,                       # [B*, 1, *spatial*]
-            'bg_rec': bg_rec,                         # [B*, C_bg, *spatial*]
-            'rec_rgb': rec_rgb,                       # [B*, 3, *spatial*] if RGB available, else FG-only
-            'rec_depth': rec_depth,                   # [B*, 1, *spatial*] or None
-            'dec_depth_trans': dec_depth_trans,       # FG depth composite or None
-            'dec_depth_patches': dec_depth_patches,   # (kept for API parity)
+            'rec': rec,
+            'dec_objects': dec_objects,
+            'dec_objects_trans': dec_objects_trans,
+            'alpha_masks': alpha_masks,
+            'bg_mask': bg_mask,
+            'bg_rec': bg_rec,
+            'rec_rgb': rec_rgb,
+            'rec_depth': rec_depth,
+            'dec_depth_trans': dec_depth_trans,
+            'dec_depth_patches': dec_depth_patches,
         }
+
 
 
     def forward(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx=None,
