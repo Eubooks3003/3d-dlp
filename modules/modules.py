@@ -5609,7 +5609,7 @@ class DLPEncoder(nn.Module):
                        'z_context_global': z_context_global,
                        'cropped_objects': cropped_objects.detach(), 'patch_id_embed': patch_id_embed,
                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
-                       'z_base_var': z_base_var,
+                       'z_base_var': z_base_var, 'cov_kp': cov_kp,
                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
                        'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
                        'kp_p': kp_p, 'var_kp': var_kp, 'bg_enc_mask': bg_enc_mask,

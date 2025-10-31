@@ -13,7 +13,7 @@ from datasets.point_cloud_datasets.get_dataset import get_point_cloud_dataset, p
 from datasets.voxelize_ds_wrapper import VoxelizedDataset
 
 from voxel_models import DLP  # voxel-capable DLP (same as training)
-from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, topk_kps_from_variance,
+from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, topk_kps,
         extract_volumes_for_vis, print_vol_stats)
 
 import wandb
@@ -237,20 +237,15 @@ def main():
 
 
             # Top-K by variance (mirrors training call)
-            idx_topk, kp_topk, scores_topk, scores_all = topk_kps_from_variance(
-                model_output,
-                topk=min(cfg.get('topk', cfg['n_kp_enc']), cfg['n_kp_enc']),
-                use_mu="kp_p",
-                prefer_logvar=True,
-                gate_with_obj_on=True,
-            )
-
+            idx, kp_topk, score_topk, scores_all = topk_kps(model_output, cfg['topk'], use_mu="kp_p", gate_with_obj_on=True, eps=1e-12)
             # take first in batch for voxel plots (consistent with training eval snippet)
+            print("KP TOPK: ", kp_topk.shape)
+            print("KP TOPK SCORES: ", score_topk)
             b0 = 0
             kp_b0    = None if kp_xyz is None else kp_xyz[b0]
             kpt_b0   = None if kp_topk is None else kp_topk[b0]
-            score_b0 = None if scores_topk is None else scores_topk[b0]
-            print("KP TOPK: ", kpt_b0)
+            score_b0 = None if score_topk is None else score_topk[b0]
+            print("KP TOPK: ", kpt_b0.shape)
             print("KP TOPK SCORES: ", score_b0)
 
             # ------ Voxel overlays (same as training) ------

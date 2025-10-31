@@ -1132,6 +1132,7 @@ class DLP(nn.Module):
 
         # unpack encoder output: [bs, T, ...]
         kp_p = enc_dict['kp_p']
+        cov_kp = enc_dict['cov_kp']
         mu_anchor = enc_dict['mu_anchor']  # mu_anchor = z_base = top-k(kp_p)
         logvar_anchor = enc_dict['logvar_anchor']
         z_base = enc_dict['z_base']
@@ -1344,6 +1345,7 @@ class DLP(nn.Module):
                         'occ_prob_per_obj':    occ_prob_per_obj,     # [B*,N,1,...] or None
                         'occ_logits_per_obj':  occ_logits_per_obj,   # [B*,N,1,...] or None
                         'occ_prob_composite':  occ_prob_comp,        # [B*,1,...] or None
+                        'cov_kp': cov_kp,
                        }
 
         if with_loss:

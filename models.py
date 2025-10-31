@@ -9,8 +9,8 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-from modules.modules import DLPEncoder, DLPDecoder, DLPContext
-from modules.modules import DLPDynamics
+from modules.rgb_modules import DLPEncoder, DLPDecoder, DLPContext
+from modules.rgb_modules import DLPDynamics
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \

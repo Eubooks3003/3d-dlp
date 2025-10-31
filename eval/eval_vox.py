@@ -254,81 +254,55 @@ def log_vox_isoseries(
 
 
 @torch.no_grad()
-def topk_kps_from_variance(
-    model_output: dict,
-    topk: int,
-    *,
-    use_mu: str = "mu_tot",     # which kp positions to return: "mu_tot" or "kp_p"
-    prefer_logvar: bool = True, # if True, use z_base_var; else fall back to kp_cov trace or zeros
-    gate_with_obj_on: bool = True,
-):
+def select_kp_topk(cov_kp, post_logvar, n_keep, *,
+                   obj_on=None, warmup=False, warmup_ratio=1.0,
+                   alpha=1.0, eps=1e-6):
     """
-    Select Top-K keypoints with *lowest* uncertainty.
-
-    Inputs (from model_output):
-      - 'z_base_var':   [B,K,*, ...]  (e.g., [B,K,3] or [B,K,4])   # summed across last dim
-      - 'kp_cov'     :  [B,K,3,3]     (optional fallback: use trace)
-      - 'obj_on'     :  [B,K] or [B,K,1]  (optional presence gate in [0,1])
-      - 'mu_tot'     :  [B,K,3]       (or 'kp_p' if you pass use_mu="kp_p")
+    cov_kp:      [B, N, 3, 3]   prior covariance per kp (from 3D SSM)
+    post_logvar: [B, N, 3]      posterior log-variance from your encoder
+    obj_on:      [B, N] or [B, N, 1]  optional objectness (higher is better)
+    n_keep:      int, target #kps to keep after filtering
 
     Returns:
-      idx_topk      : [B,k]          (indices into K)
-      kp_topk       : [B,k,3]        (positions from `use_mu`)
-      scores_topk   : [B,k]          (selection scores; higher == better)
-      scores_all    : [B,K]          (per-kp scores; useful for viz / bboxes)
+      embed_ind: [B, K]   indices of selected kps (smallest scores)
+      score:     [B, N]   per-kp scores (lower = sharper/better)
     """
-    # --- required positions ---
-    MU = model_output.get(use_mu, None)
-    if MU is None:
-        raise KeyError(f"model_output['{use_mu}'] is required (e.g., 'mu_tot' or 'kp_p').")
-    B, K, D = MU.shape
-    device = MU.device
+    B, N = cov_kp.shape[:2]
 
-    # --- base score: negative summed variance (smaller var => higher score) ---
-    score = None
-    if prefer_logvar and ("z_base_var" in model_output and model_output["z_base_var"] is not None):
-        z_var = model_output["z_base_var"]
-        print("Z BASE VAR INSIDE TOPK: ", z_var)
-        # reshape to [B,K,...] then sum all trailing dims -> [B,K]
-        while z_var.dim() > 2:
-            z_var = z_var.sum(-1)
-        if z_var.shape == (B, K):
-            score = -z_var  # smaller variance -> larger score
+    # strictly-positive components
+    prior_var   = torch.diagonal(cov_kp, -2, -1).clamp_min(eps)   # [B, N, 3]
+    prior_trace = prior_var.sum(-1)                               # [B, N]
 
-    # fallback: use trace of covariance if provided
-    if score is None and ("kp_cov" in model_output and model_output["kp_cov"] is not None):
-        cov = model_output["kp_cov"]  # [B,K,3,3]
-        if cov.dim() == 4 and cov.shape[0] == B and cov.shape[1] == K:
-            tr = cov[..., 0,0] + cov[..., 1,1] + cov[..., 2,2]  # [B,K]
-            score = -tr
+    post_var    = torch.exp(post_logvar).clamp_min(eps)           # [B, N, 3]
+    post_trace  = post_var.sum(-1)                                # [B, N]
 
-    # final fallback: zeros (all equal)
-    if score is None:
-        score = torch.zeros(B, K, device=device)
+    score = prior_trace + alpha * post_trace                      # [B, N]
 
-    # optional presence gate
-    if gate_with_obj_on and ("obj_on" in model_output) and (model_output["obj_on"] is not None):
-        obj_on = model_output["obj_on"]
-        if obj_on.dim() == 3 and obj_on.size(-1) == 1:
-            obj_on = obj_on.squeeze(-1)               # [B,K]
-        if obj_on.shape == (B, K):
-            score = score * obj_on.clamp(0, 1)        # gate in [0,1]
+    if obj_on is not None:
+        obj_on = obj_on.squeeze(-1) if obj_on.dim() == 3 else obj_on
+        # penalize low objectness; keep finite
+        score = score * (1.0 / obj_on.clamp_min(1e-3))
 
-    # optional mask: if you have 'kp_mask' (bool), set invalid to -inf
-    kp_mask = model_output.get("kp_mask", None)
-    if kp_mask is not None and kp_mask.shape == (B, K):
-        neg_inf = torch.full_like(score, float("-inf"))
-        score = torch.where(kp_mask, score, neg_inf)
+    # guard against NaN/Inf and break ties from flat heatmaps
+    score = torch.where(torch.isfinite(score), score, torch.full_like(score, 1e9))
+    score = score + 1e-6 * torch.randn_like(score)
 
-    # --- pick Top-K (largest scores == best) ---
-    k_eff = min(int(topk), K)
-    scores_topk, idx_topk = torch.topk(score, k=k_eff, dim=-1, largest=True, sorted=True)
+    K = n_keep if not warmup else min(n_keep, max(1, int(warmup_ratio * N)))
+    K = min(K, N)
+    _, embed_ind = torch.topk(score, k=K, dim=-1, largest=False)  # keep smallest scores
+    return embed_ind, score
 
-    b_idx = torch.arange(B, device=device)[:, None]
-    kp_topk = MU[b_idx, idx_topk]  # [B,k,3]
 
-    return idx_topk, kp_topk, scores_topk, score
-
+def gather_by_ind(x, embed_ind):
+    """
+    Gather along dim=1 with broadcasting.
+    x:         [B, N, ...]
+    embed_ind: [B, K]
+    returns:   [B, K, ...]
+    """
+    take_shape = list(embed_ind.shape) + [1] * (x.dim() - embed_ind.dim())
+    ind_exp = embed_ind.view(*take_shape).expand(-1, -1, *x.shape[2:])
+    return torch.take_along_dim(x, ind_exp, dim=1)
 
 
 def _as_b0_channel(vol, occ_channel=0):
