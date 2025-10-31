@@ -13,11 +13,62 @@ from datasets.point_cloud_datasets.get_dataset import get_point_cloud_dataset, p
 from datasets.voxelize_ds_wrapper import VoxelizedDataset
 
 from voxel_models import DLP  # voxel-capable DLP (same as training)
-from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, topk_kps,
+from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries,
         extract_volumes_for_vis, print_vol_stats)
 
 import wandb
 
+
+@torch.no_grad()
+def filter_topk_kps_3d(
+    z_base_var,      # [B, K, 6] = [prior_var_x,y,z | posterior_logvar_x,y,z]
+    mu_tot,          # [B, K, 3]
+    topk: int,
+    obj_on=None,     # [B, K, 1] or [B, K]; optional
+    use_posterior_in_score: bool = False,
+    eps: float = 1e-6
+):
+    print("Z BASE VAR SHAPE: ", z_base_var.shape)
+    B,_, K, C = z_base_var.shape
+    assert C in (3, 6), "z_base_var must have 3 (prior var) or 6 (prior var + posterior logvar) channels"
+    # Flatten batch for safe indexing then restore
+    zvar = z_base_var.view(B, K, C)
+
+    # Prior variances are already positive (from diag(cov))
+    prior_var = zvar[..., :3]                    # [B, K, 3]
+
+    if use_posterior_in_score and C == 6:
+        post_logvar = zvar[..., 3:6]            # [B, K, 3] (could be negative)
+        post_var    = post_logvar.exp().clamp_min(eps)
+        unc = prior_var.sum(-1) + post_var.sum(-1)  # [B, K]
+    else:
+        unc = prior_var.sum(-1)                      # [B, K]
+
+    # Optional gating by obj_on (same as your 2D)
+    if obj_on is not None:
+        g = obj_on
+        if g.dim() == 3 and g.size(-1) == 1:
+            g = g.squeeze(-1)                      # [B, K]
+        unc = unc * g                              # [B, K]
+
+    # Top-K lowest uncertainty
+    k = min(topk, K)
+    _, indices = torch.topk(unc, k=k, dim=-1, largest=False)   # [B, k]
+
+    batch_idx = torch.arange(B, device=mu_tot.device).view(-1, 1)
+    print("MU TOT SHAPE: ", mu_tot.shape)
+    topk_kp   = mu_tot[batch_idx, indices]                     # [B, k, 3]
+
+    # For your bbox scores (same sign as your 2D code)
+    bb_scores = -unc                                           # [B, K]
+    
+    print("TOPK KP SHAPE: ", topk_kp.shape)
+    return {
+        "indices":   indices,   # [B, k]
+        "topk_kp":   topk_kp,   # [B, k, 3]
+        "unc":       unc,       # [B, K] (selection score before negation)
+        "bb_scores": bb_scores  # [B, K]
+    }
 # ------------------------------- helpers -------------------------------
 
 def find_latest_checkpoint(run_save_dir: str) -> Optional[str]:
@@ -236,28 +287,29 @@ def main():
             kp_xyz = model_output.get('kp_p', None)
 
 
-            # Top-K by variance (mirrors training call)
-            idx, kp_topk, score_topk, scores_all = topk_kps(model_output, cfg['topk'], use_mu="kp_p", gate_with_obj_on=True, eps=1e-12)
-            # take first in batch for voxel plots (consistent with training eval snippet)
-            print("KP TOPK: ", kp_topk.shape)
-            print("KP TOPK SCORES: ", score_topk)
-            b0 = 0
-            kp_b0    = None if kp_xyz is None else kp_xyz[b0]
-            kpt_b0   = None if kp_topk is None else kp_topk[b0]
-            score_b0 = None if score_topk is None else score_topk[b0]
-            print("KP TOPK: ", kpt_b0.shape)
-            print("KP TOPK SCORES: ", score_b0)
+            with torch.no_grad():
+                # z_base_var: [B,K,6], mu_tot: [B,K,3], obj_on: [B,K,1]
+                out = filter_topk_kps_3d(
+                    z_base_var=model_output["z_base_var"],
+                    mu_tot=model_output["kp_p"],
+                    topk=cfg['topk'],
+                    obj_on=model_output.get("obj_on", None),
+                    use_posterior_in_score=False  # set True to include posterior uncertainty
+                )
+                indices  = out["indices"]
+                topk_kp  = out["topk_kp"]
+                bb_scores= out["bb_scores"]
 
             # ------ Voxel overlays (same as training) ------
-            log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=kp_b0,
+            log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,
                                    iso_levels=[iso_main], step=step)
             log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=None,
                                    iso_levels=[iso_main], step=step)
             log_vox_overlay_plotly("rec/rec", None, rec_vol, kps=None,
                                    iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=kpt_b0,
+            log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=None,
                                    iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=kpt_b0,
+            log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=None,
                                    iso_levels=[iso_main], step=step)
 
             # --- compact KP stats ---
