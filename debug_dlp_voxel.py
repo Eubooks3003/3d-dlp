@@ -308,7 +308,8 @@ def main():
                 indices  = out["indices"]
                 topk_kp  = out["topk_kp"]
                 bb_scores= out["bb_scores"]
-
+            
+            print("bb scores: ", bb_scores)
             b0 = 0  # first in batch
             topk_kp_b0 = topk_kp[b0]  # [k, 3]
             cov_b0 = model_output["cov_kp"][b0]  # [K, 6]
@@ -318,6 +319,7 @@ def main():
             print("TOPK kp (b0):", topk_kp_b0.cpu().numpy())
             print("KP_P: ", kp_xyz[b0].shape)
             print("z_base_cov_b0 B0: ", z_base_cov_b0.shape)
+
             # ------ Voxel overlays (same as training) ------
             # log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,
             #                        iso_levels=[iso_main], step=step)

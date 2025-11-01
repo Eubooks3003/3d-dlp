@@ -3111,61 +3111,51 @@ class ParticleAttributeEncoder(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        # pass
+        # ---- generic inits ----
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
-                # pass
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0.0, self.init_conv_fg_std)
-                # nn.init.constant_(m.weight, 0.0)
-                if self.init_zero_bias and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                if self.init_zero_bias and (m.bias is not None):
+                    nn.init.constant_(m.bias, 0.0)
             elif isinstance(m, nn.Linear):
-                if self.init_zero_bias and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        # torch.nn.init.normal_(self.xy_head[-1].weight[:2], std=0.02)
-        torch.nn.init.constant_(self.xy_head[-1].weight[:2], 0.0)
-        torch.nn.init.constant_(self.xy_head[-1].bias[:2], 0.0)
-        torch.nn.init.constant_(self.xy_head[-1].weight[2:], 0.0)
-        torch.nn.init.constant_(self.xy_head[-1].bias[2:], math.log(0.01 ** 2))
+                if self.init_zero_bias and (m.bias is not None):
+                    nn.init.constant_(m.bias, 0.0)
+
+        # ---- xy_head: [mu_x, mu_y, mu_z, logvar_x, logvar_y, logvar_z] ----
+        W = self.xy_head[-1].weight
+        b = self.xy_head[-1].bias
+        nn.init.constant_(W, 0.0)
+        if b is not None:
+            nn.init.constant_(b, 0.0)
+            # set only logvar biases
+            b.data[3:6] = math.log(0.01 ** 2)
+
+        # ---- scale_xy_head: [mu_sx, mu_sy, mu_sz, logvar_sx, logvar_sy, logvar_sz] ----
         if self.with_scale:
-            # torch.nn.init.constant_(self.scale_xy_head[-1].weight[:2], 0.0)
-            # torch.nn.init.constant_(self.scale_xy_head[-1].weight[:2], -1.5)
-            # torch.nn.init.normal_(self.scale_xy_head[-1].weight[:2], 0.0, 0.1)
-            # torch.nn.init.xavier_uniform_(self.scale_xy_head[-1].weight[:2])
-            # torch.nn.init.kaiming_normal_(self.scale_xy_head[-1].weight[:2])
-            torch.nn.init.constant_(self.scale_xy_head[-1].bias[:2], 0.0)
-            # torch.nn.init.constant_(self.scale_xy_head[-1].bias[:2], np.log(scale_init / (1 - scale_init)))
-            # torch.nn.init.constant_(self.scale_xy_head[-1].bias[:2], -0.2)
-            #
-            #     # scale_init = min(1.0, 1.25 * self.anchor_size + 1e-5)  # smaller scale (it goes ~1/scale)
-            #     # torch.nn.init.constant_(self.scale_xy_head[-1].weight[:2], 0.0)
-            #     # torch.nn.init.constant_(self.scale_xy_head[-1].bias[:2],
-            #     #                         np.log(scale_init / (1 - scale_init)))
-            #
-            # torch.nn.init.constant_(self.scale_xy_head[-1].weight[2:], 0.0)
-            # torch.nn.init.constant_(self.scale_xy_head[-1].bias[2:], math.log(0.01 ** 2))
-            torch.nn.init.constant_(self.scale_xy_head[-1].bias[2:], math.log(0.1 ** 2))
-            # torch.nn.init.constant_(self.scale_xy_head[-1].bias[2:], math.log(0.15 ** 2))
-            torch.nn.init.constant_(self.scale_xy_head[-1].weight, 0.0)
-            # torch.nn.init.normal_(self.scale_xy_head[-1].weight, std=0.02)
+            Ws = self.scale_xy_head[-1].weight
+            bs = self.scale_xy_head[-1].bias
+            nn.init.constant_(Ws, 0.0)
+            if bs is not None:
+                nn.init.constant_(bs, 0.0)
+                bs.data[3:6] = math.log(0.1 ** 2)  # your chosen init variance for scale
 
+        # ---- obj_on_head (Beta params are produced elsewhere from this logit) ----
         if self.with_obj_on:
-            torch.nn.init.constant_(self.obj_on_head[-1].weight, 0.0)
-            # torch.nn.init.normal_(self.obj_on_head[-1].weight, std=0.01)
+            Wo = self.obj_on_head[-1].weight
+            bo = self.obj_on_head[-1].bias
+            nn.init.constant_(Wo, 0.0)
+            if bo is not None:
+                nn.init.constant_(bo, 0.0)
 
-            # torch.nn.init.constant_(self.obj_on_head[-1].bias[0], -3.0)  # beta(a,), older, without log
-            # torch.nn.init.constant_(self.obj_on_head[-1].bias[1], 3.0)  # beta(,b), older, without log
-            # torch.nn.init.constant_(self.obj_on_head[-1].bias[0], 0.0)  # beta(a,)
-            # torch.nn.init.constant_(self.obj_on_head[-1].bias[1], 0.0)  # beta(,b)
-            # torch.nn.init.constant_(self.obj_on_head[-1].bias[0], 0.0)  # beta(a,)
-            # torch.nn.init.constant_(self.obj_on_head[-1].bias[1], 0.0)  # beta(,b)
-            if self.obj_on_head[-1].bias is not None:
-                torch.nn.init.constant_(self.obj_on_head[-1].bias, 0.0)  # beta(a,)
-
-            # torch.nn.init.constant_(self.obj_on_head_2[-1].weight, 0.0)
-            # torch.nn.init.constant_(self.obj_on_head_2[-1].bias[0], -6.0)  # beta(a,)
-            # torch.nn.init.constant_(self.obj_on_head_2[-1].bias[1], 6.0)  # beta(,b)
+        # ---- depth_head: [mu_depth, logvar_depth] (optional) ----
+        if self.with_depth and (self.depth_head is not None):
+            Wd = self.depth_head[-1].weight
+            bd = self.depth_head[-1].bias
+            nn.init.constant_(Wd, 0.0)
+            if bd is not None:
+                nn.init.constant_(bd, 0.0)
+                bd.data[1] = math.log(0.01 ** 2)
 
     def forward(self, x, kp, z_scale=None, timesteps=None, deterministic=False):
         # x: [batch_size, ch, H, W, L]
@@ -3259,6 +3249,8 @@ class ParticleAttributeEncoder(nn.Module):
             mu_depth, logvar_depth = torch.chunk(depth, 2, dim=-1)
         else:
             mu_depth = logvar_depth = None
+
+        print("MU 0: ", mu[0,0])
 
         spatial_out = {'mu': mu, 'logvar': logvar, 'mu_scale': mu_scale, 'logvar_scale': logvar_scale,
                        'lobj_on_a': lobj_on_a, 'lobj_on_b': lobj_on_b, 'obj_on': obj_on,

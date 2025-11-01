@@ -641,15 +641,52 @@ def log_cov_ellipsoids_over_voxels(
         name="KP centers"
     ))
 
-    # ---- Scene limits from GT occupancy box ----
-    mask_base = np.transpose((V > float(iso)), (2,1,0))
-    xr, yr, zr = _robust_nonempty_box(mask_base)
+    # ---- Scene limits: union of GT + KPs + ellipsoids ----
+    pad = 2.0  # voxels of padding
+    has_gt = False
+    mins = []
+    maxs = []
+
+    # GT bounds (if show_gt and any voxel is on)
+    if show_gt:
+        mask_base = np.transpose((V > float(iso)), (2,1,0))  # (X,Y,Z)
+        if mask_base.any():
+            has_gt = True
+            xr, yr, zr = _robust_nonempty_box(mask_base)
+            mins.append([xr[0], yr[0], zr[0]])
+            maxs.append([xr[1], yr[1], zr[1]])
+
+    # KP centers
+    if KPx is not None and KPx.size > 0:
+        mins.append([float(KPx[:,0].min()), float(KPx[:,1].min()), float(KPx[:,2].min())])
+        maxs.append([float(KPx[:,0].max()), float(KPx[:,1].max()), float(KPx[:,2].max())])
+
+    # Ellipsoid meshes: collect vertex limits if any were added
+    ellip_points = []
+    for tr in fig.data:
+        if isinstance(tr, go.Mesh3d) and tr.name.startswith("σ ellipsoid"):
+            ellip_points.append(np.column_stack([tr.x, tr.y, tr.z]))
+    if len(ellip_points):
+        P_all = np.concatenate(ellip_points, axis=0)
+        mins.append(P_all.min(axis=0).tolist())
+        maxs.append(P_all.max(axis=0).tolist())
+
+    # Fallback to full volume if nothing else
+    if not mins:
+        D,H,W = V.shape
+        mins.append([0.0, 0.0, 0.0])
+        maxs.append([float(W-1), float(H-1), float(D-1)])   # note: your coords are (X,Y,Z) ~ (W,H,D)
+
+    mins = np.array(mins).min(axis=0) - pad
+    maxs = np.array(maxs).max(axis=0) + pad
+
     fig.update_scenes(
-        xaxis=dict(range=[xr[0], xr[1]]),
-        yaxis=dict(range=[yr[0], yr[1]]),
-        zaxis=dict(range=[zr[0], zr[1]]),
+        xaxis=dict(range=[mins[0], maxs[0]]),
+        yaxis=dict(range=[mins[1], maxs[1]]),
+        zaxis=dict(range=[mins[2], maxs[2]]),
         aspectmode="data"
     )
+
     fig.update_layout(
         title=f"Covariance ellipsoids over GT (iso≥{iso}) — color by trace(Σ)",
         margin=dict(l=0,r=0,t=40,b=0),
