@@ -476,3 +476,185 @@ def log_voxel_rec_distributions(model_output, x, *, occ_channel=0, name_prefix="
     })
 
     wandb.log(log_dict, step=step)
+
+
+import numpy as np
+import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
+
+def _ellipsoid_mesh(mean_xyz, cov3, scale=1.0, nu=18, nv=18):
+    """
+    Build a triangular mesh for the covariance ellipsoid:
+      { x | (x-μ)^T Σ^{-1} (x-μ) = c^2 } with c=scale
+    """
+    # eigendecomposition (Σ = R diag(λ) R^T)
+    w, R = np.linalg.eigh(cov3)
+    w = np.clip(w, 1e-12, None)            # guard
+    radii = scale * np.sqrt(w)              # axes lengths
+
+    # parametric sphere
+    u = np.linspace(0, 2*np.pi, nu, endpoint=True)
+    v = np.linspace(0, np.pi, nv, endpoint=True)
+    uu, vv = np.meshgrid(u, v, indexing="xy")
+    X = radii[0] * np.cos(uu) * np.sin(vv)
+    Y = radii[1] * np.sin(uu) * np.sin(vv)
+    Z = radii[2] * np.cos(vv)
+    P = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)           # [(nu*nv),3]
+    P = (P @ R.T) + mean_xyz[None, :]                         # rotate + translate
+
+    # triangles
+    def idx(i, j):  # wrap u, clamp v
+        return (i % nu) + j * nu
+    faces = []
+    for j in range(nv - 1):
+        for i in range(nu):
+            i0 = idx(i, j)
+            i1 = idx(i + 1, j)
+            i2 = idx(i + 1, j + 1)
+            i3 = idx(i, j + 1)
+            faces.append([i0, i1, i2])
+            faces.append([i0, i2, i3])
+    faces = np.asarray(faces, dtype=int)
+    return P, faces
+
+@torch.no_grad()
+def log_cov_ellipsoids_over_voxels(
+    name,
+    gt_vol,                    # [D,H,W] or [1,D,H,W] tensor/np
+    kp_norm,                   # [B,N,3] in [-1,1] (order given by kp_order)
+    cov_kp,                    # [B,N,3,3]
+    *,
+    step=None,
+    kp_order=("x","y","z"),    # how kp_norm components are ordered
+    iso=0.5,                   # GT iso for surface
+    ellip_scale=2.0,           # c-value: 1≈1σ; 2≈~95% if Gaussian
+    max_ellipsoids=128,        # cap plotting
+    color_scale="Viridis",     # Plotly colorscale name
+    show_gt=True
+):
+    from plotly.colors import sample_colorscale
+
+    V = _as_DHW(gt_vol)
+    if V is None:
+        raise ValueError("gt_vol required for context.")
+    if kp_norm is None or cov_kp is None:
+        raise ValueError("kp_norm [B,N,3] and cov_kp [B,N,3,3] are required.")
+
+    D,H,W = V.shape
+    fig = go.Figure()
+
+    # ---- Draw GT voxels (iso surface) ----
+    if show_gt:
+        maskG = np.transpose((V > float(iso)), (2,1,0))  # -> (X,Y,Z)
+        if maskG.any():
+            if _HAS_FF:
+                import plotly.figure_factory as ff
+                vox = ff.create_voxels(maskG,
+                                       colorscale=[[0,"rgba(31,119,180,1.0)"],[1,"rgba(31,119,180,1.0)"]],
+                                       opacity=0.5)
+                for tr in vox.data:
+                    tr.name = "GT"
+                    fig.add_trace(tr)
+            else:
+                for tr in _mesh_from_binary(maskG, "rgba(31,119,180,1.0)", 0.5):
+                    tr.name = "GT"
+                    fig.add_trace(tr)
+
+    # ---- Prepare KP positions / covs (batch 0) ----
+    kp0  = kp_norm[0]                    # [N,3] torch
+    cov0 = cov_kp[0]                     # [N,3,3] torch
+    KPx  = _kp_norm_to_index(kp0, D,H,W, order=kp_order)   # -> np [N,3] in voxel indices
+    COV  = _np(cov0)                     # -> np [N,3,3]
+    N    = int(KPx.shape[0])
+
+    print("Number of keypoints for ellipsoids:", N)
+
+    if N == 0:
+        fig.add_annotation(text="No keypoints to plot", showarrow=False)
+        wandb.log({name: fig}, step=step)
+        return
+
+    # ---- scoring by trace (total variance) ----
+    # keep it 1D even for N=1
+    traces = np.trace(COV, axis1=-2, axis2=-1).reshape(-1)   # [N]
+
+    # select which to draw (smallest traces first = sharper ellipsoids)
+    order = np.argsort(traces)
+    if N > max_ellipsoids:
+        order = order[:max_ellipsoids]
+
+    t_sel = traces[order]                  # [K]
+    if t_sel.size == 0:
+        fig.add_annotation(text="No valid ellipsoids to plot", showarrow=False)
+        wandb.log({name: fig}, step=step)
+        return
+    t_min = float(np.min(t_sel))
+    t_max = float(np.max(t_sel))
+
+    # color function
+    def _color_for(val):
+        if t_max == t_min:
+            frac = 0.5
+        else:
+            frac = float((val - t_min) / (t_max - t_min))
+        # sample_colorscale returns list of rgba strings; take first
+        rgba = sample_colorscale(color_scale, [frac])[0]
+        # Ensure alpha ~0.85 for visibility
+        if rgba.startswith("rgb("):
+            r,g,b = [int(x) for x in rgba[4:-1].split(",")]
+            return f"rgba({r},{g},{b},0.85)"
+        if rgba.startswith("rgba("):
+            comps = rgba[5:-1].split(",")
+            comps[-1] = "0.85"
+            return "rgba(" + ",".join(comps) + ")"
+        return rgba
+
+    # ---- Add ellipsoids ----
+    added = 0
+    for idx in order:
+        mu_xyz = KPx[idx]    # (x,y,z) in voxel indices
+        Sigma  = COV[idx]
+        print("Sigma:", Sigma)
+        # skip invalid covariances
+        if not np.isfinite(Sigma).all():
+            continue
+        try:
+            P, F = _ellipsoid_mesh(mu_xyz, Sigma, scale=ellip_scale, nu=18, nv=14)
+        except Exception:
+            continue
+        col = _color_for(traces[idx])
+        fig.add_trace(go.Mesh3d(
+            x=P[:,0], y=P[:,1], z=P[:,2],
+            i=F[:,0], j=F[:,1], k=F[:,2],
+            opacity=0.85, color=col, name=f"σ ellipsoid (tr={traces[idx]:.3g})",
+            showscale=False, flatshading=True
+        ))
+        added += 1
+
+    if added == 0:
+        fig.add_annotation(text="No valid ellipsoids to plot", showarrow=False)
+
+    # ---- KP centers as markers ----
+    fig.add_trace(go.Scatter3d(
+        x=KPx[:,0], y=KPx[:,1], z=KPx[:,2],
+        mode="markers",
+        marker=dict(size=3, color="black"),
+        name="KP centers"
+    ))
+
+    # ---- Scene limits from GT occupancy box ----
+    mask_base = np.transpose((V > float(iso)), (2,1,0))
+    xr, yr, zr = _robust_nonempty_box(mask_base)
+    fig.update_scenes(
+        xaxis=dict(range=[xr[0], xr[1]]),
+        yaxis=dict(range=[yr[0], yr[1]]),
+        zaxis=dict(range=[zr[0], zr[1]]),
+        aspectmode="data"
+    )
+    fig.update_layout(
+        title=f"Covariance ellipsoids over GT (iso≥{iso}) — color by trace(Σ)",
+        margin=dict(l=0,r=0,t=40,b=0),
+        showlegend=True,
+        legend=dict(orientation='h')
+    )
+    wandb.log({name: fig}, step=step)

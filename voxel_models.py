@@ -1137,6 +1137,7 @@ class DLP(nn.Module):
         logvar_anchor = enc_dict['logvar_anchor']
         z_base = enc_dict['z_base']
         z_base_var = enc_dict['z_base_var']
+        z_base_cov = enc_dict['z_base_cov']
         z = enc_dict['z']
         mu_offset = enc_dict['mu_offset']
         logvar_offset = enc_dict['logvar_offset']
@@ -1311,7 +1312,7 @@ class DLP(nn.Module):
             logvar_score_dyn = None
 
         output_dict = {'kp_p': kp_p, 'rec': rec, 'rec_rgb': rec_rgb, 'rec_depth': rec_depth, 'mu_anchor': mu_anchor,
-                       'logvar_anchor': logvar_anchor, 'z_base_var': z_base_var,
+                       'logvar_anchor': logvar_anchor, 'z_base_var': z_base_var, 'z_base_cov': z_base_cov,
                        'z_base': z_base, 'z': z,
                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset,
                        'mu_tot': mu_tot, 'mu_features': mu_features, 'logvar_features': logvar_features,

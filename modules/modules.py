@@ -4648,6 +4648,7 @@ class ParticleEncoder(nn.Module):
         # per-axis variance from the prior covariance (diag)
         var_kp = torch.diagonal(cov_kp, dim1=-2, dim2=-1)  # [B, n_kp_prior, 3]
         z_base_var = var_kp.detach()
+        z_base_cov = cov_kp.detach()
 
         print("Z BASE VAR: ", z_base_var)
 
@@ -4689,6 +4690,7 @@ class ParticleEncoder(nn.Module):
             mu_score     = mu_score[batch_ind, embed_ind]      # [B, n_kp_enc, 1]
             logvar_score = logvar_score[batch_ind, embed_ind]  # [B, n_kp_enc, 1]
             z_score      = z_score[batch_ind, embed_ind]       # [B, n_kp_enc, 1]
+            z_base_cov  = z_base_cov[batch_ind, embed_ind]   # [B, n_kp_enc, 3,3]
 
             if logvar_scale is not None:
                 logvar_scale = logvar_scale[batch_ind, embed_ind]  # [B, n_kp_enc, 3]
@@ -4716,7 +4718,7 @@ class ParticleEncoder(nn.Module):
             'kp_p': kp_p,
             # keep both for convenience: full covariance + per-axis variance
             'cov_kp': cov_kp, 'var_kp': var_kp,
-            'z_base_var': z_base_var, 'total_var': total_var,
+            'z_base_var': z_base_var, 'total_var': total_var, 'z_base_cov': z_base_cov,
             'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'z_obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
             'z_base_id': z_base_id, 'mu_score': mu_score, 'logvar_score': logvar_score, 'z_score': z_score
         }
@@ -4830,6 +4832,7 @@ class ParticleEncoder(nn.Module):
         cov_kp       = stage1_dict['cov_kp']          # <-- CHANGED: use covariance, not var
         var_kp      = stage1_dict['var_kp']
         z_base_var   = stage1_dict['z_base_var']
+        z_base_cov   = stage1_dict['z_base_cov']
         total_var    = stage1_dict['total_var']
         patch_id_embed = stage1_dict['patch_id_embed']
 
@@ -4903,6 +4906,7 @@ class ParticleEncoder(nn.Module):
         # reshape to [bs, T, ...]
         z_base       = z_base.view(bs, timestep_horizon, *z_base.shape[1:])
         z_base_var   = z_base_var.view(bs, timestep_horizon, *z_base_var.shape[1:])
+        z_base_cov   = z_base_cov.view(bs, timestep_horizon, *z_base_cov.shape[1:])
         if patch_id_embed is not None:
             patch_id_embed = patch_id_embed.view(bs, timestep_horizon, *patch_id_embed.shape[1:])
         mu_offset    = mu_offset.view(bs, timestep_horizon, *mu_offset.shape[1:])
@@ -4945,7 +4949,7 @@ class ParticleEncoder(nn.Module):
             'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
             'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
             'kp_p': kp_p, 'cov_kp': cov_kp, 'var_kp': var_kp,             
-            'z_base_var': z_base_var, 'mu_score': mu_score,
+            'z_base_var': z_base_var, 'mu_score': mu_score, 'z_base_cov': z_base_cov,
             'logvar_score': logvar_score, 'z_score': z_score
         }
         return encode_dict
@@ -5421,6 +5425,7 @@ class DLPEncoder(nn.Module):
         z_offset          = particle_dict['z_offset']
         mu_tot            = particle_dict['mu_tot']
         z_base_var        = particle_dict['z_base_var']
+        z_base_cov        = particle_dict['z_base_cov']
         mu_scale          = particle_dict['mu_scale']
         logvar_scale      = particle_dict['logvar_scale']
         z_scale           = particle_dict['z_scale']
@@ -5585,6 +5590,7 @@ class DLPEncoder(nn.Module):
             if mu_obj_on is not None:
                 mu_obj_on = mu_obj_on[:, :-1].contiguous()
             z_base_var = z_base_var[:, :-1].contiguous()
+            z_base_cov = z_base_cov[:, :-1].contiguous()
             mu_depth = mu_depth[:, :-1].contiguous()
             logvar_depth = logvar_depth[:, :-1].contiguous()
             z_depth = z_depth[:, :-1].contiguous()
@@ -5610,7 +5616,7 @@ class DLPEncoder(nn.Module):
                        'z_context_global': z_context_global,
                        'cropped_objects': cropped_objects.detach(), 'patch_id_embed': patch_id_embed,
                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on, 'mu_obj_on': mu_obj_on,
-                       'z_base_var': z_base_var, 'cov_kp': cov_kp,
+                       'z_base_var': z_base_var, 'cov_kp': cov_kp, 'z_base_cov': z_base_cov,
                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
                        'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
                        'kp_p': kp_p, 'var_kp': var_kp, 'bg_enc_mask': bg_enc_mask,

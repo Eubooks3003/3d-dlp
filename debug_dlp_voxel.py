@@ -13,7 +13,7 @@ from datasets.point_cloud_datasets.get_dataset import get_point_cloud_dataset, p
 from datasets.voxelize_ds_wrapper import VoxelizedDataset
 
 from voxel_models import DLP  # voxel-capable DLP (same as training)
-from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries,
+from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, log_cov_ellipsoids_over_voxels,
         extract_volumes_for_vis, print_vol_stats)
 
 import wandb
@@ -271,7 +271,7 @@ def main():
     # ----- loop -----
     step = 0
     max_batches = args.max_batches
-    iso_main = 0.67
+    iso_main = 0.65
     iso_sweep = make_iso_sweep()
 
     with torch.no_grad():
@@ -289,8 +289,12 @@ def main():
             # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
             kp_xyz = model_output.get('kp_p', None)
 
-            print("MU TOT: ", model_output["z_base"] + model_output["mu_offset"])
+            # print("MU TOT: ", model_output["z_base"] + model_output["mu_offset"])
+            # print("VAR BASE: ", model_output["z_base_var"])
 
+            print("KP BASE: ", model_output["z_base"].shape)
+
+            print("COVKP: ", model_output["cov_kp"].shape)
 
             with torch.no_grad():
                 # z_base_var: [B,K,6], mu_tot: [B,K,3], obj_on: [B,K,1]
@@ -307,9 +311,13 @@ def main():
 
             b0 = 0  # first in batch
             topk_kp_b0 = topk_kp[b0]  # [k, 3]
+            cov_b0 = model_output["cov_kp"][b0]  # [K, 6]
+
+            z_base_cov_b0 = model_output["z_base_cov"][b0]  # [K, 6]
 
             print("TOPK kp (b0):", topk_kp_b0.cpu().numpy())
-            print("KP_P: ", kp_xyz[b0].cpu().numpy())
+            print("KP_P: ", kp_xyz[b0].shape)
+            print("z_base_cov_b0 B0: ", z_base_cov_b0.shape)
             # ------ Voxel overlays (same as training) ------
             log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,
                                    iso_levels=[iso_main], step=step)
@@ -321,6 +329,24 @@ def main():
                                    iso_levels=[iso_main], step=step)
             log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=topk_kp_b0,
                                    iso_levels=[iso_main], step=step)
+            
+            z_base_b0 = model_output["z_base"][b0]  # [K, 3]
+            print("Z BASE B0: ", z_base_b0.shape)
+            log_cov_ellipsoids_over_voxels(
+                name="cov/over_gt",
+                gt_vol=gt_vol,
+                kp_norm=model_output["z_base"][b0],
+                cov_kp=z_base_cov_b0,
+                step=step,
+                kp_order=("x","y","z"),
+                iso=0.67,
+                ellip_scale=2.0,
+                max_ellipsoids=128,
+                color_scale="Viridis",
+                show_gt=True
+            )
+
+
 
             # --- compact KP stats ---
             kp_stats = summarize_kp(model_output)
