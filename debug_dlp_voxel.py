@@ -319,26 +319,43 @@ def main():
             print("KP_P: ", kp_xyz[b0].shape)
             print("z_base_cov_b0 B0: ", z_base_cov_b0.shape)
             # ------ Voxel overlays (same as training) ------
-            log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,
-                                   iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=kp_xyz[b0],
-                                   iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("rec/rec", None, rec_vol, kps=None,
-                                   iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=topk_kp_b0,
-                                   iso_levels=[iso_main], step=step)
-            log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=topk_kp_b0,
-                                   iso_levels=[iso_main], step=step)
+            # log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,
+            #                        iso_levels=[iso_main], step=step)
+            # log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=kp_xyz[b0],
+            #                        iso_levels=[iso_main], step=step)
+            # log_vox_overlay_plotly("rec/rec", None, rec_vol, kps=None,
+            #                        iso_levels=[iso_main], step=step)
+            # log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=topk_kp_b0,
+            #                        iso_levels=[iso_main], step=step)
+            # log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=topk_kp_b0,
+            #                        iso_levels=[iso_main], step=step)
             
             z_base_b0 = model_output["z_base"][b0]  # [K, 3]
+            mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
+            print("MU TOT B0: ", mu_tot_b0.shape)
             print("Z BASE B0: ", z_base_b0.shape)
+            
+            kp_order = ("x","y","z")  # your kp_xyz is in (x,y,z) order
             log_cov_ellipsoids_over_voxels(
-                name="cov/over_gt",
+                name="gt/over_gt_all_kp",
+                gt_vol=gt_vol,
+                kp_norm=kp_xyz,
+                cov_kp=model_output["cov_kp"],
+                step=step,
+                kp_order=kp_order,
+                iso=0.67,
+                ellip_scale=2.0,
+                max_ellipsoids=128,
+                color_scale="Viridis",
+                show_gt=True
+            )
+            log_cov_ellipsoids_over_voxels(
+                name="gt/over_gt",
                 gt_vol=gt_vol,
                 kp_norm=model_output["z_base"][b0],
                 cov_kp=z_base_cov_b0,
                 step=step,
-                kp_order=("x","y","z"),
+                kp_order=kp_order,
                 iso=0.67,
                 ellip_scale=2.0,
                 max_ellipsoids=128,
@@ -346,6 +363,61 @@ def main():
                 show_gt=True
             )
 
+            log_cov_ellipsoids_over_voxels(
+                name="gt/over_gt_w_offset",
+                gt_vol=gt_vol,
+                kp_norm=mu_tot_b0,
+                cov_kp=z_base_cov_b0,
+                step=step,
+                kp_order=kp_order,
+                iso=0.67,
+                ellip_scale=2.0,
+                max_ellipsoids=128,
+                color_scale="Viridis",
+                show_gt=True
+            )
+
+            # REC
+            log_cov_ellipsoids_over_voxels(
+                name="rec/over_gt_all_kp",
+                gt_vol=rec_vol,
+                kp_norm=kp_xyz,
+                cov_kp=model_output["cov_kp"],
+                step=step,
+                kp_order=kp_order,
+                iso=0.67,
+                ellip_scale=2.0,
+                max_ellipsoids=128,
+                color_scale="Viridis",
+                show_gt=True
+            )
+            log_cov_ellipsoids_over_voxels(
+                name="rec/over_gt",
+                gt_vol=rec_vol,
+                kp_norm=model_output["z_base"][b0],
+                cov_kp=z_base_cov_b0,
+                step=step,
+                kp_order=kp_order,
+                iso=0.67,
+                ellip_scale=2.0,
+                max_ellipsoids=128,
+                color_scale="Viridis",
+                show_gt=True
+            )
+
+            log_cov_ellipsoids_over_voxels(
+                name="rec/over_gt_w_offset",
+                gt_vol=rec_vol,
+                kp_norm=mu_tot_b0,
+                cov_kp=z_base_cov_b0,
+                step=step,
+                kp_order=kp_order,
+                iso=0.67,
+                ellip_scale=2.0,
+                max_ellipsoids=128,
+                color_scale="Viridis",
+                show_gt=True
+            )
 
 
             # --- compact KP stats ---

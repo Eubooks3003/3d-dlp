@@ -614,7 +614,6 @@ def log_cov_ellipsoids_over_voxels(
     for idx in order:
         mu_xyz = KPx[idx]    # (x,y,z) in voxel indices
         Sigma  = COV[idx]
-        print("Sigma:", Sigma)
         # skip invalid covariances
         if not np.isfinite(Sigma).all():
             continue
@@ -658,3 +657,57 @@ def log_cov_ellipsoids_over_voxels(
         legend=dict(orientation='h')
     )
     wandb.log({name: fig}, step=step)
+
+
+@torch.no_grad()
+
+def filter_topk_kps_3d(
+    z_base_var,      # [B, *G*, K, C]  (C = 3 or 6)
+    mu_tot,          # [B, *G*, K, 3]  (must align to same K as z_base_var)
+    topk: int,
+    obj_on=None,     # [B, *G*, K, 1] or [B, *G*, K] (optional)
+    use_posterior_in_score: bool = False,
+    eps: float = 1e-6,
+):
+    B = z_base_var.shape[0]
+    C = z_base_var.shape[-1]
+    assert C in (3, 6)
+
+    # 1) Squeeze any extra group/time dims so both are [B, K, ·]
+    zvar = z_base_var.view(B, -1, C)          # [B, K, C]
+    mu   = mu_tot.view(B, -1, 3)              # [B, K, 3]
+    K = zvar.size(1)
+
+    # 2) Uncertainty score (prior variance sum; optionally add posterior var)
+    prior_var = zvar[..., :3]                 # [B, K, 3]  (≥ 0)
+    if use_posterior_in_score and C == 6:
+        post_var = zvar[..., 3:6].exp().clamp_min(eps)
+        unc = prior_var.sum(-1) + post_var.sum(-1)    # [B, K]
+    else:
+        unc = prior_var.sum(-1)                        # [B, K]
+
+    # Optional gating by obj_on
+    if obj_on is not None:
+        g = obj_on
+        if g.dim() == 4 and g.size(-1) == 1:  # [B,*G*,K,1]
+            g = g.view(B, -1)                 # [B, K]
+        else:
+            g = g.view(B, -1)
+        unc = unc * g
+
+    # 3) Top-k (smallest uncertainty)
+    k = min(topk, K)
+    _, idx = torch.topk(unc, k=k, dim=1, largest=False)          # [B, k]
+
+    # 4) Gather (no advanced indexing outer-product)
+    idx_exp = idx.unsqueeze(-1).expand(B, k, 3)                  # [B, k, 3]
+    topk_kp = torch.gather(mu, 1, idx_exp)                       # [B, k, 3]
+
+    bb_scores = -unc                                             # [B, K]
+    print("TOPK kp shape:", topk_kp.shape)
+    return {
+        "indices":   idx,        # [B, k] in the current K space
+        "topk_kp":   topk_kp,    # [B, k, 3]
+        "unc":       unc,        # [B, K]
+        "bb_scores": bb_scores,  # [B, K]
+    }

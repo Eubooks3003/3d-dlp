@@ -100,6 +100,121 @@ class AlternativeSpatialSoftmaxKP3D(torch.nn.Module):
         return kp, cov
 
 
+class SoftKNNMass3D(nn.Module):
+    """
+    Differentiable KNN-style local pooling over a voxel volume.
+
+    Inputs:
+      rec_vol: [B, 1, D, H, W]  (logits or probs; see as_logits)
+      kp_norm: [B, K, 3]        (x,y,z) in normalized coords ∈ [-1,1]
+                                (same convention as your SSM outputs)
+    Returns (depending on flags):
+      if return_mean=False and return_cov=False:
+         local_mass: [B, K]        # weighted sum of probs in a local 3D window
+      if return_mean=True:
+         local_mass: [B, K]
+         local_mean: [B, K, 3]     # weighted mean position (normalized coords)
+      if return_cov=True:
+         local_mass: [B, K]
+         local_mean: [B, K, 3]
+         local_cov:  [B, K, 3, 3]  # weighted covariance in normalized coords
+
+    Notes:
+      - Uses a Gaussian weight over a cubic window (radius = win_rad).
+      - Fully differentiable w.r.t. kp_norm and rec_vol.
+      - Set as_logits=True if rec_vol are logits; probs are computed via sigmoid.
+    """
+    def __init__(self,
+                 win_rad=(2, 2, 2),          # (rx, ry, rz) in voxel units
+                 sigma_vox=(2.0, 2.0, 2.0),  # Gaussian σ per axis, in voxel units
+                 as_logits=True,
+                 align_corners=True):
+        super().__init__()
+        self.rx, self.ry, self.rz = map(int, win_rad)
+        self.sx, self.sy, self.sz = map(float, sigma_vox)
+        self.as_logits = as_logits
+        self.align_corners = align_corners
+
+        # Pre-build integer offsets (dx,dy,dz) and register as buffers later (on first call)
+        self.register_buffer("_off_idx", None, persistent=False)
+        self.register_buffer("_w",       None, persistent=False)
+
+    def _build_offsets(self, device):
+        dz = torch.arange(-self.rz, self.rz + 1, device=device)
+        dy = torch.arange(-self.ry, self.ry + 1, device=device)
+        dx = torch.arange(-self.rx, self.rx + 1, device=device)
+        zz, yy, xx = torch.meshgrid(dz, dy, dx, indexing="ij")
+        off_idx = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3).float()  # [M,3] (dx,dy,dz)
+        # Gaussian weights over offsets (in voxel units)
+        w = torch.exp(-0.5 * ((off_idx[:,0] / self.sx) ** 2 +
+                              (off_idx[:,1] / self.sy) ** 2 +
+                              (off_idx[:,2] / self.sz) ** 2))
+        w = w / (w.sum() + 1e-8)
+        return off_idx, w
+
+    def _ensure_buffers(self, device):
+        if self._off_idx is None or self._off_idx.device != device:
+            off_idx, w = self._build_offsets(device)
+            self._off_idx = off_idx
+            self._w = w
+
+    @staticmethod
+    def _to_probs(x, as_logits=True):
+        return torch.sigmoid(x) if as_logits else x.clamp(0, 1)
+
+    def forward(self, rec_vol, kp_norm, return_mean=False, return_cov=False):
+        """
+        rec_vol: [B,1,D,H,W]  (logits or probs)
+        kp_norm: [B,K,3]      normalized (x,y,z) in [-1,1]
+        """
+        B, C, D, H, W = rec_vol.shape
+        assert C == 1, "rec_vol should have a single occupancy channel"
+
+        self._ensure_buffers(rec_vol.device)
+        off_idx = self._off_idx      # [M,3] (dx,dy,dz) in voxel units
+        w = self._w.to(rec_vol.dtype)  # [M]
+        M = off_idx.shape[0]
+
+        # Convert voxel offsets to normalized coords for grid_sample
+        to_norm = torch.tensor([2/(W-1), 2/(H-1), 2/(D-1)], device=rec_vol.device, dtype=rec_vol.dtype)
+        off_norm = off_idx * to_norm  # [M,3] (Δx,Δy,Δz) in normalized coords
+
+        K = kp_norm.shape[1]
+        base = kp_norm.unsqueeze(2).expand(B, K, M, 3)       # [B,K,M,3]
+        samp = base + off_norm.view(1, 1, M, 3)              # [B,K,M,3]
+
+        # grid_sample expects (z,y,x) in the last dim; shape [N, D,H,W], grid [N, ..., 3]
+        grid = samp[..., [2, 1, 0]].view(B * K, M, 1, 1, 3)  # [B*K, M, 1, 1, 3]
+        x_in = self._to_probs(rec_vol, self.as_logits)
+        x_in = x_in.unsqueeze(1).expand(B, K, 1, D, H, W).reshape(B * K, 1, D, H, W)
+        vals = F.grid_sample(
+            x_in, grid, mode='bilinear', padding_mode='zeros', align_corners=self.align_corners
+        ).view(B, K, M)  # [B,K,M] sampled probs
+
+        # Local mass (weighted sum)
+        w_broadcast = w.view(1, 1, M).to(vals.dtype)         # [1,1,M]
+        mass = (vals * w_broadcast).sum(dim=-1)              # [B,K]
+
+        if not (return_mean or return_cov):
+            return mass
+
+        # Weighted mean in normalized coords
+        weights = (vals * w_broadcast).unsqueeze(-1)         # [B,K,M,1]
+        pts_norm = samp.to(vals.dtype)                       # [B,K,M,3] (x,y,z) normalized
+        denom = weights.sum(dim=2).clamp_min(1e-8)           # [B,K,1]
+        mean = (weights * pts_norm).sum(dim=2) / denom       # [B,K,3]
+
+        if not return_cov:
+            return mass, mean
+
+        # Weighted covariance in normalized coords
+        diff = pts_norm - mean.unsqueeze(2)                  # [B,K,M,3]
+        # [B,K,3,3] = sum_m w_m * p_m p_m^T / sum_w   (with probs*w)
+        cov = torch.einsum('bkmc,bkmd->bkcd', weights * diff, diff) / denom  # [B,K,3,3]
+
+        return mass, mean, cov
+
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -3487,6 +3602,10 @@ class DLPPrior(nn.Module):
     def patches_to_vox(self, x):
         return self.patcher.patches_to_vox(x)
 
+    def zyx_to_xyz(self, v):  # [...,3]
+        print("++++++++FLIPPING ZYX TO XYZ++++++++")
+        return torch.stack([v[..., 2], v[..., 1], v[..., 0]], dim=-1)
+
     def encode_prior(self, x, filtering_heuristic='none', k=None):
         """
         x: [B, C, D, H, W]  (D=z, H=y, W=x)
@@ -3514,7 +3633,8 @@ class DLPPrior(nn.Module):
 
         kp_global = self.get_global_kp(kp_local)                       # [B,N,K,3]  (x,y,z) in global kp_range
         cov_global = cov_local                                         # (optionally rescale to global units)
-
+        kp_global_xyz = self.zyx_to_xyz(kp_global)                     # convert to (z,y,x) for output
+        print("FILTERING HEURISTIC: ", filtering_heuristic)
         # ---- filtering ----
         if filtering_heuristic == 'distance':
             scores = self.get_distance_from_patch_centers(kp_global)       # [B,N,K]
@@ -3537,11 +3657,12 @@ class DLPPrior(nn.Module):
             return kp_flat[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
         else:
             # none: return all
-            return kp_global.view(B, -1, 3), cov_global.view(B, -1, 3, 3)
+            kp_global_xyz = self.zyx_to_xyz(kp_global) 
+            return kp_global_xyz.view(B, -1, 3), cov_global.view(B, -1, 3, 3)
 
         # gather filtered
         b = torch.arange(B, device=x.device)[:, None]
-        return kp_global.view(B, -1, 3)[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
+        return kp_global_xyz.view(B, -1, 3)[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
 
     def forward(self, x):
         return self.encode_prior(x, filtering_heuristic=self.filtering_heuristic)
@@ -4585,7 +4706,6 @@ class ParticleEncoder(nn.Module):
         # prior now returns (x,y,z) and full covariance
         kp_p, cov_kp = self.encode_prior(x)  # kp_p: [B, n_kp_prior, 3], cov_kp: [B, n_kp_prior, 3, 3]
         
-        print("KP PRIOR: ", kp_p)
         # kp_init: [B, n_kp_prior, 3] in [-1, 1]
         kp_init = kp_p
 
@@ -4650,7 +4770,6 @@ class ParticleEncoder(nn.Module):
         z_base_var = var_kp.detach()
         z_base_cov = cov_kp.detach()
 
-        print("Z BASE VAR: ", z_base_var)
 
         # optional confidence feature (same shape as logvar_offset)
         confidence_score = particle_stats_dict['logvar'].detach()  # [B, n_kp_prior, 3]
