@@ -1375,7 +1375,7 @@ class DLP(nn.Module):
                                       apply_mask_on_obj_on=apply_mask_on_obj_on, beta_obj=beta_obj, done_mask=done_mask)
         elif self.occupancy_mode:
             return self.calc_static_elbo_occupancy(x, model_output, warmup, beta_kl, beta_rec,
-                                            kl_balance,
+                                            kl_balance, recon_loss_type,
                                             balance, use_kl_mask=use_kl_mask, apply_mask_on_obj_on=apply_mask_on_obj_on,
                                             beta_obj=beta_obj)
         else:
@@ -1888,11 +1888,12 @@ class DLP(nn.Module):
     def calc_static_elbo_occupancy(
         self, x, model_output, warmup=False,
         beta_kl=0.05, beta_rec=1.0,
-        kl_balance=0.001, balance=0.5,
+        kl_balance=0.001, recon_loss_type="mse", balance=0.5,
         use_kl_mask=True, apply_mask_on_obj_on=False, beta_obj=0.0,
         dice_weight=0.2,                 # weight for Dice loss on probs
         sparsity_weight=1e-3,            # per-object occupancy sparsity reg
         aux_bg_weight=0.1,               # optional BCE on bg_logits vs target
+        mse_pos_mult= 4.0,
     ):
         """
         Occupancy-only ELBO:
@@ -1909,6 +1910,8 @@ class DLP(nn.Module):
         """
         import torch
         import torch.nn.functional as F
+
+        print(" RECON LOSS TYPE: ", recon_loss_type)
 
         # --------- helpers ----------
         def bce_logits_weighted(logits, target, pos_weight):
@@ -1964,20 +1967,49 @@ class DLP(nn.Module):
 
         # --------- reconstruction: class-imbalanced BCE(+Dice) on composite ---------
         with torch.no_grad():
-            f = torch.clamp(target_occ.mean(), 1e-6, 1 - 1e-6)         # foreground fraction
-            pos_weight = ((1.0 - f) / f).to(x_flat.device)
+            f = torch.clamp(target_occ.mean(), 1e-6, 1 - 1e-6)          # foreground fraction
+            pos_weight = ((1.0 - f) / f).to(x_flat.device)               # used in BCE modes
 
-        rec_occ_logit = logit(rec_occ_prob)                             # convert prob→logit for stable BCE
-        loss_bce = bce_logits_weighted(rec_occ_logit, target_occ, pos_weight)
-        loss_dice = dice_loss(rec_occ_prob, target_occ) if dice_weight > 0 else torch.tensor(0.0, device=x.device)
-        loss_rec = loss_bce + dice_weight * loss_dice
+        loss_bce = torch.tensor(0.0, device=x.device)
+        loss_mse = torch.tensor(0.0, device=x.device)
+        loss_dice = torch.tensor(0.0, device=x.device)
+        loss_bg_aux = torch.tensor(0.0, device=x.device)
 
-        # Optional auxiliary BCE on background logits (helps early training of bg prior)
-        if (bg_logits is not None) and (aux_bg_weight > 0):
-            loss_bg_aux = bce_logits_weighted(bg_logits, target_occ, pos_weight) * aux_bg_weight
-            loss_rec = loss_rec + loss_bg_aux
+        if recon_loss_type in ("bce", "hybrid"):
+            # BCE expects logits → convert probs to logits for numerical stability
+            rec_occ_logit = logit(rec_occ_prob)
+            loss_bce = F.binary_cross_entropy_with_logits(rec_occ_logit, target_occ,
+                                                        pos_weight=pos_weight, reduction="mean")
+            # Optional auxiliary BCE on bg logits
+            if (bg_logits is not None) and (aux_bg_weight > 0):
+                loss_bg_aux = F.binary_cross_entropy_with_logits(bg_logits, target_occ,
+                                                                pos_weight=pos_weight, reduction="mean") * aux_bg_weight
+            # Dice on probabilities
+            if dice_weight > 0:
+                loss_dice = dice_loss(rec_occ_prob, target_occ) * dice_weight
+
+        if recon_loss_type == "mse":
+            # MSE on probabilities; SUM over spatial dims, then MEAN over batch
+            # pred: rec_occ_prob  [B*T,1,*spatial*], target: target_occ [B*T,1,*spatial*]
+            err = (rec_occ_prob - target_occ) ** 2
+            spatial_dims = tuple(range(1, err.dim()))  # sum over C,(D,)H,W
+            loss_mse = err.sum(dim=spatial_dims).mean()
+
+            # Auxiliary head: convert logits -> probs and use the same reduction
+            if (bg_logits is not None) and (aux_bg_weight > 0):
+                bg_prob = torch.sigmoid(bg_logits)
+                bg_err = (bg_prob - target_occ) ** 2
+                loss_bg_aux = bg_err.sum(dim=spatial_dims).mean() * aux_bg_weight
+        # Combine per chosen mode
+        if recon_loss_type == "bce":
+            loss_rec = loss_bce + loss_dice + loss_bg_aux
+        elif recon_loss_type == "mse":
+            loss_rec = loss_mse + loss_bg_aux
+        elif recon_loss_type == "hybrid":
+            # Your current behavior (BCE + Dice), still allowing bg aux
+            loss_rec = loss_bce + loss_dice + loss_bg_aux
         else:
-            loss_bg_aux = torch.tensor(0.0, device=x.device)
+            raise ValueError(f"Unknown recon_loss='{recon_loss_type}'")
 
         # Optional per-object sparsity (keep each particle's occupancy small)
         if (occ_prob_per_obj is not None) and (sparsity_weight > 0):
