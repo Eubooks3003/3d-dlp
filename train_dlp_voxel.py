@@ -203,16 +203,16 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     voxel_grid_whd = config["voxel_grid_whd"]
 
     dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=(ch == 6))
-    vox_ds = VoxelizedDataset(
-        base_ds=dataset,
-        grid_whd=voxel_grid_whd,          # (W,H,D) in your class name, but tensors come out [C,D,H,W]
-        mode="occupancy",                 # "occupancy" | "density" | "moments" | "avg_rgb"
-        bounds_mode="global",           # "per_item" | "global" | ((pmin),(pmax))
-        keep_points=False,              # True to also return original points
-        device=torch.device("cpu"),     # keep CPU if you use DataLoader workers
-        cache_dir="/home/ellina/Desktop/Code/voxel_ds_moments",  # speeds up future runs
-        force_rebuild=False
-    )
+    # vox_ds = VoxelizedDataset(
+    #     base_ds=dataset,
+    #     grid_whd=voxel_grid_whd,          # (W,H,D) in your class name, but tensors come out [C,D,H,W]
+    #     mode="occupancy",                 # "occupancy" | "density" | "moments" | "avg_rgb"
+    #     bounds_mode="global",           # "per_item" | "global" | ((pmin),(pmax))
+    #     keep_points=False,              # True to also return original points
+    #     device=torch.device("cpu"),     # keep CPU if you use DataLoader workers
+    #     cache_dir="/home/ellina/Desktop/Code/voxel_ds_moments",  # speeds up future runs
+    #     force_rebuild=False
+    # )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
     # model
