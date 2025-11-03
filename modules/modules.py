@@ -98,121 +98,87 @@ class AlternativeSpatialSoftmaxKP3D(torch.nn.Module):
         if probs:
             return kp, cov, sm_x, sm_y, sm_z
         return kp, cov
-
-
-class SoftKNNMass3D(nn.Module):
+    
+class SoftKMeans3D(nn.Module):
     """
-    Differentiable KNN-style local pooling over a voxel volume.
-
+    Soft k-means with weighted responsibilities.
     Inputs:
-      rec_vol: [B, 1, D, H, W]  (logits or probs; see as_logits)
-      kp_norm: [B, K, 3]        (x,y,z) in normalized coords ∈ [-1,1]
-                                (same convention as your SSM outputs)
-    Returns (depending on flags):
-      if return_mean=False and return_cov=False:
-         local_mass: [B, K]        # weighted sum of probs in a local 3D window
-      if return_mean=True:
-         local_mass: [B, K]
-         local_mean: [B, K, 3]     # weighted mean position (normalized coords)
-      if return_cov=True:
-         local_mass: [B, K]
-         local_mean: [B, K, 3]
-         local_cov:  [B, K, 3, 3]  # weighted covariance in normalized coords
-
-    Notes:
-      - Uses a Gaussian weight over a cubic window (radius = win_rad).
-      - Fully differentiable w.r.t. kp_norm and rec_vol.
-      - Set as_logits=True if rec_vol are logits; probs are computed via sigmoid.
+        pts:      [B, M, 3]     coordinates in [-1,1] (x,y,z)
+        weights:  [B, M]        nonnegative weights (e.g., occupancy), will be normalized per batch
+    Hyperparams:
+        K:        number of clusters
+        iters:    EM-like updates
+        tau:      temperature; smaller -> harder assignments
+        eps:      numerical floor
+    Returns:
+        centers:  [B, K, 3]
+        cov_diag: [B, K, 3]     per-axis diagonal covariance (soft second moments)
+        resp:     [B, K, M]     responsibilities (optional use)
     """
-    def __init__(self,
-                 win_rad=(2, 2, 2),          # (rx, ry, rz) in voxel units
-                 sigma_vox=(2.0, 2.0, 2.0),  # Gaussian σ per axis, in voxel units
-                 as_logits=True,
-                 align_corners=True):
+    def __init__(self, K: int, iters: int = 5, tau: float = 0.05, eps: float = 1e-8):
         super().__init__()
-        self.rx, self.ry, self.rz = map(int, win_rad)
-        self.sx, self.sy, self.sz = map(float, sigma_vox)
-        self.as_logits = as_logits
-        self.align_corners = align_corners
+        self.K = int(K)
+        self.iters = int(iters)
+        self.tau = float(tau)
+        self.eps = float(eps)
 
-        # Pre-build integer offsets (dx,dy,dz) and register as buffers later (on first call)
-        self.register_buffer("_off_idx", None, persistent=False)
-        self.register_buffer("_w",       None, persistent=False)
+    @torch.no_grad()
+    def _kmeanspp_init(self, pts: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        # pts: [B,M,3], w: [B,M]
+        B, M, _ = pts.shape
+        device = pts.device
+        # pick first center by weighted sampling
+        c_idx = torch.multinomial(w, num_samples=1)                # [B,1]
+        centers = pts.gather(1, c_idx[..., None].expand(-1, -1, 3)) # [B,1,3]
+        # successive picks
+        for _ in range(1, self.K):
+            # distances to nearest chosen center
+            d2 = torch.cdist(pts, centers).pow(2.0).min(dim=2).values  # [B,M]
+            prob = (d2 * w).clamp_min(self.eps)
+            prob = prob / prob.sum(dim=1, keepdim=True)
+            nxt = torch.multinomial(prob, num_samples=1)               # [B,1]
+            c_new = pts.gather(1, nxt[..., None].expand(-1, -1, 3))    # [B,1,3]
+            centers = torch.cat([centers, c_new], dim=1)               # [B,t,3]
+        return centers
 
-    def _build_offsets(self, device):
-        dz = torch.arange(-self.rz, self.rz + 1, device=device)
-        dy = torch.arange(-self.ry, self.ry + 1, device=device)
-        dx = torch.arange(-self.rx, self.rx + 1, device=device)
-        zz, yy, xx = torch.meshgrid(dz, dy, dx, indexing="ij")
-        off_idx = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3).float()  # [M,3] (dx,dy,dz)
-        # Gaussian weights over offsets (in voxel units)
-        w = torch.exp(-0.5 * ((off_idx[:,0] / self.sx) ** 2 +
-                              (off_idx[:,1] / self.sy) ** 2 +
-                              (off_idx[:,2] / self.sz) ** 2))
-        w = w / (w.sum() + 1e-8)
-        return off_idx, w
-
-    def _ensure_buffers(self, device):
-        if self._off_idx is None or self._off_idx.device != device:
-            off_idx, w = self._build_offsets(device)
-            self._off_idx = off_idx
-            self._w = w
-
-    @staticmethod
-    def _to_probs(x, as_logits=True):
-        return torch.sigmoid(x) if as_logits else x.clamp(0, 1)
-
-    def forward(self, rec_vol, kp_norm, return_mean=False, return_cov=False):
+    def forward(self, pts: torch.Tensor, weights: torch.Tensor):
         """
-        rec_vol: [B,1,D,H,W]  (logits or probs)
-        kp_norm: [B,K,3]      normalized (x,y,z) in [-1,1]
+        pts:     [B,M,3] in [-1,1]
+        weights: [B,M]   >=0
         """
-        B, C, D, H, W = rec_vol.shape
-        assert C == 1, "rec_vol should have a single occupancy channel"
+        B, M, _ = pts.shape
+        K = self.K
+        eps = self.eps
 
-        self._ensure_buffers(rec_vol.device)
-        off_idx = self._off_idx      # [M,3] (dx,dy,dz) in voxel units
-        w = self._w.to(rec_vol.dtype)  # [M]
-        M = off_idx.shape[0]
+        # normalize weights
+        w = weights.clamp_min(0)
+        w = w / (w.sum(dim=1, keepdim=True) + eps)                     # [B,M]
 
-        # Convert voxel offsets to normalized coords for grid_sample
-        to_norm = torch.tensor([2/(W-1), 2/(H-1), 2/(D-1)], device=rec_vol.device, dtype=rec_vol.dtype)
-        off_norm = off_idx * to_norm  # [M,3] (Δx,Δy,Δz) in normalized coords
+        # init
+        centers = self._kmeanspp_init(pts, w)                          # [B,K,3]
 
-        K = kp_norm.shape[1]
-        base = kp_norm.unsqueeze(2).expand(B, K, M, 3)       # [B,K,M,3]
-        samp = base + off_norm.view(1, 1, M, 3)              # [B,K,M,3]
+        for _ in range(self.iters):
+            # responsibilities r_{k,m} ∝ w_m * exp(-||x_m - c_k||^2 / tau)
+            # d2: [B,K,M]
+            d2 = torch.cdist(centers, pts).pow(2.0)                    # [B,K,M]
+            logits = -(d2 / max(self.tau, eps))                        # [B,K,M]
+            # multiply by weights in probability space: add log(w)
+            r_unnorm = torch.softmax(logits, dim=1) * w[:, None, :]    # [B,K,M]
+            r = r_unnorm / (r_unnorm.sum(dim=1, keepdim=True) + eps)   # [B,K,M]
 
-        # grid_sample expects (z,y,x) in the last dim; shape [N, D,H,W], grid [N, ..., 3]
-        grid = samp[..., [2, 1, 0]].view(B * K, M, 1, 1, 3)  # [B*K, M, 1, 1, 3]
-        x_in = self._to_probs(rec_vol, self.as_logits)
-        x_in = x_in.unsqueeze(1).expand(B, K, 1, D, H, W).reshape(B * K, 1, D, H, W)
-        vals = F.grid_sample(
-            x_in, grid, mode='bilinear', padding_mode='zeros', align_corners=self.align_corners
-        ).view(B, K, M)  # [B,K,M] sampled probs
+            # update centers: c_k = sum_m r_{k,m} x_m / sum_m r_{k,m}
+            denom = (r.sum(dim=2, keepdim=True) + eps)                  # [B,K,1]
+            c_new = torch.bmm(r.reshape(B*K, 1, M), pts.reshape(B, M, 3).repeat_interleave(K, dim=0)) \
+                        .view(B, K, 3) / denom                           # [B,K,3]
+            centers = c_new
 
-        # Local mass (weighted sum)
-        w_broadcast = w.view(1, 1, M).to(vals.dtype)         # [1,1,M]
-        mass = (vals * w_broadcast).sum(dim=-1)              # [B,K]
+        # per-cluster diag covariance from second moments
+        # E[x] = centers; E[x^2] via responsibilities
+        Ex2 = torch.bmm(r.reshape(B*K, 1, M), (pts**2).reshape(B, M, 3).repeat_interleave(K, dim=0)) \
+                  .view(B, K, 3) / (r.sum(dim=2, keepdim=True) + eps)   # [B,K,3]
+        cov_diag = (Ex2 - centers**2).clamp_min(1e-6)                   # [B,K,3]
+        return centers, cov_diag, r
 
-        if not (return_mean or return_cov):
-            return mass
-
-        # Weighted mean in normalized coords
-        weights = (vals * w_broadcast).unsqueeze(-1)         # [B,K,M,1]
-        pts_norm = samp.to(vals.dtype)                       # [B,K,M,3] (x,y,z) normalized
-        denom = weights.sum(dim=2).clamp_min(1e-8)           # [B,K,1]
-        mean = (weights * pts_norm).sum(dim=2) / denom       # [B,K,3]
-
-        if not return_cov:
-            return mass, mean
-
-        # Weighted covariance in normalized coords
-        diff = pts_norm - mean.unsqueeze(2)                  # [B,K,M,3]
-        # [B,K,3,3] = sum_m w_m * p_m p_m^T / sum_w   (with probs*w)
-        cov = torch.einsum('bkmc,bkmd->bkcd', weights * diff, diff) / denom  # [B,K,3,3]
-
-        return mass, mean, cov
 
 
 import torch
@@ -3465,7 +3431,8 @@ class DLPPrior(nn.Module):
                  init_zero_bias=True,
                  init_ssm_last_layer=True,
                  init_conv_layers=True,
-                 init_conv_fg_std=0.02):
+                 init_conv_fg_std=0.02,
+                 use_kmeans_prior=True, kmeans_iters=5, kmeans_tau=1.0,):
         super().__init__()
 
         # ---- fixed grid shape (no per-batch dependence) ----
@@ -3511,6 +3478,7 @@ class DLPPrior(nn.Module):
         # 3D spatial softmax -> per-patch KPs (local coords) + covariance
         self.ssm = AlternativeSpatialSoftmaxKP3D(kp_range=kp_range)
 
+
         # -------- precompute tile origins/centers in voxel-index space; keep as buffers --------
         origins = self._precompute_patch_origins_xyz(
             W, H, D, pw, ph, pd
@@ -3520,6 +3488,12 @@ class DLPPrior(nn.Module):
         self.register_buffer("patch_centers_xyz_idx", centers)
         self.register_buffer("size_minus1", torch.tensor([W - 1, H - 1, D - 1], dtype=torch.float32))  # (x,y,z)
         self.register_buffer("patch_size_vec", torch.tensor([pw, ph, pd], dtype=torch.float32))
+        
+        self.use_kmeans_prior = use_kmeans_prior
+        self.kmeans_iters = int(kmeans_iters)
+        self.kmeans_tau = float(kmeans_tau)
+
+        self.kmeans = SoftKMeans3D(K=self.n_kp_prior, iters=kmeans_iters, tau=kmeans_tau)
         self.init_weights()
 
     # ---------- init helpers ----------
@@ -4784,6 +4758,7 @@ class ParticleEncoder(nn.Module):
         total_var = var_kp.sum(-1)  # [B, n_kp_prior]
 
         if self.n_kp_enc < self.n_kp_prior:
+            print("FILTERING!!!!!!!!!!!!")
             n_filter = self.n_kp_enc if not warmup else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior))
             _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
             batch_ind = torch.arange(batch_size, device=x.device)[:, None]
