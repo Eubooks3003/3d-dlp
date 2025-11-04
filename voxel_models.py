@@ -1976,17 +1976,31 @@ class DLP(nn.Module):
         loss_bg_aux = torch.tensor(0.0, device=x.device)
 
         if recon_loss_type in ("bce", "hybrid"):
-            # BCE expects logits → convert probs to logits for numerical stability
-            rec_occ_logit = logit(rec_occ_prob)
-            loss_bce = F.binary_cross_entropy_with_logits(rec_occ_logit, target_occ,
-                                                        pos_weight=pos_weight, reduction="mean")
-            # Optional auxiliary BCE on bg logits
+            # Convert probs → logits safely for BCE-with-logits
+            rec_occ_logit = logit(rec_occ_prob)  # or torch.logit(rec_occ_prob, eps=1e-6)
+
+            # Per-element BCE loss (no reduction yet)
+            bce_map = F.binary_cross_entropy_with_logits(
+                rec_occ_logit, target_occ,
+                pos_weight=pos_weight, reduction="none"
+            )
+
+            # Sum over C,(D,)H,W then mean over batch/time
+            spatial_dims = tuple(range(1, bce_map.dim()))  # sum all but batch
+            loss_bce = bce_map.sum(dim=spatial_dims).mean()
+
+            # Optional auxiliary BCE on bg logits (same reduction)
             if (bg_logits is not None) and (aux_bg_weight > 0):
-                loss_bg_aux = F.binary_cross_entropy_with_logits(bg_logits, target_occ,
-                                                                pos_weight=pos_weight, reduction="mean") * aux_bg_weight
-            # Dice on probabilities
+                bce_bg_map = F.binary_cross_entropy_with_logits(
+                    bg_logits, target_occ,
+                    pos_weight=pos_weight, reduction="none"
+                )
+                loss_bg_aux = bce_bg_map.sum(dim=spatial_dims).mean() * aux_bg_weight
+
+            # Dice still on probabilities
             if dice_weight > 0:
                 loss_dice = dice_loss(rec_occ_prob, target_occ) * dice_weight
+
 
         if recon_loss_type == "mse":
             # MSE on probabilities; SUM over spatial dims, then MEAN over batch

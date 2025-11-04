@@ -3561,6 +3561,98 @@ class DLPPrior(nn.Module):
         centers_b = centers.view(1, -1, 1, 3)
         return ((kp_global - centers_b) ** 2).sum(dim=-1)
 
+    def weighted_cov_proximity(self,pts, weights, center,
+                                alpha=1.5,           # ↑ emphasize high-mass voxels
+                                tau_mode="median",   # proximity length scale
+                                tau_mult=1.0,        # ↓ smaller → more shrink
+                                lam0=1e-4,           # base ridge
+                                mass_norm=True):
+        """
+        pts: [M,3] in global [-1,1]
+        weights: [M] >=0 (voxel mass)
+        center: [3] cluster center (x,y,z)
+
+        Effective weights = mass^alpha * exp(-||x-c||^2 / tau^2)
+        tau picked per-cluster from distances (robust).
+        """
+        w = weights.clamp_min(0)
+
+        # distances to center
+        d2 = ((pts - center[None])**2).sum(dim=-1)     # [M]
+
+        # pick tau from distances
+        if tau_mode == "median":
+            tau = d2.median().sqrt() * tau_mult + 1e-9
+        elif tau_mode == "p75":
+            tau = d2.kthvalue(int(0.75*max(1, d2.numel()))).values.sqrt() * tau_mult + 1e-9
+        else:
+            tau = d2.mean().sqrt() * tau_mult + 1e-9
+
+        w_eff = (w**alpha) * torch.exp(-d2 / (tau*tau))  # [M]
+        W = w_eff.sum() + 1e-12
+
+        # weighted mean and covariance
+        mu = (w_eff[:,None] * pts).sum(dim=0) / W
+        xc = pts - mu[None]
+        cov = (w_eff[:,None,None] * (xc[:,:,None] * xc[:,None,:])).sum(dim=0) / W
+
+        # ridge scaled inversely with mass → more mass = tighter cov
+        lam = lam0 / (W.item() if mass_norm else 1.0)
+        cov = cov + torch.eye(3, device=cov.device, dtype=cov.dtype) * lam
+        return mu, cov, W
+
+    def kmeans_hard(self,x, K, init_centers=None, iters=50, tol=1e-4):
+        """
+        x: [N,3] points in (-1,1) global coords
+        K: number of clusters
+        init_centers: [M,3] optional; if provided but M!=K, reduce/expand via KMeans++
+        """
+        device = x.device
+        x = x.float()
+        if init_centers is None:
+            # KMeans++ on data
+            idx0 = torch.randint(0, x.shape[0], (1,), device=device)
+            centers = [x[idx0]]
+            while len(centers) < K:
+                C = torch.cat(centers, dim=0)  # [k,3]
+                d2 = torch.cdist(x, C, p=2).pow(2).min(dim=1).values
+                probs = d2 / (d2.sum() + 1e-9)
+                idx = torch.multinomial(probs, 1)
+                centers.append(x[idx])
+            centers = torch.cat(centers, dim=0)
+        else:
+            C0 = init_centers.float().to(device)
+            # down/up select init to exactly K
+            if C0.shape[0] != K:
+                idx0 = torch.randint(0, C0.shape[0], (1,), device=device)
+                centers = [C0[idx0]]
+                while len(centers) < K:
+                    C = torch.cat(centers, dim=0)
+                    d2 = torch.cdist(C0, C, p=2).pow(2).min(dim=1).values
+                    probs = d2 / (d2.sum() + 1e-9)
+                    idx = torch.multinomial(probs, 1)
+                    centers.append(C0[idx])
+                centers = torch.cat(centers, dim=0)
+            else:
+                centers = C0.clone()
+
+        for _ in range(iters):
+            d2 = torch.cdist(x, centers, p=2).pow(2)
+            assign = d2.argmin(dim=1)
+            new_centers = torch.zeros_like(centers)
+            for k in range(K):
+                m = (assign == k)
+                if m.any():
+                    new_centers[k] = x[m].mean(dim=0)
+                else:
+                    j = torch.randint(0, x.shape[0], (1,), device=device)
+                    new_centers[k] = x[j]
+            shift = (new_centers - centers).norm(dim=-1).mean()
+            centers = new_centers
+            if shift.item() < tol:
+                break
+        return centers
+
     # ---------- main API ----------
     def vox_to_patches(self, x):
         return self.patcher.vox_to_patches(x)
@@ -3584,6 +3676,93 @@ class DLPPrior(nn.Module):
         patches = patches.permute(0, 2, 1, 3, 4, 5).contiguous()  # [B, N, C, pd, ph, pw]
         N = patches.shape[1]
         pd, ph, pw = self.patcher.pd, self.patcher.ph, self.patcher.pw
+
+        # if self.kp_mode == "kmeans":
+        if True:
+            centers_init = self.get_patch_centers().to(x)     # [N_patches,3] in [-1,1]
+            K = int(self.n_kp_prior if k is None else k)
+
+            keep_top = 80_000
+            sample_m = 50_000
+            iters    = 50
+            min_pts  = 8
+            ridge    = 1e-4
+
+            B, C, D, H, W = x.shape
+            out_centers, out_covs, out_mass, out_count = [], [], [], []
+
+            for b in range(B):
+                # --- mass volume and top voxels ---
+                v = x[b].sum(dim=0) if C > 1 else x[b, 0]              # [D,H,W]
+                v = v.float()
+                vals = v.reshape(-1)
+                k_keep = min(keep_top, vals.numel())
+                top = torch.topk(vals, k=k_keep, largest=True, sorted=False)
+                idx = top.indices                                       # [k_keep]
+                wts = top.values.clamp_min(0)                           # [k_keep]
+
+                # flat index -> (x,y,z) -> global [-1,1]
+                z = idx // (H * W)
+                y = (idx % (H * W)) // W
+                xidx = (idx % W)
+                xs = (xidx.float() / (W - 1)) * 2 - 1
+                ys = (y.float()    / (H - 1)) * 2 - 1
+                zs = (z.float()    / (D - 1)) * 2 - 1
+                pts = torch.stack([xs, ys, zs], dim=-1)                 # [k_keep,3]
+
+                # --- subsample for kmeans itself (importance by mass) ---
+                probs = (wts + 1e-9) / (wts.sum() + 1e-9)
+                m = min(sample_m, pts.shape[0])
+                sel = torch.multinomial(probs, num_samples=m, replacement=True)
+                pts_w = pts[sel]                                        # [m,3]
+
+                # --- kmeans with init = patch centers ---
+                centers = self.kmeans_hard(pts_w, K=K, init_centers=centers_init, iters=iters)  # [K,3]
+
+                # --- assignments on FULL top set for stable covariances ---
+                d2 = torch.cdist(pts, centers, p=2).pow(2)              # [k_keep, K]
+                assign = d2.argmin(dim=1)                                # [k_keep]
+
+                # --- per-cluster proximity-weighted covariance ---
+                covs_b, mass_b, cnt_b = [], [], []
+                for k_id in range(K):
+                    mask = (assign == k_id)
+                    if not mask.any():
+                        covs_b.append(torch.eye(3, device=x.device, dtype=pts.dtype) * ridge)
+                        mass_b.append(0.0); cnt_b.append(0)
+                        continue
+
+                    pts_k = pts[mask]
+                    w_k   = wts[mask]
+                    mu_k, cov_k, m_k = self.weighted_cov_proximity(
+                        pts_k, w_k, center=centers[k_id],
+                        alpha=1.5, tau_mode="median", tau_mult=0.8, lam0=ridge, mass_norm=True
+                    )
+
+                    # optional: re-center to μ_k for nicer viz
+                    centers[k_id] = mu_k
+
+                    eff_count = int((w_k > (w_k.max() * 1e-3)).sum().item())
+                    if eff_count < min_pts:
+                        var_iso = cov_k.diag().mean().clamp_min(1e-8)
+                        cov_k = torch.eye(3, device=cov_k.device, dtype=cov_k.dtype) * var_iso
+
+                    covs_b.append(cov_k)
+                    mass_b.append(float(m_k))
+                    cnt_b.append(eff_count)
+
+                out_centers.append(centers)                               # [K,3]
+                out_covs.append(torch.stack(covs_b, dim=0))               # [K,3,3]
+                out_mass.append(torch.tensor(mass_b, device=x.device, dtype=pts.dtype))  # [K]
+                out_count.append(torch.tensor(cnt_b, device=x.device, dtype=torch.int32))# [K]
+
+            kp   = torch.stack(out_centers, dim=0)                        # [B,K,3]
+            cov  = torch.stack(out_covs,    dim=0)                        # [B,K,3,3]
+            mass = torch.stack(out_mass,    dim=0)                        # [B,K]
+            cnt  = torch.stack(out_count,   dim=0)                        # [B,K]
+
+            return kp, cov
+
 
         # encode
         patches_bn = patches.view(-1, C, pd, ph, pw)              # [B*N, C, pd, ph, pw]
