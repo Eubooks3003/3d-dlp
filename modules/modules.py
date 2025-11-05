@@ -3684,7 +3684,7 @@ class DLPPrior(nn.Module):
 
             keep_top = 80_000
             sample_m = 50_000
-            iters    = 50
+            iters    = 5
             min_pts  = 8
             ridge    = 1e-4
 
