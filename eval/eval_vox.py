@@ -333,7 +333,10 @@ def extract_volumes_for_vis(model_output, *, occ_channel=0):
     if 'rec' not in model_output:
         raise KeyError("model_output['rec'] is required.")
     if 'x' not in model_output:
-        raise KeyError("model_output['x'] is required as the ground-truth volume.")
+        # raise KeyError("model_output['x'] is required as the ground-truth volume.")
+        rec_logits = _as_b0_channel(model_output['rec'], occ_channel=occ_channel)
+        rec = torch.sigmoid(rec_logits)   
+        return None, rec
 
     rec_logits = _as_b0_channel(model_output['rec'], occ_channel=occ_channel)
     rec = torch.sigmoid(rec_logits)                     # probs in [0,1] for plotting

@@ -419,12 +419,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
             warmup = (epoch < warmup_epoch)
             # forward pass
-            model_output = model(vox, warmup=warmup, with_loss=True,
-                                 beta_kl=beta_kl,
-                                 beta_rec=beta_rec, kl_balance=kl_balance,
-                                 recon_loss_type=recon_loss_type,
-                                 recon_loss_func=recon_loss_func,
-                                 beta_obj=beta_obj)
+
             
             with torch.no_grad():
                 # --- decoder-side diagnostics if present ---
