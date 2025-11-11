@@ -6203,7 +6203,7 @@ class DLPDecoder(nn.Module):
         # per-voxel mixture weights from alpha only (no ordering)
         w = a / (a.sum(dim=1, keepdim=True) + eps)             # [B,N,1,D,H,W]
         rgb_comp = (w * rgb_obj).sum(dim=1)                    # [B,3,D,H,W]
-        alpha_sum = a.sum(dim=1, keepdim=True).clamp(max=1.0)  # [B,1,D,H,W]
+        alpha_sum = a.sum(dim=1, keepdim=False).clamp(max=1.0)   # [B,1,D,H,W]
         bg_mask = 1.0 - alpha_sum
         # return per-object α for optional aux losses/visualization
         return a, bg_mask, rgb_comp, None
@@ -6235,7 +6235,6 @@ class DLPDecoder(nn.Module):
         dec_depth_patches = None  # unified depth is not per-patch separate object unless you want to expose it
 
         # Composite (always uses z_depth for ordering)
-        print("Z DEPTH SHAPE: ", z_depth.shape)
         alpha_masks, bg_mask, dec_rgb_comp, dec_depth_comp = self.composite_rgb(a_obj, rgb_obj, obj_on)
 
         return dec_rgb_patches, dec_rgb_comp, alpha_masks, bg_mask, dec_depth_comp, dec_depth_patches
@@ -6309,11 +6308,11 @@ class DLPDecoder(nn.Module):
         bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C_bg, *spatial*]
         C_bg   = bg_rec.shape[1]
 
+
         if C_bg >= 3:
             rec_rgb = bg_mask * bg_rec[:, :3, ...] + dec_objects_trans
         else:
             rec_rgb = dec_objects_trans
-
         rec_depth = None
         have_obj_depth = (dec_depth_trans is not None)
         have_bg_depth  = (C_bg > 3)
@@ -6330,7 +6329,6 @@ class DLPDecoder(nn.Module):
 
         rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
 
-        print("REC shape from decoder; ", rec.shape)
         return {
             'rec': rec,
             'dec_objects': dec_objects,
