@@ -384,7 +384,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # iteration counter
     iteration = 0
     
-    run_name = f"{recon_loss_type}-beta_rec-{beta_rec}-beta_kl-{beta_kl}-kl_balance-{kl_balance}"
+    run_name = f"{recon_loss_type}-beta_rec-{beta_rec}-beta_kl-{beta_kl}-kl_balance-{kl_balance}-rgb"
     wandb.init(
         name=run_name,
         config=config,

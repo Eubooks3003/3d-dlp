@@ -99,86 +99,236 @@ class AlternativeSpatialSoftmaxKP3D(torch.nn.Module):
             return kp, cov, sm_x, sm_y, sm_z
         return kp, cov
     
-class SoftKMeans3D(nn.Module):
+class FeatureKMeansRGB(nn.Module):
     """
-    Soft k-means with weighted responsibilities.
-    Inputs:
-        pts:      [B, M, 3]     coordinates in [-1,1] (x,y,z)
-        weights:  [B, M]        nonnegative weights (e.g., occupancy), will be normalized per batch
-    Hyperparams:
-        K:        number of clusters
-        iters:    EM-like updates
-        tau:      temperature; smaller -> harder assignments
-        eps:      numerical floor
-    Returns:
-        centers:  [B, K, 3]
-        cov_diag: [B, K, 3]     per-axis diagonal covariance (soft second moments)
-        resp:     [B, K, M]     responsibilities (optional use)
+    RGB-aware k-means prior:
+      - Build per-voxel color features (Lab or ILR), optional XYZ appending
+      - Prefilter by saliency (L*, alpha, or ||rgb||)
+      - k-means in feature space, then compute μ,Σ in XYZ space per cluster
+    Returns per-batch keypoints in global [-1,1] coords + covariances and meta.
     """
-    def __init__(self, K: int, iters: int = 5, tau: float = 0.05, eps: float = 1e-8):
+    def __init__(
+        self,
+        K: int,
+        feat_mode: str = "lab",          # {"lab","ilr"}
+        append_xyz: bool = False,
+        saliency: str = "L",             # {"L","alpha","rgbnorm"}
+        keep_top: int = 80_000,
+        sample_m: int = 50_000,
+        iters: int = 30,
+        tol: float = 1e-4,
+        ridge: float = 1e-4,
+    ):
         super().__init__()
         self.K = int(K)
+        self.feat_mode = feat_mode
+        self.append_xyz = append_xyz
+        self.saliency = saliency
+        print("KEEP TOP: ", keep_top)
+        self.keep_top = int(keep_top)
+        self.sample_m = int(sample_m)
         self.iters = int(iters)
-        self.tau = float(tau)
-        self.eps = float(eps)
+        self.tol = float(tol)
+        self.ridge = float(ridge)
 
+        self.SRGB_A = 0.055
+        self.SRGB_GAMMA = 2.4
+        self.SRGB_LINEAR_THRESH = 0.04045
+        self.SRGB_LINEAR_SCALE = 12.92
+        self.SRGB2XYZ = torch.tensor([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ], dtype=torch.float32)
+        self.D65_WHITE = torch.tensor([0.95047, 1.00000, 1.08883], dtype=torch.float32)
+        self.DELTA = 6.0 / 29.0
+        self.LAB_EPS = self.DELTA ** 3
+        self.LAB_K = 1.0 / (3 * (self.DELTA ** 2))
+        self.LAB_C = 4.0 / 29.0
+        self.ILR_S1 = 1.0 / torch.sqrt(torch.tensor(2.0))
+        self.ILR_S2 = 1.0 / torch.sqrt(torch.tensor(6.0))
+
+    def srgb_to_linear(self, c):
+        return torch.where(
+            c <= self.SRGB_LINEAR_THRESH,
+            c / self.SRGB_LINEAR_SCALE,
+            ((c + self.SRGB_A) / (1.0 + self.SRGB_A)) ** self.SRGB_GAMMA
+        )
+
+    def rgb_to_xyz(self, rgb):  # [B,3,D,H,W] linear
+        M = self.SRGB2XYZ.to(rgb.device, rgb.dtype)
+        return torch.einsum("cd, b d... -> b c...", M, rgb)
+
+    def xyz_to_lab(self, xyz, eps=1e-9):  # [B,3,D,H,W]
+        Xn, Yn, Zn = self.D65_WHITE.to(xyz.device, xyz.dtype).unbind(0)
+        x = xyz[:,0] / (Xn + eps); y = xyz[:,1] / (Yn + eps); z = xyz[:,2] / (Zn + eps)
+        def f(t): return torch.where(t > self.LAB_EPS, t.pow(1/3), self.LAB_K * t + self.LAB_C)
+        fx, fy, fz = f(x), f(y), f(z)
+        L = 116.0 * fy - 16.0
+        a = 500.0 * (fx - fy)
+        b = 200.0 * (fy - fz)
+        return torch.stack([L, a, b], dim=1)
+
+    def rgb_to_lab_srgb(self, rgb01):        # [B,3,D,H,W] in [0,1]
+        rgb_lin = self.srgb_to_linear(rgb01.clamp(0,1))
+        return self.xyz_to_lab(self.rgb_to_xyz(rgb_lin))
+
+    def rgb_to_ilr2(self, rgb01, eps=1e-6):  # [B,3,D,H,W] in [0,1]
+        R,G,B = rgb01[:,0].clamp_min(0.0), rgb01[:,1].clamp_min(0.0), rgb01[:,2].clamp_min(0.0)
+        S = (R+G+B).clamp_min(eps)
+        r = R/S; g = G/S; b = B/S
+        u1 = self.ILR_S1 * (torch.log(r+eps) - torch.log(g+eps))
+        u2 = self.ILR_S2 * (torch.log(r+eps) + torch.log(g+eps) - 2.0*torch.log(b+eps))
+        return torch.stack([u1, u2], dim=1)
+
+    def whiten(self, X, eps=1e-6):           # [N,D]
+        mu = X.mean(dim=0, keepdim=True)
+        sd = X.std(dim=0, keepdim=True).clamp_min(eps)
+        return (X - mu) / sd
+
+    def build_xyz_grid(self, D,H,W, device, dtype):
+        z = torch.linspace(-1, 1, steps=D, device=device, dtype=dtype)
+        y = torch.linspace(-1, 1, steps=H, device=device, dtype=dtype)
+        x = torch.linspace(-1, 1, steps=W, device=device, dtype=dtype)
+        Z,Y,X = torch.meshgrid(z,y,x, indexing="ij")
+        return torch.stack([X,Y,Z], dim=0)  # [3,D,H,W]
+
+    def kmeans_hard_feat(self, X, K, iters=30, tol=1e-4):  # X: [N,D]
+        device = X.device; N = X.shape[0]
+        i0 = torch.randint(0, N, (1,), device=device)
+        C = X[i0].clone()
+        while C.shape[0] < K:
+            d2 = torch.cdist(X, C).pow(2).min(dim=1).values
+            probs = (d2 + 1e-12) / (d2.sum() + 1e-12)
+            i = torch.multinomial(probs, 1)
+            C = torch.cat([C, X[i]], dim=0)
+        for _ in range(iters):
+            d2 = torch.cdist(X, C).pow(2)
+            A  = d2.argmin(dim=1)
+            Cn = torch.stack([X[A==k].mean(dim=0) if (A==k).any() else C[k] for k in range(K)], dim=0)
+            shift = (Cn - C).norm(dim=1).mean()
+            C = Cn
+            if shift < tol: break
+        A = torch.cdist(X, C).pow(2).argmin(dim=1)
+        return C, A
     @torch.no_grad()
-    def _kmeanspp_init(self, pts: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        # pts: [B,M,3], w: [B,M]
-        B, M, _ = pts.shape
-        device = pts.device
-        # pick first center by weighted sampling
-        c_idx = torch.multinomial(w, num_samples=1)                # [B,1]
-        centers = pts.gather(1, c_idx[..., None].expand(-1, -1, 3)) # [B,1,3]
-        # successive picks
-        for _ in range(1, self.K):
-            # distances to nearest chosen center
-            d2 = torch.cdist(pts, centers).pow(2.0).min(dim=2).values  # [B,M]
-            prob = (d2 * w).clamp_min(self.eps)
-            prob = prob / prob.sum(dim=1, keepdim=True)
-            nxt = torch.multinomial(prob, num_samples=1)               # [B,1]
-            c_new = pts.gather(1, nxt[..., None].expand(-1, -1, 3))    # [B,1,3]
-            centers = torch.cat([centers, c_new], dim=1)               # [B,t,3]
-        return centers
+    def forward(self, x, centers_init_global=None):
+        """
+        x:     [B,C,D,H,W] (expects RGB in x[:,:3], range [0,1] or [-1,1] OK)
+        alpha: [B,1,D,H,W] or [B,D,H,W] or None
+        centers_init_global: [Npatch,3] in [-1,1] (optional, for compatibility)
 
-    def forward(self, pts: torch.Tensor, weights: torch.Tensor):
+        Returns:
+          kp:   [B,K,3] in global [-1,1] (x,y,z)
+          cov:  [B,K,3,3]
+          meta: dict with "cluster_mass" (B,K), "cluster_eff_count" (B,K), etc.
         """
-        pts:     [B,M,3] in [-1,1]
-        weights: [B,M]   >=0
-        """
-        B, M, _ = pts.shape
+        B,C,D,H,W = x.shape
+        device, dtype = x.device, x.dtype
+
+        # RGB in [0,1]
+        RGB = x[:, :3]
+        if RGB.min() < 0: RGB = (RGB + 1.0) * 0.5
+        RGB = RGB.clamp(0,1)
+
+        # features
+        if self.feat_mode == "lab":
+            feat = self.rgb_to_lab_srgb(RGB)            # [B,3,D,H,W]
+        elif self.feat_mode == "ilr":
+            feat = self.rgb_to_ilr2(RGB)                # [B,2,D,H,W]
+        else:
+            raise ValueError(f"feat_mode={self.feat_mode}")
+
+        if self.append_xyz:
+            XYZ = self.build_xyz_grid(D,H,W, device, dtype).unsqueeze(0).expand(B,-1,-1,-1,-1)
+            feat = torch.cat([feat, XYZ], dim=1)    # [B,Cf(+3),D,H,W]
+
+        # saliency
+        if self.saliency == "L":
+            if self.feat_mode == "lab":
+                sal = feat[:,0]                     # L*
+            else:
+                sal = self.rgb_to_lab_srgb(RGB)[:,0]
+        else:
+            sal = torch.linalg.norm(RGB, dim=1)
+
+        # flat xyz grid for μ,Σ
+        xyz_flat = self.build_xyz_grid(D,H,W, device, dtype).view(3, -1)  # [3,DHW]
+
+        out_centers, out_covs, out_mass, out_count = [], [], [], []
         K = self.K
-        eps = self.eps
 
-        # normalize weights
-        w = weights.clamp_min(0)
-        w = w / (w.sum(dim=1, keepdim=True) + eps)                     # [B,M]
+        for b in range(B):
+            vals = sal[b].reshape(-1)                    # [DHW]
+            k_keep = min(self.keep_top, vals.numel())
+            top = torch.topk(vals, k=k_keep, largest=True, sorted=False)
+            flat_idx = top.indices                       # [k_keep]
+            wts      = top.values.clamp_min(0)           # [k_keep]
 
-        # init
-        centers = self._kmeanspp_init(pts, w)                          # [B,K,3]
+            Cf = feat.shape[1]
+            feat_flat = feat[b].view(Cf, -1)[:, flat_idx].t()   # [k_keep,Cf]
+            X = self.whiten(feat_flat)                              # [k_keep,Cf]
 
-        for _ in range(self.iters):
-            # responsibilities r_{k,m} ∝ w_m * exp(-||x_m - c_k||^2 / tau)
-            # d2: [B,K,M]
-            d2 = torch.cdist(centers, pts).pow(2.0)                    # [B,K,M]
-            logits = -(d2 / max(self.tau, eps))                        # [B,K,M]
-            # multiply by weights in probability space: add log(w)
-            r_unnorm = torch.softmax(logits, dim=1) * w[:, None, :]    # [B,K,M]
-            r = r_unnorm / (r_unnorm.sum(dim=1, keepdim=True) + eps)   # [B,K,M]
+            # importance subsample for k-means itself
+            probs = (wts + 1e-9) / (wts.sum() + 1e-9)
+            m = min(self.sample_m, X.shape[0])
+            sel = torch.multinomial(probs, num_samples=m, replacement=True)
+            X_sub = X[sel]
 
-            # update centers: c_k = sum_m r_{k,m} x_m / sum_m r_{k,m}
-            denom = (r.sum(dim=2, keepdim=True) + eps)                  # [B,K,1]
-            c_new = torch.bmm(r.reshape(B*K, 1, M), pts.reshape(B, M, 3).repeat_interleave(K, dim=0)) \
-                        .view(B, K, 3) / denom                           # [B,K,3]
-            centers = c_new
+            C_feat, _ = self.kmeans_hard_feat(X_sub, K, iters=self.iters, tol=self.tol)
 
-        # per-cluster diag covariance from second moments
-        # E[x] = centers; E[x^2] via responsibilities
-        Ex2 = torch.bmm(r.reshape(B*K, 1, M), (pts**2).reshape(B, M, 3).repeat_interleave(K, dim=0)) \
-                  .view(B, K, 3) / (r.sum(dim=2, keepdim=True) + eps)   # [B,K,3]
-        cov_diag = (Ex2 - centers**2).clamp_min(1e-6)                   # [B,K,3]
-        return centers, cov_diag, r
+            # re-assign all kept voxels
+            d2 = torch.cdist(X, C_feat).pow(2)                 # [k_keep,K]
+            assign = d2.argmin(dim=1)
 
+            pts_xyz = xyz_flat[:, flat_idx].t()                # [k_keep,3] in [-1,1]
+            centers_b, covs_b, mass_b, cnt_b = [], [], [], []
+
+            for k_id in range(K):
+                msk = (assign == k_id)
+                if not msk.any():
+                    centers_b.append(pts_xyz.mean(dim=0))
+                    covs_b.append(torch.eye(3, device=device, dtype=dtype) * self.ridge)
+                    mass_b.append(0.0); cnt_b.append(0)
+                    continue
+
+                pts_k = pts_xyz[msk]
+                wk    = wts[msk]
+                Xk    = X[msk]
+                d2k   = torch.cdist(Xk, C_feat[k_id:k_id+1]).pow(2).squeeze(1)  # [Mk]
+                tau   = d2k.median().sqrt() + 1e-9
+                w_soft = torch.exp(-d2k / (tau*tau))
+                w_eff  = (wk ** 1.5) * w_soft
+
+                Wsum = w_eff.sum() + 1e-12
+                mu = (w_eff[:,None] * pts_k).sum(dim=0) / Wsum
+                xc = pts_k - mu[None]
+                cov = (w_eff[:,None,None] * (xc[:,:,None]*xc[:,None,:])).sum(dim=0) / Wsum
+                cov = cov + torch.eye(3, device=device, dtype=dtype) * (self.ridge / Wsum.item())
+
+                eff = int((wk > (wk.max() * 1e-3)).sum().item())
+                if eff < 8:
+                    var_iso = cov.diag().mean().clamp_min(1e-8)
+                    cov = torch.eye(3, device=device, dtype=dtype) * var_iso
+
+                centers_b.append(mu); covs_b.append(cov)
+                mass_b.append(float(Wsum.item())); cnt_b.append(eff)
+
+            out_centers.append(torch.stack(centers_b, dim=0))   # [K,3]
+            out_covs.append(torch.stack(covs_b,    dim=0))      # [K,3,3]
+            out_mass.append(torch.tensor(mass_b, device=device, dtype=dtype))      # [K]
+            out_count.append(torch.tensor(cnt_b, device=device, dtype=torch.int32))# [K]
+
+        kp  = torch.stack(out_centers, dim=0)   # [B,K,3]  (x,y,z in [-1,1])
+        cov = torch.stack(out_covs,    dim=0)   # [B,K,3,3]
+        meta = {
+            "mode": f"kmeans_rgb_feat[{self.feat_mode}{'+xyz' if self.append_xyz else ''}]",
+            "saliency": self.saliency,
+            "K": K, "kept": self.keep_top, "sampled": self.sample_m, "iters": self.iters,
+            "cluster_mass": torch.stack(out_mass,  dim=0),      # [B,K]
+            "cluster_eff_count": torch.stack(out_count, dim=0), # [B,K]
+        }
+        return kp, cov, meta
 
 
 import torch
@@ -3493,7 +3643,27 @@ class DLPPrior(nn.Module):
         self.kmeans_iters = int(kmeans_iters)
         self.kmeans_tau = float(kmeans_tau)
 
-        self.kmeans = SoftKMeans3D(K=self.n_kp_prior, iters=kmeans_iters, tau=kmeans_tau)
+        # TODO: Make this configurable values
+        rgbk_feat_mode="lab"     # {"lab","ilr"}
+        rgbk_append_xyz=False
+        rgbk_saliency="L"        # {"L","alpha","rgbnorm"}
+        rgbk_keep_top=80_000
+        rgbk_sample_m=50_000
+        rgbk_iters=30
+        rgbk_tol=1e-4
+        rgbk_ridge=1e-4
+        print("keep top: ", rgbk_keep_top)
+        self.rgb_km = FeatureKMeansRGB(
+                K=self.n_kp_prior,
+                feat_mode=rgbk_feat_mode,
+                append_xyz=rgbk_append_xyz,
+                saliency=rgbk_saliency,
+                keep_top=rgbk_keep_top,
+                sample_m=rgbk_sample_m,
+                iters=rgbk_iters,
+                tol=rgbk_tol,
+                ridge=rgbk_ridge,
+            )
         self.init_weights()
 
     # ---------- init helpers ----------
@@ -3679,88 +3849,9 @@ class DLPPrior(nn.Module):
 
         # if self.kp_mode == "kmeans":
         if True:
-            centers_init = self.get_patch_centers().to(x)     # [N_patches,3] in [-1,1]
-            K = int(self.n_kp_prior if k is None else k)
-
-            keep_top = 80_000
-            sample_m = 50_000
-            iters    = 5
-            min_pts  = 8
-            ridge    = 1e-4
-
-            B, C, D, H, W = x.shape
-            out_centers, out_covs, out_mass, out_count = [], [], [], []
-
-            for b in range(B):
-                # --- mass volume and top voxels ---
-                v = x[b].sum(dim=0) if C > 1 else x[b, 0]              # [D,H,W]
-                v = v.float()
-                vals = v.reshape(-1)
-                k_keep = min(keep_top, vals.numel())
-                top = torch.topk(vals, k=k_keep, largest=True, sorted=False)
-                idx = top.indices                                       # [k_keep]
-                wts = top.values.clamp_min(0)                           # [k_keep]
-
-                # flat index -> (x,y,z) -> global [-1,1]
-                z = idx // (H * W)
-                y = (idx % (H * W)) // W
-                xidx = (idx % W)
-                xs = (xidx.float() / (W - 1)) * 2 - 1
-                ys = (y.float()    / (H - 1)) * 2 - 1
-                zs = (z.float()    / (D - 1)) * 2 - 1
-                pts = torch.stack([xs, ys, zs], dim=-1)                 # [k_keep,3]
-
-                # --- subsample for kmeans itself (importance by mass) ---
-                probs = (wts + 1e-9) / (wts.sum() + 1e-9)
-                m = min(sample_m, pts.shape[0])
-                sel = torch.multinomial(probs, num_samples=m, replacement=True)
-                pts_w = pts[sel]                                        # [m,3]
-
-                # --- kmeans with init = patch centers ---
-                centers = self.kmeans_hard(pts_w, K=K, init_centers=centers_init, iters=iters)  # [K,3]
-
-                # --- assignments on FULL top set for stable covariances ---
-                d2 = torch.cdist(pts, centers, p=2).pow(2)              # [k_keep, K]
-                assign = d2.argmin(dim=1)                                # [k_keep]
-
-                # --- per-cluster proximity-weighted covariance ---
-                covs_b, mass_b, cnt_b = [], [], []
-                for k_id in range(K):
-                    mask = (assign == k_id)
-                    if not mask.any():
-                        covs_b.append(torch.eye(3, device=x.device, dtype=pts.dtype) * ridge)
-                        mass_b.append(0.0); cnt_b.append(0)
-                        continue
-
-                    pts_k = pts[mask]
-                    w_k   = wts[mask]
-                    mu_k, cov_k, m_k = self.weighted_cov_proximity(
-                        pts_k, w_k, center=centers[k_id],
-                        alpha=1.5, tau_mode="median", tau_mult=0.8, lam0=ridge, mass_norm=True
-                    )
-
-                    # optional: re-center to μ_k for nicer viz
-                    centers[k_id] = mu_k
-
-                    eff_count = int((w_k > (w_k.max() * 1e-3)).sum().item())
-                    if eff_count < min_pts:
-                        var_iso = cov_k.diag().mean().clamp_min(1e-8)
-                        cov_k = torch.eye(3, device=cov_k.device, dtype=cov_k.dtype) * var_iso
-
-                    covs_b.append(cov_k)
-                    mass_b.append(float(m_k))
-                    cnt_b.append(eff_count)
-
-                out_centers.append(centers)                               # [K,3]
-                out_covs.append(torch.stack(covs_b, dim=0))               # [K,3,3]
-                out_mass.append(torch.tensor(mass_b, device=x.device, dtype=pts.dtype))  # [K]
-                out_count.append(torch.tensor(cnt_b, device=x.device, dtype=torch.int32))# [K]
-
-            kp   = torch.stack(out_centers, dim=0)                        # [B,K,3]
-            cov  = torch.stack(out_covs,    dim=0)                        # [B,K,3,3]
-            mass = torch.stack(out_mass,    dim=0)                        # [B,K]
-            cnt  = torch.stack(out_count,   dim=0)                        # [B,K]
-
+            kp, cov, meta = self.rgb_km(x, centers_init_global=self.get_patch_centers().to(x))
+            print("KP: ", kp.shape)
+            print("cov: ", cov.shape)
             return kp, cov
 
 

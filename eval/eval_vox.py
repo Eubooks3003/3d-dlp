@@ -886,40 +886,41 @@ def log_rgb_voxels(
     else:
         raise ValueError(f"Unknown mode='{mode}' (use 'splat' or 'mesh').")
 
+    if KPx is not None:
+        cross_half = 2.0   # half-length of each arm in voxels; tweak to taste
+        line_w     = 4
+        cross_col  = "rgba(255,0,0,0.95)"  # red
 
-    cross_half = 2.0   # half-length of each arm in voxels; tweak to taste
-    line_w     = 4
-    cross_col  = "rgba(255,0,0,0.95)"  # red
+        KPx = KPx[0]
+        for i in range(KPx.shape[0]):
+            x0, y0, z0 = map(float, KPx[i])  # (X,Y,Z) in voxel indices
 
-    for i in range(KPx.shape[0]):
-        x0, y0, z0 = map(float, KPx[i])  # (X,Y,Z) in voxel indices
-
-        # X arm
-        fig.add_trace(go.Scatter3d(
-            x=[x0 - cross_half, x0 + cross_half], y=[y0, y0], z=[z0, z0],
-            mode="lines",
-            line=dict(color=cross_col, width=line_w),
-            showlegend=False,
-            hoverinfo="text",
-            text=[f"kp {i}", f"kp {i}"],
-            name=f"kp {i}"
-        ))
-        # Y arm
-        fig.add_trace(go.Scatter3d(
-            x=[x0, x0], y=[y0 - cross_half, y0 + cross_half], z=[z0, z0],
-            mode="lines",
-            line=dict(color=cross_col, width=line_w),
-            showlegend=False,
-            hoverinfo="skip"
-        ))
-        # Z arm
-        fig.add_trace(go.Scatter3d(
-            x=[x0, x0], y=[y0, y0], z=[z0 - cross_half, z0 + cross_half],
-            mode="lines",
-            line=dict(color=cross_col, width=line_w),
-            showlegend=False,
-            hoverinfo="skip"
-        ))
+            # X arm
+            fig.add_trace(go.Scatter3d(
+                x=[x0 - cross_half, x0 + cross_half], y=[y0, y0], z=[z0, z0],
+                mode="lines",
+                line=dict(color=cross_col, width=line_w),
+                showlegend=False,
+                hoverinfo="text",
+                text=[f"kp {i}", f"kp {i}"],
+                name=f"kp {i}"
+            ))
+            # Y arm
+            fig.add_trace(go.Scatter3d(
+                x=[x0, x0], y=[y0 - cross_half, y0 + cross_half], z=[z0, z0],
+                mode="lines",
+                line=dict(color=cross_col, width=line_w),
+                showlegend=False,
+                hoverinfo="skip"
+            ))
+            # Z arm
+            fig.add_trace(go.Scatter3d(
+                x=[x0, x0], y=[y0, y0], z=[z0 - cross_half, z0 + cross_half],
+                mode="lines",
+                line=dict(color=cross_col, width=line_w),
+                showlegend=False,
+                hoverinfo="skip"
+            ))
     # ---------- axes & layout ----------
     if show_axes:
         fig.update_scenes(
