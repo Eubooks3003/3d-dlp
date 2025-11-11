@@ -516,7 +516,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             iteration += 1
 
 
-            break  # for debug
+            # break  # for debug
         pbar.close()
         # at end of epoch
         # end of epoch
@@ -617,6 +617,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
             print("mu tot: ", mu_tot_b0.shape)
             print("GT VOL: ", gt_vol.shape)
+
+            # GT LOGGING
             log_rgb_voxels(
                 name="gt/rgb_splat",
                 rgb_vol=gt_vol,
@@ -629,6 +631,33 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 pad=2.0,
                 show_axes=True,
             )
+
+            log_rgb_voxels(
+                name="gt/rgb_splat",
+                rgb_vol=gt_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=None,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+            # REC LOGGING
+            log_rgb_voxels(
+                name="rec/rgb_splat",
+                rgb_vol=rec_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=mu_tot_b0,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
             log_rgb_voxels(
                 name="rec/rgb_splat",
                 rgb_vol=rec_vol,
