@@ -31,7 +31,8 @@ from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, 
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
 from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, log_cov_ellipsoids_over_voxels, 
-                           extract_volumes_for_vis, print_vol_stats, log_voxel_rec_distributions, filter_topk_kps_3d)
+                           extract_volumes_for_vis, print_vol_stats, log_voxel_rec_distributions, filter_topk_kps_3d,
+                           log_rgb_voxels)
 import wandb
 
 matplotlib.use("Agg")
@@ -515,7 +516,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             iteration += 1
 
 
-            # break  # for debug
+            break  # for debug
         pbar.close()
         # at end of epoch
         # end of epoch
@@ -582,9 +583,12 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 
-            gt_vol, rec_vol = extract_volumes_for_vis(model_output, occ_channel=0)
-            print_vol_stats("GT", gt_vol)
-            print_vol_stats("REC", rec_vol)
+            # gt_vol, rec_vol = extract_volumes_for_vis(model_output, occ_channel=0)
+
+            gt_vol = model_output['x'][b0]
+            rec_vol = model_output['rec'][b0]
+
+            print("gt vol: ", gt_vol.shape)
 
             with torch.no_grad():
                 # z_base_var: [B,K,6], mu_tot: [B,K,3], obj_on: [B,K,1]
@@ -605,110 +609,36 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             kp_xyz = model_output["kp_p"]  # [B, K, 3]
 
             z_base_cov_b0 = model_output["z_base_cov"][b0]  # [K, 6]
-
-            # ------ Voxel overlays (same as training) ------
-            # log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,
-            #                        iso_levels=[iso_main], step=step)
-            # log_vox_overlay_plotly("gt/gt", gt_vol, None, kps=kp_xyz[b0],
-            #                        iso_levels=[iso_main], step=step)
-            # log_vox_overlay_plotly("rec/rec", None, rec_vol, kps=None,
-            #                        iso_levels=[iso_main], step=step)
-            # log_vox_overlay_plotly("gt/gt_topk", gt_vol, None, kps=topk_kp_b0,
-            #                        iso_levels=[iso_main], step=step)
-            # log_vox_overlay_plotly("rec/rec_topk", None, rec_vol, kps=topk_kp_b0,
-            #                        iso_levels=[iso_main], step=step)
             
+            print("z base: ", model_output["z_base"].shape)
             z_base_b0 = model_output["z_base"][b0]  # [K, 3]
             mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
             kp_order = ("x","y","z")  # your kp_xyz is in (x,y,z) order
-            log_cov_ellipsoids_over_voxels(
-                name="gt/over_gt_all_kp",
-                gt_vol=gt_vol,
-                kp_norm=kp_xyz,
-                cov_kp=model_output["cov_kp"],
-                step=iteration,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
-            )
-            log_cov_ellipsoids_over_voxels(
-                name="gt/over_gt",
-                gt_vol=gt_vol,
-                kp_norm=model_output["z_base"][b0],
-                cov_kp=z_base_cov_b0,
-                step=iteration,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
-            )
 
-            log_cov_ellipsoids_over_voxels(
-                name="gt/over_gt_w_offset",
-                gt_vol=gt_vol,
-                kp_norm=mu_tot_b0,
-                cov_kp=z_base_cov_b0,
+            print("mu tot: ", mu_tot_b0.shape)
+            print("GT VOL: ", gt_vol.shape)
+            log_rgb_voxels(
+                name="gt/rgb_splat",
+                rgb_vol=gt_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=mu_tot_b0,
                 step=iteration,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
             )
-
-            # REC
-            log_cov_ellipsoids_over_voxels(
-                name="rec/over_gt_all_kp",
-                gt_vol=rec_vol,
-                kp_norm=kp_xyz,
-                cov_kp=model_output["cov_kp"],
+            log_rgb_voxels(
+                name="rec/rgb_splat",
+                rgb_vol=rec_vol,
+                alpha_vol=None,          # None if you don’t have GT α
                 step=iteration,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
-            )
-            log_cov_ellipsoids_over_voxels(
-                name="rec/over_gt",
-                gt_vol=rec_vol,
-                kp_norm=model_output["z_base"][b0],
-                cov_kp=z_base_cov_b0,
-                step=iteration,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
-            )
-
-            log_cov_ellipsoids_over_voxels(
-                name="rec/over_gt_w_offset",
-                gt_vol=rec_vol,
-                kp_norm=mu_tot_b0,
-                cov_kp=z_base_cov_b0,
-                step=iteration,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
-            )
-            log_voxel_rec_distributions(
-                model_output=model_output,
-                x=vox,                 # your GT volume batch
-                occ_channel=0,
-                name_prefix="vox/dist",
-                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
             )
 
 

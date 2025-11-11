@@ -700,6 +700,249 @@ def log_cov_ellipsoids_over_voxels(
 
 
 @torch.no_grad()
+def log_rgb_voxels(
+    name: str,
+    rgb_vol,                      # [3,D,H,W] or [1,3,D,H,W] (torch or np, 0..1 or -1..1)
+    alpha_vol=None,               # [D,H,W] or [1,D,H,W] or None; if None, uniform opacity
+    KPx=None,
+    *,
+    step=None,
+    mode="splat",                 # "splat" or "mesh"
+    topk=60000,                   # only for "splat": max points to plot
+    alpha_thresh=0.05,            # "splat": keep voxels with alpha ≥ thresh
+    mesh_iso=0.2,                 # "mesh": iso-level on alpha/occupancy
+    pad=2.0,                      # scene padding (vox)
+    show_axes=True,
+):
+    import numpy as np
+    import plotly.graph_objects as go
+    try:
+        import wandb
+    except Exception:
+        wandb = None
+
+    # ---------- helpers ----------
+    def _to_np(x):
+        if x is None: return None
+        if isinstance(x, torch.Tensor): x = x.detach().cpu().numpy()
+        return x
+
+    def _as_CDHW(x):
+        x = _to_np(x)
+        if x is None: return None
+        if x.ndim == 5:  # [B,3,D,H,W] or [B,1,D,H,W]
+            x = x[0]
+        assert x.ndim == 4 and (x.shape[0] in (1,3)), f"rgb/alpha shape must be [C,D,H,W], got {x.shape}"
+        return x
+
+    def _as_DHW(x):
+        x = _to_np(x)
+        if x is None: return None
+        if x.ndim == 4:  # [1,D,H,W]
+            x = x[0]
+        assert x.ndim == 3, f"alpha shape must be [D,H,W], got {x.shape}"
+        return x
+
+    def _trilinear_sample_rgb(rgb_CDHW, pts_XYZ):
+        """
+        rgb_CDHW: np [3,D,H,W], values in [0,1] or [-1,1]
+        pts_XYZ:  np [M,3] in voxel index coordinates (x=W, y=H, z=D), float
+        returns:  np [M,3] rgb in [0,1]
+        """
+        C, D, H, W = rgb_CDHW.shape
+        assert C == 3
+        # clamp points to valid cube
+        x = np.clip(pts_XYZ[:,0], 0, W-1-1e-6)
+        y = np.clip(pts_XYZ[:,1], 0, H-1-1e-6)
+        z = np.clip(pts_XYZ[:,2], 0, D-1-1e-6)
+        x0 = np.floor(x).astype(np.int32); x1 = x0 + 1
+        y0 = np.floor(y).astype(np.int32); y1 = y0 + 1
+        z0 = np.floor(z).astype(np.int32); z1 = z0 + 1
+        xd = (x - x0)[...,None]; yd = (y - y0)[...,None]; zd = (z - z0)[...,None]
+
+        def get(c, zz, yy, xx): return rgb_CDHW[c, zz, yy, xx]  # scalar
+
+        out = np.empty((pts_XYZ.shape[0], 3), dtype=np.float32)
+        for c in range(3):
+            c000 = get(c, z0, y0, x0); c100 = get(c, z1, y0, x0)
+            c010 = get(c, z0, y1, x0); c110 = get(c, z1, y1, x0)
+            c001 = get(c, z0, y0, x1); c101 = get(c, z1, y0, x1)
+            c011 = get(c, z0, y1, x1); c111 = get(c, z1, y1, x1)
+            c00 = c000*(1-xd) + c001*xd
+            c01 = c010*(1-xd) + c011*xd
+            c10 = c100*(1-xd) + c101*xd
+            c11 = c110*(1-xd) + c111*xd
+            c0  = c00*(1-yd) + c01*yd
+            c1  = c10*(1-yd) + c11*yd
+            out[:,c] = (c0*(1-zd) + c1*zd).squeeze(-1)
+        # map [-1,1] to [0,1] if needed
+        if out.min() < 0.0:
+            out = (out + 1.0) * 0.5
+        return np.clip(out, 0.0, 1.0)
+
+    # ---------- sanitize inputs ----------
+    RGB = _as_CDHW(rgb_vol)            # [3,D,H,W]
+    if RGB.shape[0] != 3:
+        raise ValueError("rgb_vol must be 3-channel [3,D,H,W] (or [1,3,D,H,W]).")
+    D,H,W = RGB.shape[1:]
+    ALP = None if alpha_vol is None else _as_DHW(alpha_vol)  # [D,H,W]
+    if ALP is not None and ALP.shape != (D,H,W):
+        raise ValueError(f"alpha_vol shape {ALP.shape} != rgb spatial {(D,H,W)}")
+
+    # ---------- figure ----------
+    fig = go.Figure()
+
+    # ---------- plotting modes ----------
+    if mode == "splat":
+        # parameters (feel free to surface them)
+        alpha_thresh = 0.25           # was 0.05; tighten a lot
+        rgb_mag_thresh = 0.10         # filter out near-black
+        edge_percentile = 80          # keep top 20% edges (optional)
+        use_edge_mask = True
+
+        # --- compute masks ---
+        weights = np.asarray(ALP, dtype=np.float32).clip(0, 1) if ALP is not None else None
+        if weights is None:
+            # if no alpha provided, derive a proxy from color magnitude
+            mag = np.sqrt((RGB[0]**2 + RGB[1]**2 + RGB[2]**2))
+            mask = mag >= rgb_mag_thresh
+        else:
+            mag = np.sqrt((RGB[0]**2 + RGB[1]**2 + RGB[2]**2))
+            mask = (weights >= alpha_thresh) & (mag >= rgb_mag_thresh)
+
+        # optional: edge emphasis to avoid filling interiors
+        if use_edge_mask and weights is not None:
+            import scipy.ndimage as ndi
+            gx = ndi.sobel(weights, axis=2); gy = ndi.sobel(weights, axis=1); gz = ndi.sobel(weights, axis=0)
+            edge = np.sqrt(gx*gx + gy*gy + gz*gz)
+            if edge.any():
+                thr = np.percentile(edge[mask], edge_percentile) if mask.any() else np.percentile(edge, edge_percentile)
+                edge_mask = edge >= thr
+                mask = mask & edge_mask
+
+        idx = np.argwhere(mask)  # [M,3] int (z,y,x)
+        if idx.size == 0:
+            # nothing to draw
+            fig.add_trace(go.Scatter3d(x=[], y=[], z=[], mode="markers", name="RGB voxels"))
+            if wandb is not None: wandb.log({name: fig}, step=step)
+            return fig
+
+        # top-K (after filtering)
+        if idx.shape[0] > topk:
+            # score by alpha * edge (fallback to alpha if no edge)
+            score = (weights[idx[:,0], idx[:,1], idx[:,2]] if weights is not None else mag[idx[:,0], idx[:,1], idx[:,2]])
+            if use_edge_mask and weights is not None:
+                score = score * edge[idx[:,0], idx[:,1], idx[:,2]]
+            sel = np.argpartition(score, -topk)[-topk:]
+            idx = idx[sel]
+
+        # integer indices for gather; float for plotting
+        z_i, y_i, x_i = idx[:,0].astype(np.int64), idx[:,1].astype(np.int64), idx[:,2].astype(np.int64)
+        z_f, y_f, x_f = z_i.astype(np.float32), y_i.astype(np.float32), x_i.astype(np.float32)
+
+        # gather colors
+        r, g, b = RGB[0, z_i, y_i, x_i], RGB[1, z_i, y_i, x_i], RGB[2, z_i, y_i, x_i]
+        if r.min() < 0 or g.min() < 0 or b.min() < 0:
+            r = (r + 1) * 0.5; g = (g + 1) * 0.5; b = (b + 1) * 0.5
+        R = np.clip((r * 255).astype(np.uint8), 0, 255)
+        G = np.clip((g * 255).astype(np.uint8), 0, 255)
+        B = np.clip((b * 255).astype(np.uint8), 0, 255)
+
+        # per-point opacity = alpha; NO min-clamp and NO marker.opacity scalar
+        opac = weights[z_i, y_i, x_i] if weights is not None else np.ones_like(R, dtype=np.float32)
+        color_rgba = [f"rgba({int(R[k])},{int(G[k])},{int(B[k])},{float(np.clip(opac[k],0.0,1.0))})" for k in range(len(R))]
+
+        fig.add_trace(go.Scatter3d(
+            x=x_f, y=y_f, z=z_f,
+            mode="markers",
+            marker=dict(size=2, color=color_rgba),
+            name="RGB voxels",
+        ))
+
+    elif mode == "mesh":
+        if ALP is None:
+            raise ValueError("mode='mesh' requires alpha_vol for an isosurface.")
+        try:
+            from skimage.measure import marching_cubes
+        except Exception:
+            raise ImportError("mode='mesh' needs skimage.measure.marching_cubes; install scikit-image or use mode='splat'.")
+
+        # marching cubes on alpha (in Z,Y,X order)
+        verts_zyx, faces, _, _ = marching_cubes(ALP.astype(np.float32), level=float(mesh_iso))
+        # convert to (X,Y,Z) index space
+        P = np.stack([verts_zyx[:,2], verts_zyx[:,1], verts_zyx[:,0]], axis=1)  # [V,3] (x,y,z)
+        # sample per-vertex RGB
+        v_rgb = _trilinear_sample_rgb(RGB, P)  # [V,3] in [0,1]
+        v_rgb_u8 = (v_rgb*255.0).astype(np.uint8)
+
+        fig.add_trace(go.Mesh3d(
+            x=P[:,0], y=P[:,1], z=P[:,2],
+            i=faces[:,0], j=faces[:,1], k=faces[:,2],
+            vertexcolor=v_rgb_u8,  # per-vertex color
+            opacity=0.9,
+            flatshading=True,
+            name="RGB isosurface"
+        ))
+    else:
+        raise ValueError(f"Unknown mode='{mode}' (use 'splat' or 'mesh').")
+
+
+    cross_half = 2.0   # half-length of each arm in voxels; tweak to taste
+    line_w     = 4
+    cross_col  = "rgba(255,0,0,0.95)"  # red
+
+    for i in range(KPx.shape[0]):
+        x0, y0, z0 = map(float, KPx[i])  # (X,Y,Z) in voxel indices
+
+        # X arm
+        fig.add_trace(go.Scatter3d(
+            x=[x0 - cross_half, x0 + cross_half], y=[y0, y0], z=[z0, z0],
+            mode="lines",
+            line=dict(color=cross_col, width=line_w),
+            showlegend=False,
+            hoverinfo="text",
+            text=[f"kp {i}", f"kp {i}"],
+            name=f"kp {i}"
+        ))
+        # Y arm
+        fig.add_trace(go.Scatter3d(
+            x=[x0, x0], y=[y0 - cross_half, y0 + cross_half], z=[z0, z0],
+            mode="lines",
+            line=dict(color=cross_col, width=line_w),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+        # Z arm
+        fig.add_trace(go.Scatter3d(
+            x=[x0, x0], y=[y0, y0], z=[z0 - cross_half, z0 + cross_half],
+            mode="lines",
+            line=dict(color=cross_col, width=line_w),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+    # ---------- axes & layout ----------
+    if show_axes:
+        fig.update_scenes(
+            xaxis=dict(range=[-pad, W-1+pad]),
+            yaxis=dict(range=[-pad, H-1+pad]),
+            zaxis=dict(range=[-pad, D-1+pad]),
+            aspectmode="data"
+        )
+    fig.update_layout(
+        title=f"RGB voxels ({mode})",
+        margin=dict(l=0,r=0,t=40,b=0),
+        showlegend=True,
+        legend=dict(orientation='h'),
+        scene=dict(xaxis_title="X (W)", yaxis_title="Y (H)", zaxis_title="Z (D)")
+    )
+
+    
+
+    if wandb is not None:
+        wandb.log({name: fig}, step=step)
+    return fig
+
+@torch.no_grad()
 
 def filter_topk_kps_3d(
     z_base_var,      # [B, *G*, K, C]  (C = 3 or 6)
