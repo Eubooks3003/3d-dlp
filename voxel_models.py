@@ -243,7 +243,7 @@ class DLP(nn.Module):
 
         Note: Patch extraction and stitching use differentiable spatial transformer networks (STN).
         """
-        self.occupancy_mode = True
+        self.occupancy_mode = (cdim ==1)
         self.cdim = cdim  # number of input image channels
         self.image_size = image_size
         self.normalize_rgb = normalize_rgb  # normalize to [-1, 1] or keep [0, 1]
@@ -1379,10 +1379,19 @@ class DLP(nn.Module):
                                             balance, use_kl_mask=use_kl_mask, apply_mask_on_obj_on=apply_mask_on_obj_on,
                                             beta_obj=beta_obj)
         else:
-            return self.calc_static_elbo(x, model_output, warmup, beta_kl, beta_dyn, beta_rec,
-                                         kl_balance, dynamic_discount, recon_loss_type, recon_loss_func,
-                                         balance, use_kl_mask=use_kl_mask, apply_mask_on_obj_on=apply_mask_on_obj_on,
-                                         beta_obj=beta_obj)
+            return self.calc_static_elbo_rgb_voxels(
+                x,
+                model_output,
+                warmup=warmup,
+                beta_kl=beta_kl,
+                beta_rec=beta_rec,
+                beta_obj=beta_obj,
+                kl_balance=kl_balance,
+                balance=balance,
+                recon_loss_type=recon_loss_type,
+                use_kl_mask=use_kl_mask,
+                apply_mask_on_obj_on=apply_mask_on_obj_on,
+            )
 
     def calc_dyn_elbo(self, x, model_output, warmup=False, beta_kl=0.1, beta_dyn=0.1, beta_rec=1.0,
                       kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
@@ -1908,8 +1917,6 @@ class DLP(nn.Module):
         occ_prob_per_obj (opt): [B*T, N, 1, *spatial*]
         bg_logits (opt):        [B*T, 1, *spatial*]
         """
-        import torch
-        import torch.nn.functional as F
 
         print(" RECON LOSS TYPE: ", recon_loss_type)
 
@@ -2349,6 +2356,265 @@ class DLP(nn.Module):
                      'loss_kl_obj_on': loss_kl_obj_on, 'loss_kl_scale': loss_kl_scale, 'loss_kl_depth': loss_kl_depth,
                      'loss_kl_context': loss_kl_context, 'loss_obj_reg': loss_obj_reg}
         return loss_dict
+    
+
+    def calc_static_elbo_rgb_voxels(
+        self,
+        x,                                    # [B, T, 3, D, H, W] target RGB voxels (match self.normalize_rgb scale)
+        model_output,
+        warmup: bool = False,
+        # weights
+        beta_kl: float = 0.05,
+        beta_rec: float = 1.0,
+        beta_obj: float = 0.0,
+        kl_balance: float = 0.001,
+        balance: float = 0.5,
+        # reconstruction
+        recon_loss_type: str = "mse",         # {"mse","l1"}
+        fg_weight: float = 1.0,               # weight on foreground voxels
+        bg_weight: float = 1.0,               # weight on background voxels
+        use_x_occ_as_mask: bool = False,      # if True, derive occ mask from x to weight recon
+        occ_from_x_thresh: float = 0.05,      # threshold on |x| to treat a voxel as foreground (if use_x_occ_as_mask)
+        # regularizers / aux
+        alpha_sparsity_weight: float = 1e-3,  # L1 on per-object α volume
+        alpha_entropy_weight: float = 0.0,    # encourage crisp α (optional)
+        overlap_weight: float = 0.0,          # penalize multi-coverage ∑_{i≠j} a_i a_j
+        bg_aux_weight: float = 0.1,           # MSE on background head under bg_mask (optional)
+        # KL masking
+        use_kl_mask: bool = True,
+        apply_mask_on_obj_on: bool = False,
+    ):
+        """
+        ELBO for RGB voxel reconstruction (no depth):
+        - recon on rec_rgb ∈ [B*T,3,D,H,W] vs x_rgb ∈ [B*T,3,D,H,W]
+        - same KLs as occupancy path (kp base/offset, scale, obj_on Beta, features; depth KL = 0)
+        - α-based regs: sparsity, optional entropy and overlap
+        - optional BG aux: MSE on bg RGB behind the object mask
+        """
+        kl_loss_func = ChamferLossKL(use_reverse_kl=False)
+
+        # --------- unpack model outputs ----------
+        mu_p            = model_output['kp_p']                 # [B*T, K, 2 or 3]
+        mu_anchor       = model_output['mu_anchor']            # [B*T, 1, ...]
+        logvar_anchor   = model_output['logvar_anchor']        # (unused; posterior delta at mu_anchor)
+
+        z               = model_output['z']
+        z_base          = model_output['z_base']
+        mu_offset       = model_output['mu_offset']
+        logvar_offset   = model_output['logvar_offset']
+
+        mu_features     = model_output['mu_features']
+        logvar_features = model_output['logvar_features']
+        z_features      = model_output['z_features']
+        mu_bg           = model_output['mu_bg_features']
+        logvar_bg       = model_output['logvar_bg_features']
+        z_bg            = model_output['z_bg_features']
+
+        mu_scale        = model_output['mu_scale']
+        logvar_scale    = model_output['logvar_scale']
+        z_scale         = model_output['z_scale']
+
+        obj_on          = model_output['obj_on']               # [B*T,K] or [B*T,K,1]
+        obj_on_a        = model_output['obj_on_a']
+        obj_on_b        = model_output['obj_on_b']
+
+        # decoder composites (RGB path; no depth)
+        rec_rgb         = model_output['rec']                  # [B*T,3,D,H,W] (already squashed to [-1,1] or [0,1])
+        alpha_masks     = model_output.get('alpha_masks', None)   # [B*T,N,1,D,H,W] in [0,1]
+        bg_mask         = model_output.get('bg_mask', None)       # [B*T,1,D,H,W]
+        bg_rec_raw      = model_output.get('bg_rec', None)        # [B*T,C_bg,D,H,W] (pre-activation)
+
+        # --------- flatten time ----------
+        B = x.shape[0]
+        T = getattr(self, 'timestep_horizon', x.shape[1] if x.dim() >= 2 else 1)
+        x_flat   = x.view(-1, *x.shape[2:])                    # [B*T,3,D,H,W]
+        pred_rgb = rec_rgb                                     # [B*T,3,D,H,W]
+
+        # --------- reconstruction (RGB) ----------
+        # Optional fg/bg weighting via mask; default uniform weights
+        if use_x_occ_as_mask:
+            # derive occupancy from target RGB (channel-agnostic magnitude)
+            # works for either [0,1] or [-1,1] ranges with a small threshold
+            occ_from_x = (x_flat.abs().mean(dim=1, keepdim=True) > occ_from_x_thresh).float()  # [B*T,1,D,H,W]
+            w = fg_weight * occ_from_x + bg_weight * (1.0 - occ_from_x)                       # [B*T,1,D,H,W]
+        elif bg_mask is not None:
+            # use model’s bg_mask as a soft weight (stabilizes BG learning)
+            w = fg_weight * (1.0 - bg_mask) + bg_weight * bg_mask                              # [B*T,1,D,H,W]
+        else:
+            w = pred_rgb.new_ones(pred_rgb.shape[:2] + pred_rgb.shape[2:])                    # [B*T,3,D,H,W]
+            # match channel dims below
+
+        if w.shape[1] == 1:
+            w = w.expand(-1, pred_rgb.shape[1], -1, -1, -1)                                   # [B*T,3,D,H,W]
+
+        if recon_loss_type == "l1":
+            err_map = (pred_rgb - x_flat).abs() * w
+        else:  # "mse" (default)
+            err_map = (pred_rgb - x_flat) ** 2 * w
+
+        spatial_dims = tuple(range(1, err_map.dim()))  # sum over C,D,H,W
+        loss_rec = err_map.sum(dim=spatial_dims).mean()
+
+        # Optional BG aux: train BG head to match x on BG regions
+        loss_bg_aux = torch.tensor(0.0, device=x.device)
+        if (bg_rec_raw is not None) and (bg_mask is not None) and (bg_aux_weight > 0):
+            # Re-squash BG RGB to same range as pred/target
+            bg_rgb = bg_rec_raw[:, :pred_rgb.shape[1], ...]
+            if getattr(self, "normalize_rgb", False):
+                bg_rgb = torch.tanh(bg_rgb)
+            else:
+                bg_rgb = torch.sigmoid(bg_rgb)
+            # weight only where bg_mask ~1 (i.e., not covered by objects)
+            w_bg = bg_mask.expand_as(bg_rgb) * bg_weight
+            bg_err = ((bg_rgb - x_flat) ** 2) * w_bg
+            loss_bg_aux = bg_err.sum(dim=spatial_dims).mean() * bg_aux_weight
+
+        # --------- α-based regularizers (optional) ----------
+        sparsity = torch.tensor(0.0, device=x.device)
+        alpha_entropy = torch.tensor(0.0, device=x.device)
+        overlap_pen = torch.tensor(0.0, device=x.device)
+
+        if alpha_masks is not None:
+            # L1 sparsity over per-object α volumes
+            if alpha_sparsity_weight > 0:
+                spatial = tuple(range(2, alpha_masks.dim()))   # sum over 1,D,H,W
+                sparsity = alpha_masks.mean(dim=spatial).mean()
+                loss_rec = loss_rec + alpha_sparsity_weight * sparsity
+
+            # Optional entropy reg to discourage mid-range α (foggy blending)
+            if alpha_entropy_weight > 0:
+                a = torch.clamp(alpha_masks, 1e-6, 1 - 1e-6)
+                ent = -(a * torch.log(a) + (1 - a) * torch.log(1 - a))       # Bernoulli entropy
+                alpha_entropy = ent.mean()
+                loss_rec = loss_rec + alpha_entropy_weight * alpha_entropy
+
+            # Optional overlap penalty: sum_k≠j a_k a_j
+            if overlap_weight > 0:
+                A = alpha_masks.squeeze(2)            # [B*T,N,D,H,W]
+                s1 = A.sum(dim=1)                     # ∑ a_k
+                s2 = (A ** 2).sum(dim=1)              # ∑ a_k^2
+                pairwise = (s1 ** 2 - s2)             # 2∑_{i<j} a_i a_j
+                overlap_pen = pairwise.mean()
+                loss_rec = loss_rec + overlap_weight * overlap_pen
+
+        print("obj_on: ", obj_on.shape)
+        # --------- KL masking ----------
+        if use_kl_mask:
+            kl_mask = obj_on.reshape(obj_on.shape[0], obj_on.shape[2])
+            adaptive_beta_kl = 1.0
+        else:
+            kl_mask = 1.0
+            adaptive_beta_kl = 1.0
+
+        # --------- priors ----------
+        logvar_kp       = self.logvar_kp.expand_as(mu_p)
+        logvar_offset_p = self.logvar_offset_p
+        logvar_scale_p  = self.logvar_scale_p
+        obj_on_a_prior  = self.obj_on_a_p
+        obj_on_b_prior  = self.obj_on_b_p
+        mu_scale_prior  = self.mu_scale_prior
+
+        # --------- KLs (depth = 0 here) ----------
+        # kp base (anchor posterior ~ delta at mu_anchor)
+        mu_prior   = mu_p
+        logv_prior = logvar_kp
+        mu_post    = mu_anchor.squeeze(1)
+        logv_post  = torch.zeros_like(mu_post)
+        loss_kl_kp_base = kl_loss_func(
+            mu_preds=mu_post, logvar_preds=logv_post, mu_gts=mu_prior, logvar_gts=logv_prior
+        )                                                 # [B*T]
+        loss_kl_kp_base = (loss_kl_kp_base * adaptive_beta_kl).mean()
+
+        # kp offset
+        loss_kl_kp_offset = calc_kl(
+            logvar_offset.reshape(-1, logvar_offset.shape[-1]),
+            mu_offset.reshape(-1, mu_offset.shape[-1]),
+            logvar_o=logvar_offset_p, reduce='none'
+        )
+        loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, mu_offset.shape[2]) * kl_mask).sum(-1)
+        loss_kl_kp_offset = (loss_kl_kp_offset * adaptive_beta_kl).mean()
+        loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset
+
+        # scale
+        loss_kl_scale = calc_kl(
+            logvar_scale.reshape(-1, logvar_scale.shape[-1]),
+            mu_scale.reshape(-1,  mu_scale.shape[-1]),
+            mu_o=mu_scale_prior, logvar_o=logvar_scale_p, reduce='none'
+        )
+        loss_kl_scale = ((loss_kl_scale.view(-1, mu_scale.shape[2]) * kl_mask).sum(-1) * adaptive_beta_kl).mean()
+
+        # obj_on ~ Beta
+        loss_kl_obj_on = calc_kl_beta_dist(obj_on_a, obj_on_b, obj_on_a_prior, obj_on_b_prior)  # [B*T,K]
+        loss_kl_obj_on = (loss_kl_obj_on * kl_mask).sum(-1) if apply_mask_on_obj_on else loss_kl_obj_on.sum(-1)
+        loss_kl_obj_on = (loss_kl_obj_on * adaptive_beta_kl).mean()
+
+        # features (object + bg)
+        if getattr(self, 'features_dist', 'gaussian') == 'categorical':
+            logits_feat_post = mu_features.reshape(-1, mu_features.shape[-1])
+            logits_feat_prior = torch.log(torch.full_like(logits_feat_post, 1.0 / self.n_fg_classes))
+            loss_kl_feat_obj = calc_kl_categorical(
+                logits_feat_post, logits_feat_prior, num_classes=self.n_fg_classes, reduce='none', balance=balance
+            )
+            loss_kl_feat_obj = (loss_kl_feat_obj.view(-1, mu_features.shape[2]) * kl_mask)
+            loss_kl_feat_obj = (loss_kl_feat_obj.sum(-1) * adaptive_beta_kl).mean()
+
+            logits_feat_bg_post = mu_bg.reshape(-1, mu_bg.shape[-1])
+            logits_feat_bg_prior = torch.log(torch.full_like(logits_feat_bg_post, 1.0 / self.n_bg_classes))
+            loss_kl_feat_bg = calc_kl_categorical(
+                logits_feat_bg_post, logits_feat_bg_prior, num_classes=self.n_bg_classes, reduce='none', balance=balance
+            )
+            loss_kl_feat_bg = (loss_kl_feat_bg * adaptive_beta_kl).mean()
+            loss_kl_feat = loss_kl_feat_obj + loss_kl_feat_bg
+        else:
+            loss_kl_feat = calc_kl(
+                logvar_features.reshape(-1, logvar_features.shape[-1]),
+                mu_features.reshape(-1,  mu_features.shape[-1]),
+                reduce='none'
+            )
+            loss_kl_feat_obj = (loss_kl_feat.view(-1, mu_features.shape[2]) * kl_mask)
+            loss_kl_feat_obj = (loss_kl_feat_obj.sum(-1) * adaptive_beta_kl).mean()
+
+            loss_kl_feat_bg = calc_kl(logvar_bg, mu_bg, reduce='none')
+            loss_kl_feat_bg = (loss_kl_feat_bg * adaptive_beta_kl).mean()
+            loss_kl_feat = loss_kl_feat_obj + loss_kl_feat_bg
+
+        loss_kl_depth = torch.tensor(0.0, device=x.device)  # no depth in RGB-voxel case
+
+        loss_kl_static = loss_kl_kp + loss_kl_scale + loss_kl_obj_on + kl_balance * loss_kl_feat + loss_kl_depth
+
+        # regularize number of active particles (same as yours)
+        if obj_on.dim() == 3:
+            kl_mask = obj_on.reshape(obj_on.shape[0], obj_on.shape[2])
+        loss_obj_reg = (kl_mask.sum(-1) ** 2).mean()
+
+        # total loss
+        loss = beta_rec * (loss_rec + loss_bg_aux) + beta_kl * loss_kl_static + beta_obj * loss_obj_reg
+
+        # metrics
+        with torch.no_grad():
+            mse_val = F.mse_loss(pred_rgb, x_flat)
+            psnr = -10.0 * torch.log10(mse_val + 1e-12)
+            obj_on_l1 = torch.abs(obj_on.squeeze(-1) if obj_on.dim() == 3 else obj_on).sum(-1).mean()
+
+        return {
+            'loss': loss,
+            'loss_rec': loss_rec,
+            'loss_bg_aux': loss_bg_aux,
+            'alpha_sparsity': sparsity,
+            'alpha_entropy': alpha_entropy,
+            'alpha_overlap': overlap_pen,
+            'kl': loss_kl_static,
+            'kl_dyn': torch.tensor(0.0, device=x.device),
+            'loss_kl_kp': loss_kl_kp,
+            'loss_kl_feat': loss_kl_feat,
+            'loss_kl_obj_on': loss_kl_obj_on,
+            'loss_kl_scale': loss_kl_scale,
+            'loss_kl_depth': loss_kl_depth,
+            'loss_kl_context': torch.tensor(0.0, device=x.device),
+            'loss_obj_reg': loss_obj_reg,
+            'psnr': psnr,
+        }
+
 
     def lerp(self, other, betta):
         # weight interpolation for ema - not used in the paper

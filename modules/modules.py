@@ -6001,8 +6001,9 @@ class DLPDecoder(nn.Module):
               rendering of particles
         """
         super(DLPDecoder, self).__init__()
-        self.occupancy_mode  = True
+        self.occupancy_mode  = (cdim ==1)
         self.occupancy_prior = 0.05
+        self.alpha_prior = 0.05  
         self.image_size = image_size
         self.feature_map_size = image_size
         self.n_kp_enc = n_kp_enc
@@ -6092,6 +6093,15 @@ class DLPDecoder(nn.Module):
                     except Exception:
                         pass
                     break
+        else:
+            p0 = min(max(self.alpha_prior, 1e-4), 1 - 1e-4)
+            logit_p0 = math.log(p0 / (1 - p0))
+            for attr_name in ["final_conv", "out_conv", "to_rgb", "to_logits"]:
+                mod = getattr(self.particle_dec, attr_name, None)
+                if isinstance(mod, nn.Conv3d) and mod.bias is not None:
+                    with torch.no_grad():
+                        mod.bias[0].fill_(logit_p0)
+                    break
 
     def translate_patches(self, kp_batch, patches_batch, scale=None, translation=None, scale_normalized=False):
         """
@@ -6168,50 +6178,35 @@ class DLPDecoder(nn.Module):
         content_obj: [B,N,Cc,H,W,L]  (Cc can be 1 for occupancy, 3 for RGB, etc.)
         d_obj:       [B,N,1,H,W,L] or None
         """
-        patches = self.particle_dec(z_features, context=z_ctx)                 # [B*N, C, ps, ps, ps]
-        patches = patches.view(-1, z_kp.shape[1], *patches.shape[1:])         # [B, N, C, ps, ps, ps]
-        patches_t = self.translate_patches(z_kp, patches, z_scale, translation)  # [B,N,C,H,W,L]
+        patches = self.particle_dec(z_features, context=z_ctx)        # [B*N, C, ps, ps, ps]
+        patches = patches.view(-1, z_kp.shape[1], *patches.shape[1:]) # [B, N, C, ps, ps, ps]
+        patches_t = self.translate_patches(z_kp, patches, z_scale, translation)  # [B,N,C,D,H,W]
 
         C = patches_t.shape[2]
-        if C < 2:
-            raise ValueError(f"Decoder must output at least 2 channels (alpha + content). Got C={C}.")
+        assert C >= 1 + self.cdim, f"need [alpha + {self.cdim} rgb], got C={C}"
 
-        a_obj        = patches_t[:, :, :1]            # [B,N,1,H,W,L]
-        content_obj  = patches_t[:, :, 1:]            # [B,N,Cc,H,W,L]
-        d_obj        = None                           # keep unified; handle separate depth only if you add it later
-        return patches, a_obj, content_obj, d_obj
+        a_logits = patches_t[:, :, :1]                         # [B,N,1,D,H,W]
+        a_obj    = torch.sigmoid(a_logits)                     # α in [0,1]
+        rgb_raw  = patches_t[:, :, 1:1+self.cdim]              # [B,N,3,D,H,W]
+        if self.normalize_rgb:
+            rgb_obj = torch.tanh(rgb_raw)                      # [-1,1]
+        else:
+            rgb_obj = torch.sigmoid(rgb_raw)                   # [0,1]
 
+        return patches, a_obj, rgb_obj, None                   # d_obj=None
 
-    def composite_with_depth(self, a_obj, content_obj, obj_on, z_depth, d_obj=None, eps=1e-5):
-        """
-        Channel-agnostic 3D compositing.
-        a_obj:       [B,N,1,H,W,L]          (alpha from each object)
-        content_obj: [B,N,Cc,H,W,L]         (Cc arbitrary: 1 for occupancy, 3 for RGB, etc.)
-        obj_on:      [B,N] or [B,N,1]
-        z_depth:     [B,N,1]
-        d_obj:       [B,N,1,H,W,L] or None
-        Returns:
-        a_used:      [B,N,1,H,W,L]
-        bg_mask:     [B,1,H,W,L]
-        content_comp:[B,Cc,H,W,L]         (Cc matches content_obj channels)
-        depth_comp:  [B,1,H,W,L] or None
-        """
-        if obj_on.dim() == 3:
-            obj_on = obj_on.squeeze(-1)               # [B,N]
-
-        gate   = obj_on[:, :, None, None, None, None] # [B,N,1,1,1,1]
-        a_obj  = gate * a_obj                         # [B,N,1,H,W,L]
-        cont   = a_obj * content_obj                  # [B,N,Cc,H,W,L]
-
-        # importance/ordering from depth
-        imp = a_obj * torch.sigmoid(-z_depth[:, :, :, None, None, None])   # [B,N,1,H,W,L]
-        imp = imp / (imp.sum(dim=1, keepdim=True) + eps)
-
-        content_comp = (cont * imp).sum(dim=1)        # [B,Cc,H,W,L]
-        depth_comp   = (d_obj * imp).sum(dim=1) if d_obj is not None else None
-        bg_mask      = 1.0 - (imp * a_obj).sum(dim=1) # [B,1,H,W,L]
-        a_used       = imp * a_obj
-        return a_used, bg_mask, content_comp, depth_comp
+    def composite_rgb(self, a_obj, rgb_obj, obj_on, eps=1e-6):
+        # a_obj: [B,N,1,D,H,W] in [0,1], rgb_obj: [B,N,3,D,H,W]
+        if obj_on.dim() == 3: obj_on = obj_on.squeeze(-1)      # [B,N]
+        gate = obj_on[:, :, None, None, None, None]            # [B,N,1,1,1,1]
+        a = torch.clamp(a_obj * gate, 0.0, 1.0)                # gate off disabled objects
+        # per-voxel mixture weights from alpha only (no ordering)
+        w = a / (a.sum(dim=1, keepdim=True) + eps)             # [B,N,1,D,H,W]
+        rgb_comp = (w * rgb_obj).sum(dim=1)                    # [B,3,D,H,W]
+        alpha_sum = a.sum(dim=1, keepdim=True).clamp(max=1.0)  # [B,1,D,H,W]
+        bg_mask = 1.0 - alpha_sum
+        # return per-object α for optional aux losses/visualization
+        return a, bg_mask, rgb_comp, None
 
 
     def decode_objects(
@@ -6240,9 +6235,8 @@ class DLPDecoder(nn.Module):
         dec_depth_patches = None  # unified depth is not per-patch separate object unless you want to expose it
 
         # Composite (always uses z_depth for ordering)
-        alpha_masks, bg_mask, dec_rgb_comp, dec_depth_comp = self.composite_with_depth(
-            a_obj, rgb_obj, obj_on=obj_on, z_depth=z_depth, d_obj=d_obj
-        )
+        print("Z DEPTH SHAPE: ", z_depth.shape)
+        alpha_masks, bg_mask, dec_rgb_comp, dec_depth_comp = self.composite_rgb(a_obj, rgb_obj, obj_on)
 
         return dec_rgb_patches, dec_rgb_comp, alpha_masks, bg_mask, dec_depth_comp, dec_depth_patches
 
@@ -6336,6 +6330,7 @@ class DLPDecoder(nn.Module):
 
         rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
 
+        print("REC shape from decoder; ", rec.shape)
         return {
             'rec': rec,
             'dec_objects': dec_objects,
