@@ -620,10 +620,23 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
             # GT LOGGING
             log_rgb_voxels(
-                name="gt/rgb_splat",
+                name="gt/rgb_splat_kp",
                 rgb_vol=gt_vol,
                 alpha_vol=None,          # None if you don’t have GT α
                 KPx=mu_tot_b0,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            log_rgb_voxels(
+                name="gt/rgb_splat_no_offset",
+                rgb_vol=gt_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=z_base_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -646,7 +659,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             )
             # REC LOGGING
             log_rgb_voxels(
-                name="rec/rgb_splat",
+                name="rec/rgb_splat_kp",
                 rgb_vol=rec_vol,
                 alpha_vol=None,          # None if you don’t have GT α
                 KPx=mu_tot_b0,
@@ -662,6 +675,19 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 name="rec/rgb_splat",
                 rgb_vol=rec_vol,
                 alpha_vol=None,          # None if you don’t have GT α
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            log_rgb_voxels(
+                name="rec/rgb_splat_no_offset",
+                rgb_vol=rec_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=z_base_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,

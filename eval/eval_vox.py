@@ -887,40 +887,8 @@ def log_rgb_voxels(
         raise ValueError(f"Unknown mode='{mode}' (use 'splat' or 'mesh').")
 
     if KPx is not None:
-        cross_half = 2.0   # half-length of each arm in voxels; tweak to taste
-        line_w     = 4
-        cross_col  = "rgba(255,0,0,0.95)"  # red
-
-        KPx = KPx[0]
-        for i in range(KPx.shape[0]):
-            x0, y0, z0 = map(float, KPx[i])  # (X,Y,Z) in voxel indices
-
-            # X arm
-            fig.add_trace(go.Scatter3d(
-                x=[x0 - cross_half, x0 + cross_half], y=[y0, y0], z=[z0, z0],
-                mode="lines",
-                line=dict(color=cross_col, width=line_w),
-                showlegend=False,
-                hoverinfo="text",
-                text=[f"kp {i}", f"kp {i}"],
-                name=f"kp {i}"
-            ))
-            # Y arm
-            fig.add_trace(go.Scatter3d(
-                x=[x0, x0], y=[y0 - cross_half, y0 + cross_half], z=[z0, z0],
-                mode="lines",
-                line=dict(color=cross_col, width=line_w),
-                showlegend=False,
-                hoverinfo="skip"
-            ))
-            # Z arm
-            fig.add_trace(go.Scatter3d(
-                x=[x0, x0], y=[y0, y0], z=[z0 - cross_half, z0 + cross_half],
-                mode="lines",
-                line=dict(color=cross_col, width=line_w),
-                showlegend=False,
-                hoverinfo="skip"
-            ))
+        # If KPx are global [-1,1] coords:
+        _draw_kp_crosses(fig, KPx, D,H,W, space="global", half=2.0)
     # ---------- axes & layout ----------
     if show_axes:
         fig.update_scenes(
@@ -942,6 +910,55 @@ def log_rgb_voxels(
     if wandb is not None:
         wandb.log({name: fig}, step=step)
     return fig
+def _global_to_voxel_indices(kp_xyz_global, D, H, W):
+    """map (x,y,z) in [-1,1] to voxel index coordinates (X,Y,Z)"""
+    K = kp_xyz_global.shape[0]
+    g = kp_xyz_global
+    x = ( (g[:,0] + 1.0) * 0.5 ) * (W - 1)
+    y = ( (g[:,1] + 1.0) * 0.5 ) * (H - 1)
+    z = ( (g[:,2] + 1.0) * 0.5 ) * (D - 1)
+    return np.stack([x, y, z], axis=1)   # [K,3] in voxel index space
+
+def _draw_kp_crosses(fig, KPx, D, H, W, *, space="voxel", half=2.0, color="rgba(255,0,0,0.95)", width=4):
+    # KPx: [K,3] or [B,K,3] or torch tensor; space={"voxel","global"}
+    import numpy as np, torch
+    if isinstance(KPx, torch.Tensor):
+        KPx = KPx.detach().cpu().numpy()
+    KPx = np.asarray(KPx)
+
+    # squeeze batch if present
+    if KPx.ndim == 3:
+        KPx = KPx[0]
+    assert KPx.ndim == 2 and KPx.shape[1] == 3, f"KPx shape must be [K,3], got {KPx.shape}"
+
+    # map global [-1,1] -> voxel indices if needed
+    if space == "global":
+        KPx = _global_to_voxel_indices(KPx, D, H, W)   # returns [K,3] in (x,y,z) indices
+
+    # clip to volume bounds
+    KPx[:,0] = np.clip(KPx[:,0], 0, W-1)
+    KPx[:,1] = np.clip(KPx[:,1], 0, H-1)
+    KPx[:,2] = np.clip(KPx[:,2], 0, D-1)
+
+    for i, (x0, y0, z0) in enumerate(KPx.astype(float)):
+        # X arm
+        fig.add_trace(go.Scatter3d(
+            x=[x0 - half, x0 + half], y=[y0, y0], z=[z0, z0],
+            mode="lines", line=dict(color=color, width=width),
+            showlegend=False, hoverinfo="text", text=[f"kp {i}", f"kp {i}"], name=f"kp {i}"
+        ))
+        # Y arm
+        fig.add_trace(go.Scatter3d(
+            x=[x0, x0], y=[y0 - half, y0 + half], z=[z0, z0],
+            mode="lines", line=dict(color=color, width=width),
+            showlegend=False, hoverinfo="skip"
+        ))
+        # Z arm
+        fig.add_trace(go.Scatter3d(
+            x=[x0, x0], y=[y0, y0], z=[z0 - half, z0 + half],
+            mode="lines", line=dict(color=color, width=width),
+            showlegend=False, hoverinfo="skip"
+        ))
 
 @torch.no_grad()
 
