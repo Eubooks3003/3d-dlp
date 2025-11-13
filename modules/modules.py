@@ -6397,6 +6397,8 @@ class DLPDecoder(nn.Module):
         )
 
         bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C_bg, *spatial*]
+
+        print("BG REC: ", bg_rec.shape)
         C_bg   = bg_rec.shape[1]
 
 

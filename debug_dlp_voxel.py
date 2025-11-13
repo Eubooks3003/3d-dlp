@@ -14,12 +14,184 @@ from datasets.voxelize_ds_wrapper import VoxelizedDataset
 
 from voxel_models import DLP  # voxel-capable DLP (same as training)
 from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, log_cov_ellipsoids_over_voxels,
-        extract_volumes_for_vis, print_vol_stats)
+        extract_volumes_for_vis, print_vol_stats, log_rgb_voxels)
 
 import wandb
 
 
+
 @torch.no_grad()
+def rgb_distribution_for_plotted_voxels(
+    name: str,
+    rgb_vol,                      # [3,D,H,W] or [1,3,D,H,W] (torch/np; [0,1] or [-1,1])
+    alpha_vol=None,               # [D,H,W] or [1,D,H,W] or None
+    *,
+    # ---- keep these in sync with log_rgb_voxels ----
+    mode="splat",
+    topk=60000,
+    alpha_thresh=0.25,            # tightened in your plotting code
+    rgb_mag_thresh=0.10,
+    use_edge_mask=True,
+    edge_percentile=80,
+    # ---- histogram controls ----
+    print_hist=True,
+    hist_bins=20,
+):
+    """
+    Computes stats on EXACTLY the voxels selected by your log_rgb_voxels() 'splat' path.
+    Returns a dict with stats and selection indices.
+    """
+    def _to_np(x):
+        if x is None: return None
+        if isinstance(x, torch.Tensor): x = x.detach().cpu().numpy()
+        return x
+
+    def _as_CDHW(x):
+        x = _to_np(x)
+        if x is None: return None
+        if x.ndim == 5:  # [B,3,D,H,W] or [B,1, D,H,W]
+            x = x[0]
+        assert x.ndim == 4 and (x.shape[0] in (1,3)), f"rgb shape must be [C,D,H,W], got {x.shape}"
+        return x
+
+    def _as_DHW(x):
+        x = _to_np(x)
+        if x is None: return None
+        if x.ndim == 4:  # [1,D,H,W]
+            x = x[0]
+        assert x.ndim == 3, f"alpha shape must be [D,H,W], got {x.shape}"
+        return x
+
+    RGB = _as_CDHW(rgb_vol)            # [3,D,H,W]
+    if RGB.shape[0] != 3:
+        raise ValueError("rgb_vol must be 3-channel [3,D,H,W] (or [1,3,D,H,W]).")
+    D,H,W = RGB.shape[1:]
+    ALP = None if alpha_vol is None else _as_DHW(alpha_vol)  # [D,H,W]
+    if ALP is not None and ALP.shape != (D,H,W):
+        raise ValueError(f"alpha_vol shape {ALP.shape} != rgb spatial {(D,H,W)}")
+
+    # map [-1,1] to [0,1] exactly like the plotter
+    rgb_min = min(RGB[0].min(), RGB[1].min(), RGB[2].min())
+    if rgb_min < 0.0:
+        RGB = (RGB + 1.0) * 0.5
+    RGB = np.clip(RGB, 0.0, 1.0)
+
+    # ---- selection mask (identical logic) ----
+    # color magnitude
+    mag = np.sqrt(RGB[0]**2 + RGB[1]**2 + RGB[2]**2)
+
+    if ALP is None:
+        weights = None
+        mask = (mag >= rgb_mag_thresh)
+    else:
+        weights = np.asarray(ALP, dtype=np.float32).clip(0, 1)
+        mask = (weights >= alpha_thresh) & (mag >= rgb_mag_thresh)
+
+    # optional: edge emphasis (Sobel on alpha)
+    edge = None
+    if use_edge_mask and weights is not None:
+        try:
+            import scipy.ndimage as ndi
+            gx = ndi.sobel(weights, axis=2); gy = ndi.sobel(weights, axis=1); gz = ndi.sobel(weights, axis=0)
+            edge = np.sqrt(gx*gx + gy*gy + gz*gz)
+            if (mask.any() and np.isfinite(edge[mask]).any()) or np.isfinite(edge).any():
+                base = edge[mask] if mask.any() else edge
+                thr = np.percentile(base, edge_percentile)
+                edge_mask = edge >= thr
+                mask = mask & edge_mask
+        except Exception:
+            # fall back silently if scipy not available
+            edge = None
+
+    idx = np.argwhere(mask)  # [M,3] (z,y,x)
+    M = idx.shape[0]
+    if M == 0:
+        print(f"\n=== {name}: no voxels selected under current thresholds ===")
+        return dict(name=name, count=0, idx=None, stats=None)
+
+    # top-K after filtering (score = alpha*edge or alpha or mag)
+    if M > topk:
+        if weights is not None:
+            score = weights[idx[:,0], idx[:,1], idx[:,2]]
+            if use_edge_mask and edge is not None:
+                score = score * edge[idx[:,0], idx[:,1], idx[:,2]]
+        else:
+            score = mag[idx[:,0], idx[:,1], idx[:,2]]
+        sel = np.argpartition(score, -topk)[-topk:]
+        idx = idx[sel]
+        M = idx.shape[0]
+
+    z_i, y_i, x_i = idx[:,0], idx[:,1], idx[:,2]
+    r = RGB[0, z_i, y_i, x_i]
+    g = RGB[1, z_i, y_i, x_i]
+    b = RGB[2, z_i, y_i, x_i]
+
+    # ---- stats ----
+    def _stats(v):
+        v = v.astype(np.float64).ravel()
+        q = np.quantile(v, [0.01, 0.25, 0.5, 0.75, 0.99])
+        return dict(
+            min=float(v.min()),
+            p01=float(q[0]), p25=float(q[1]), med=float(q[2]), p75=float(q[3]), p99=float(q[4]),
+            max=float(v.max()),
+            mean=float(v.mean()),
+            std=float(v.std(ddof=0)),
+        )
+
+    sR, sG, sB = _stats(r), _stats(g), _stats(b)
+
+    # histograms (clamped to p1..p99 like before)
+    hist = None
+    if print_hist:
+        def _hist(v, bins):
+            q1, q99 = np.quantile(v, [0.01, 0.99])
+            if not np.isfinite(q1) or not np.isfinite(q99) or q99 <= q1:
+                q1, q99 = float(v.min()), float(v.max())
+            vv = np.clip(v, q1, q99)
+            h, edges = np.histogram(vv, bins=bins, range=(q1, q99), density=True)
+            # compress display to ~8 buckets for readability
+            step = max(1, bins // 8)
+            out = []
+            for i in range(0, bins, step):
+                lo = edges[i]; hi = edges[min(i+step, bins)]
+                prob = h[i:i+step].sum() * (edges[1]-edges[0])  # integrate density
+                out.append((float(lo), float(hi), float(prob)))
+            return out
+        hist = dict(
+            R=_hist(r, hist_bins),
+            G=_hist(g, hist_bins),
+            B=_hist(b, hist_bins),
+        )
+
+    # channel correlations
+    def _corr(a, b):
+        a = a.astype(np.float64); b = b.astype(np.float64)
+        a = (a - a.mean()) / (a.std() + 1e-12)
+        b = (b - b.mean()) / (b.std() + 1e-12)
+        return float((a*b).mean())
+    corr = dict(RG=_corr(r,g), RB=_corr(r,b), GB=_corr(g,b))
+
+    # ---- print ----
+    print(f"\n=== {name}: stats on plotted voxels ===")
+    print(f"selected = {M} voxels")
+    for ch, s in zip("RGB", [sR,sG,sB]):
+        print(f"[{ch}] min={s['min']:.5f}  p1={s['p01']:.5f}  p25={s['p25']:.5f}  "
+              f"med={s['med']:.5f}  p75={s['p75']:.5f}  p99={s['p99']:.5f}  "
+              f"max={s['max']:.5f}  mean={s['mean']:.5f}  std={s['std']:.5f}")
+        if print_hist:
+            h = hist[ch]
+            h_str = " | ".join([f"[{a:.3f},{b:.3f}): {p:.3f}" for (a,b,p) in h])
+            print(f"  hist (clamped to p1..p99): {h_str}")
+    print(f"corr(R,G)={corr['RG']:.4f}  corr(R,B)={corr['RB']:.4f}  corr(G,B)={corr['GB']:.4f}")
+
+    return dict(
+        name=name,
+        count=M,
+        idx=idx,                      # (z,y,x) indices of selected voxels
+        stats=dict(R=sR,G=sG,B=sB),
+        corr=corr,
+        hist=hist,
+    )
 
 def filter_topk_kps_3d(
     z_base_var,      # [B, *G*, K, C]  (C = 3 or 6)
@@ -282,9 +454,33 @@ def main():
             # forward (no loss)
             model_output = model(vox, warmup=False, with_loss=False)
 
-            gt_vol, rec_vol = extract_volumes_for_vis(model_output, occ_channel=0)
+            gt_vol = model_output['x'][0]
+            rec_vol = model_output['rec'][0]
             print_vol_stats("GT", gt_vol)
             print_vol_stats("REC", rec_vol)
+
+            rgb_distribution_for_plotted_voxels(
+                "GT plotted stats",
+                gt_vol, alpha_vol=None,       # or your alpha if available
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.25,
+                rgb_mag_thresh=0.10,
+                use_edge_mask=True,
+                edge_percentile=80,
+            )
+
+            rgb_distribution_for_plotted_voxels(
+                "REC plotted stats",
+                rec_vol, alpha_vol=None,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.25,
+                rgb_mag_thresh=0.10,
+                use_edge_mask=True,
+                edge_percentile=80,
+            )
+
 
             # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
             kp_xyz = model_output.get('kp_p', None)
@@ -338,88 +534,83 @@ def main():
             print("Z BASE B0: ", z_base_b0.shape)
             
             kp_order = ("x","y","z")  # your kp_xyz is in (x,y,z) order
-            log_cov_ellipsoids_over_voxels(
-                name="gt/over_gt_all_kp",
-                gt_vol=gt_vol,
-                kp_norm=kp_xyz,
-                cov_kp=model_output["cov_kp"],
+            log_rgb_voxels(
+                name="gt/rgb_splat_kp",
+                rgb_vol=gt_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=mu_tot_b0,
                 step=step,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
-            )
-            log_cov_ellipsoids_over_voxels(
-                name="gt/over_gt",
-                gt_vol=gt_vol,
-                kp_norm=model_output["z_base"][b0],
-                cov_kp=z_base_cov_b0,
-                step=step,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
             )
 
-            log_cov_ellipsoids_over_voxels(
-                name="gt/over_gt_w_offset",
-                gt_vol=gt_vol,
-                kp_norm=mu_tot_b0,
-                cov_kp=z_base_cov_b0,
+            log_rgb_voxels(
+                name="gt/rgb_splat_no_offset",
+                rgb_vol=gt_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=z_base_b0,
                 step=step,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
             )
 
-            # REC
-            log_cov_ellipsoids_over_voxels(
-                name="rec/over_gt_all_kp",
-                gt_vol=rec_vol,
-                kp_norm=kp_xyz,
-                cov_kp=model_output["cov_kp"],
+            log_rgb_voxels(
+                name="gt/rgb_splat",
+                rgb_vol=gt_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=None,
                 step=step,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
             )
-            log_cov_ellipsoids_over_voxels(
-                name="rec/over_gt",
-                gt_vol=rec_vol,
-                kp_norm=model_output["z_base"][b0],
-                cov_kp=z_base_cov_b0,
+            # REC LOGGING
+            log_rgb_voxels(
+                name="rec/rgb_splat_kp",
+                rgb_vol=rec_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=mu_tot_b0,
                 step=step,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
             )
 
-            log_cov_ellipsoids_over_voxels(
-                name="rec/over_gt_w_offset",
-                gt_vol=rec_vol,
-                kp_norm=mu_tot_b0,
-                cov_kp=z_base_cov_b0,
+            log_rgb_voxels(
+                name="rec/rgb_splat",
+                rgb_vol=rec_vol,
+                alpha_vol=None,          # None if you don’t have GT α
                 step=step,
-                kp_order=kp_order,
-                iso=0.67,
-                ellip_scale=2.0,
-                max_ellipsoids=128,
-                color_scale="Viridis",
-                show_gt=True
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
             )
+
+            log_rgb_voxels(
+                name="rec/rgb_splat_no_offset",
+                rgb_vol=rec_vol,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=z_base_b0,
+                step=step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
 
 
             # --- compact KP stats ---

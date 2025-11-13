@@ -2373,7 +2373,6 @@ class DLP(nn.Module):
         recon_loss_type: str = "mse",         # {"mse","l1"}
         fg_weight: float = 1.0,               # weight on foreground voxels
         bg_weight: float = 1.0,               # weight on background voxels
-        use_x_occ_as_mask: bool = False,      # if True, derive occ mask from x to weight recon
         occ_from_x_thresh: float = 0.05,      # threshold on |x| to treat a voxel as foreground (if use_x_occ_as_mask)
         # regularizers / aux
         alpha_sparsity_weight: float = 1e-3,  # L1 on per-object α volume
@@ -2432,12 +2431,7 @@ class DLP(nn.Module):
 
         # --------- reconstruction (RGB) ----------
         # Optional fg/bg weighting via mask; default uniform weights
-        if use_x_occ_as_mask:
-            # derive occupancy from target RGB (channel-agnostic magnitude)
-            # works for either [0,1] or [-1,1] ranges with a small threshold
-            occ_from_x = (x_flat.abs().mean(dim=1, keepdim=True) > occ_from_x_thresh).float()  # [B*T,1,D,H,W]
-            w = fg_weight * occ_from_x + bg_weight * (1.0 - occ_from_x)                       # [B*T,1,D,H,W]
-        elif bg_mask is not None:
+        if bg_mask is not None:
             # use model’s bg_mask as a soft weight (stabilizes BG learning)
             w = fg_weight * (1.0 - bg_mask) + bg_weight * bg_mask                              # [B*T,1,D,H,W]
         else:
@@ -2449,7 +2443,7 @@ class DLP(nn.Module):
 
         if recon_loss_type == "l1":
             err_map = (pred_rgb - x_flat).abs() * w
-        else:  # "mse" (default)
+        else:  
             err_map = (pred_rgb - x_flat) ** 2 * w
 
         spatial_dims = tuple(range(1, err_map.dim()))  # sum over C,D,H,W
