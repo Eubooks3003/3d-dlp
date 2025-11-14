@@ -2479,7 +2479,7 @@ class DLP(nn.Module):
             assert z_kp.shape[0] == x_flat.shape[0], \
                 f"z_kp batch {z_kp.shape[0]} != x_flat batch {x_flat.shape[0]}"
 
-        if (z_kp is not None) and (z_scale_kp is not None) and (z_feat_kp is not None):
+        if (z_kp is not None) and (z_scale_kp is not None) and (z_feat_kp is not None) and not warmup:
             # ---- 1) recompute per-object RGB with DETACHED encoder latents ----
             # Detach coords *and* features so local loss only updates decoder weights.
             z_kp_det    = z_kp.detach()
