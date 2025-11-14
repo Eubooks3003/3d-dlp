@@ -882,6 +882,7 @@ class DLP(nn.Module):
         dec_objects_trans = dec_dict['dec_objects_trans']
         rec               = dec_dict['rec']
         bg_rec            = dec_dict['bg_rec']
+        rgb_obj = dec_dict['rgb_obj']
 
         # Preferred: use keys provided by decoder if present
         rec_rgb   = dec_dict.get('rec_rgb', None)
@@ -908,6 +909,8 @@ class DLP(nn.Module):
         dec_dict['bg_depth']                = bg_depth
         dec_dict['dec_objects_trans']       = dec_objects_trans
         dec_dict['dec_objects_original_rgb']= dec_objects_rgb
+        dec_dict['rgb_obj'] = rgb_obj
+
 
         return dec_dict
 
@@ -1208,6 +1211,7 @@ class DLP(nn.Module):
         print("REC SHAPE:", rec.shape)
 
         rec_rgb = dec_dict['rec_rgb']
+        rgb_obj = dec_dict['rgb_obj']
         bg_rec_rgb = dec_dict['bg_rgb']
         dec_objects_rgb = dec_dict['dec_objects_original_rgb']
         rec_depth = dec_dict['rec_depth']
@@ -1323,7 +1327,7 @@ class DLP(nn.Module):
                        'cropped_objects_original': cropped_objects, 'cropped_objects_original_rgb': cropped_objects_rgb,
                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b,
                        'obj_on': z_obj_on, 'mu_obj_on': mu_obj_on, 'dec_objects_original': dec_objects,
-                       'dec_objects_original_rgb': dec_objects_rgb, 'dec_objects': dec_objects_trans,
+                       'dec_objects_original_rgb': dec_objects_rgb, 'dec_objects': dec_objects_trans, 'rgb_obj': rgb_obj,
                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth, 'mu_scale': mu_scale,
                        'logvar_scale': logvar_scale, 'z_scale': z_scale,
                        'alpha_masks': alpha_masks, 'mu_dyn': mu_dyn,
@@ -2422,6 +2426,7 @@ class DLP(nn.Module):
         alpha_masks     = model_output.get('alpha_masks', None)   # [B*T,N,1,D,H,W] in [0,1]
         bg_mask         = model_output.get('bg_mask', None)       # [B*T,1,D,H,W]
         bg_rec_raw      = model_output.get('bg_rec', None)        # [B*T,C_bg,D,H,W] (pre-activation)
+        rgb_obj         = model_output.get('rgb_obj', None)    
 
         # --------- flatten time ----------
         B = x.shape[0]
@@ -2448,6 +2453,77 @@ class DLP(nn.Module):
 
         spatial_dims = tuple(range(1, err_map.dim()))  # sum over C,D,H,W
         loss_rec = err_map.sum(dim=spatial_dims).mean()
+        
+        # --------- per-particle local RGB loss (optional, supervised mask, in-loss) ----------
+        loss_local = torch.tensor(0.0, device=x.device)
+        lambda_local = 0.05  # start at 0.01–0.05 and tune
+
+        # We need z, z_scale, z_features from model_output
+        z_kp       = model_output.get('z', None)          # [B*T, N, 3] or [B,T,N,3]
+        z_scale_kp = model_output.get('z_scale', None)    # [B*T, N, 3] or [B,T,N,3]/[B,T,N,1]
+        z_feat_kp  = model_output.get('z_features', None) # [B*T, N, F] or [B,T,N,F]
+        z_ctx      = model_output.get('z_context', None)  # [B*T, N, Cctx] or [B,T,N,Cctx] or None
+
+        if z_kp is not None:
+            if z_kp.dim() == 4:
+                # [B,T,N,C] -> [B*T,N,C]
+                B_z, T_z, N_z, C_z = z_kp.shape
+                z_kp       = z_kp.view(B_z * T_z, N_z, C_z)
+                z_scale_kp = z_scale_kp.view(B_z * T_z, N_z, -1)
+                z_feat_kp  = z_feat_kp.view(B_z * T_z, N_z, -1)
+                if z_ctx is not None and z_ctx.dim() == 4:
+                    z_ctx = z_ctx.view(B_z * T_z, N_z, -1)
+            # else: assume already [B*T, N, ...]
+
+            # sanity check: batch matches x_flat
+            assert z_kp.shape[0] == x_flat.shape[0], \
+                f"z_kp batch {z_kp.shape[0]} != x_flat batch {x_flat.shape[0]}"
+
+        if (z_kp is not None) and (z_scale_kp is not None) and (z_feat_kp is not None):
+            # ---- 1) recompute per-object RGB with DETACHED encoder latents ----
+            # Detach coords *and* features so local loss only updates decoder weights.
+            z_kp_det    = z_kp.detach()
+            z_scale_det = z_scale_kp.detach()
+            z_feat_det  = z_feat_kp.detach()
+
+            # This call is inside the decoder class, so we can reuse decode_rgb_unified
+            dec_patches_loc, a_obj_loc, rgb_obj_loc, _ = self.decoder_module.decode_rgb_unified(
+                z_kp_det, z_feat_det, z_scale=z_scale_det, z_ctx=z_ctx
+            )
+            # a_obj_loc   : [B*T,N,1,D,H,W]
+            # rgb_obj_loc : [B*T,N,3,D,H,W]
+
+            # ---- 2) supervised FG: where GT has color + object alpha is non-trivial ----
+            # Same logic as your visualizer: treat low-magnitude voxels as "empty background"
+            mag = x_flat.abs().mean(dim=1, keepdim=True)          # [B*T,1,D,H,W]
+            occ_from_x = (mag > occ_from_x_thresh).float()        # [B*T,1,D,H,W]
+
+            # Object support from alpha (but no gradients from that decision)
+            alpha_thr_local = 0.25                                # like alpha_thresh in log_rgb_voxels
+            alpha_det = a_obj_loc.detach()                        # [B*T,N,1,D,H,W]
+            obj_support = (alpha_det > alpha_thr_local).float()   # [B*T,N,1,D,H,W]
+
+            # foreground support = GT-foreground ∧ object support
+            fg_support = occ_from_x[:, None, ...]                 # [B*T,1,1,D,H,W] → broadcast over N
+            mask_obj = obj_support * fg_support                   # [B*T,N,1,D,H,W]
+            mask_obj = mask_obj.expand_as(rgb_obj_loc)            # [B*T,N,3,D,H,W]
+
+            if mask_obj.sum() > 0:
+                # GT RGB broadcast over objects
+                x_exp = x_flat[:, None, ...].expand_as(rgb_obj_loc)  # [B*T,N,3,D,H,W]
+
+                # Per-voxel squared error where this object is “responsible”
+                diff = (rgb_obj_loc - x_exp) ** 2 * mask_obj         # [B*T,N,3,D,H,W]
+
+                # ---- reduction with same style as loss_rec ----
+                # loss_rec: sum over C,D,H,W → mean over B*T
+                # here: sum over N as well, then mean over B*T
+                per_sample_err = diff.sum(dim=(1, 2, 3, 4, 5))       # [B*T]
+                loss_local = per_sample_err.mean()
+
+                print("Local loss (supervised, enc-detached):", loss_local.item())
+
+                loss_rec = loss_rec + lambda_local * loss_local
 
         # Optional BG aux: train BG head to match x on BG regions
         loss_bg_aux = torch.tensor(0.0, device=x.device)

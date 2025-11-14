@@ -6235,6 +6235,7 @@ class DLPDecoder(nn.Module):
         """
         patches = self.particle_dec(z_features, context=z_ctx)        # [B*N, 1, ps, ps, ps] (logits)
         B, N = z_kp.shape[:2]
+
         patches = patches.view(B, N, *patches.shape[1:])              # [B,N,1,ps,ps,ps]
         patches_t = self.translate_patches(z_kp, patches, z_scale, translation)  # [B,N,1,D,H,W]
 
@@ -6273,6 +6274,7 @@ class DLPDecoder(nn.Module):
         patches = patches.view(-1, z_kp.shape[1], *patches.shape[1:]) # [B, N, C, ps, ps, ps]
         patches_t = self.translate_patches(z_kp, patches, z_scale, translation)  # [B,N,C,D,H,W]
 
+
         C = patches_t.shape[2]
         assert C >= 1 + self.cdim, f"need [alpha + {self.cdim} rgb], got C={C}"
 
@@ -6283,8 +6285,8 @@ class DLPDecoder(nn.Module):
             rgb_obj = torch.tanh(rgb_raw)                      # [-1,1]
         else:
             rgb_obj = torch.sigmoid(rgb_raw)                   # [0,1]
-
-        return patches, a_obj, rgb_obj, None                   # d_obj=None
+        
+        return patches, a_obj, rgb_obj, None                    # d_obj=None
 
     def composite_rgb(self, a_obj, rgb_obj, obj_on, eps=1e-6):
         # a_obj: [B,N,1,D,H,W] in [0,1], rgb_obj: [B,N,3,D,H,W]
@@ -6328,7 +6330,7 @@ class DLPDecoder(nn.Module):
         # Composite (always uses z_depth for ordering)
         alpha_masks, bg_mask, dec_rgb_comp, dec_depth_comp = self.composite_rgb(a_obj, rgb_obj, obj_on)
 
-        return dec_rgb_patches, dec_rgb_comp, alpha_masks, bg_mask, dec_depth_comp, dec_depth_patches
+        return dec_rgb_patches, dec_rgb_comp, alpha_masks, bg_mask, dec_depth_comp, dec_depth_patches, rgb_obj
 
     def decode_all(
         self, z, z_scale, z_features, obj_on, z_depth,
@@ -6392,13 +6394,12 @@ class DLPDecoder(nn.Module):
         # RGB / RGBD PATH (unchanged)
         # =========================
         (dec_objects, dec_objects_trans, alpha_masks, bg_mask,
-        dec_depth_trans, dec_depth_patches) = self.decode_objects(
+        dec_depth_trans, dec_depth_patches, rgb_obj) = self.decode_objects(
             z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale, z_ctx=z_ctx
         )
 
         bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C_bg, *spatial*]
 
-        print("BG REC: ", bg_rec.shape)
         C_bg   = bg_rec.shape[1]
 
 
@@ -6433,6 +6434,7 @@ class DLPDecoder(nn.Module):
             'rec_depth': rec_depth,
             'dec_depth_trans': dec_depth_trans,
             'dec_depth_patches': dec_depth_patches,
+            'rgb_obj': rgb_obj,  
         }
 
 
