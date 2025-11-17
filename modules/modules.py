@@ -2464,14 +2464,56 @@ class ObjectDecoderCNN(nn.Module):
         # force channels to num_chans
         Cprime = y.shape[1]
         if not self._cnn_out_proj_inited:
-            self.cnn_out_proj = nn.Conv3d(Cprime, self.num_chans, kernel_size=1, bias=True).to(y.device)
+            self.cnn_out_proj = nn.Conv3d(
+                Cprime, self.num_chans, kernel_size=1, bias=True
+            ).to(y.device)
             self._cnn_out_proj_inited = True
+
+            # ---- NEW: break symmetry between R/G/B output channels ----
+            with torch.no_grad():
+                # keep alpha (ch0) as-in, nudge RGB filters slightly differently
+                if self.num_chans >= 4:
+                    # small multiplicative factors for channels 1,2,3
+                    scales = torch.tensor([1.0, 0.97, 1.03, 1.06],
+                                          dtype=self.cnn_out_proj.weight.dtype,
+                                          device=self.cnn_out_proj.weight.device)
+                    for c in range(min(self.num_chans, scales.numel())):
+                        self.cnn_out_proj.weight[c].mul_(scales[c])
+
+                    # tiny different biases so gradients diverge early
+                    if self.cnn_out_proj.bias is not None:
+                        # alpha bias stays 0; tiny offsets for RGB
+                        self.cnn_out_proj.bias[1].fill_(+1e-3)
+                        self.cnn_out_proj.bias[2].fill_(-1e-3)
+                        self.cnn_out_proj.bias[3].fill_(+2e-3)
+            # ---- END NEW ----
+
         if Cprime != self.num_chans:
             y = self.cnn_out_proj(y)
+
 
         # force spatial size to (patch_size)^3
         if y.shape[2:] != (D, H, W):
             y = F.interpolate(y, size=(D, H, W), mode="trilinear", align_corners=False)
+        # ---- DEBUG: per-patch decoder stats ----
+        with torch.no_grad():
+            Btot, Cdec, Dz, Hy, Wx = y.shape
+            y_flat = y.view(Btot, Cdec, -1)
+
+            print("[ObjectDecoderCNN] y stats: "
+                f"min={y_flat.min().item():.4f} "
+                f"max={y_flat.max().item():.4f} "
+                f"mean={y_flat.mean().item():.4f} "
+                f"std={y_flat.std().item():.4f}")
+
+            # If this is RGBA-style output (alpha + RGB), look at first 4 chans
+            max_ch_to_print = min(4, Cdec)
+            for c in range(max_ch_to_print):
+                ch = y_flat[:, c]
+                print(f"  ch{c}: min={ch.min().item():.4f} "
+                    f"max={ch.max().item():.4f} "
+                    f"mean={ch.mean().item():.4f} "
+                    f"std={ch.std().item():.4f}")
 
         return y
 
@@ -3488,6 +3530,11 @@ class ParticleFeaturesEncoder(nn.Module):
         kp:  [B, K, 3]           (x,y,z) in [-1,1]
         """
         B, C, D, H, W = x.shape
+
+        print("ParticleFeatEnc x shape:", x.shape, "min/max per channel:",
+            [ (x[:,c].min().item(), x[:,c].max().item()) for c in range(x.shape[1]) ])
+
+        assert x.shape[1] == self.ch, f"Expected {self.ch} channels, got {x.shape[1]}"
         K = kp.shape[1]
 
         # repeat per keypoint
@@ -5150,6 +5197,30 @@ class ParticleEncoder(nn.Module):
         else:
             z_features = mu_features
 
+
+        with torch.no_grad():
+            enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
+            mu_feat = enc_out['mu_features']         # [B, K, F]
+            crops   = enc_out['cropped_objects']     # [B, K, 3, ps, ps, ps]
+
+            B, K, F = mu_feat.shape
+
+            # per-kp GT color: mean RGB of its crop
+            rgb_gt_kp = crops.mean(dim=(3,4,5))      # [B, K, 3]
+
+            feat_flat = mu_feat.view(B*K, F)         # [B*K, F]
+            rgb_flat  = rgb_gt_kp.view(B*K, 3)       # [B*K, 3]
+
+            # standardize
+            feat_flat = (feat_flat - feat_flat.mean(0, keepdim=True)) / (feat_flat.std(0, keepdim=True) + 1e-6)
+            rgb_flat  = (rgb_flat  - rgb_flat.mean(0, keepdim=True)) / (rgb_flat.std(0, keepdim=True)  + 1e-6)
+
+            # correlation matrix F x 3
+            corr = (feat_flat.transpose(0,1) @ rgb_flat) / (feat_flat.shape[0] - 1)  # [F,3]
+
+            max_abs_corr, idx = corr.abs().max(dim=0)  # per color channel
+            print("max |corr(feature, R/G/B)| =", max_abs_corr.tolist())
+
         return {
             'mu_features':           mu_features,
             'logvar_features':       logvar_features,
@@ -6285,6 +6356,52 @@ class DLPDecoder(nn.Module):
             rgb_obj = torch.tanh(rgb_raw)                      # [-1,1]
         else:
             rgb_obj = torch.sigmoid(rgb_raw)                   # [0,1]
+
+
+        # ---- DEBUG: per-object voxel RGB/alpha stats ----
+        with torch.no_grad():
+            B, N, C, D, H, W = patches_t.shape
+            print("[decode_rgb_unified] patches_t shape:", patches_t.shape)
+
+            # alpha logits and alpha probs
+            a_logits_flat = a_logits.view(B * N, -1)
+            a_obj_flat    = a_obj.view(B * N, -1)
+            print("  alpha_logits: min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
+                a_logits_flat.min().item(),
+                a_logits_flat.max().item(),
+                a_logits_flat.mean().item(),
+                a_logits_flat.std().item()))
+            print("  alpha_prob:   min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
+                a_obj_flat.min().item(),
+                a_obj_flat.max().item(),
+                a_obj_flat.mean().item(),
+                a_obj_flat.std().item()))
+
+            rgb_flat = rgb_obj.view(B * N, self.cdim, -1)      # [B*N,3,D*H*W]
+            for c, name in enumerate(["R", "G", "B"][:self.cdim]):
+                ch = rgb_flat[:, c]
+                print(f"  voxel {name}: min={ch.min().item():.4f} "
+                      f"max={ch.max().item():.4f} "
+                      f"mean={ch.mean().item():.4f} "
+                      f"std={ch.std().item():.4f}")
+
+            # correlations across channels at voxel level
+            if self.cdim == 3:
+                r = rgb_flat[:, 0].reshape(-1)
+                g = rgb_flat[:, 1].reshape(-1)
+                b = rgb_flat[:, 2].reshape(-1)
+
+                def corr(a, b):
+                    a = (a - a.mean()) / (a.std() + 1e-6)
+                    b = (b - b.mean()) / (b.std() + 1e-6)
+                    return (a * b).mean().item()
+
+                print("  voxel corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
+                    corr(r, g), corr(r, b), corr(g, b)
+                ))
+
+        return patches, a_obj, rgb_obj, None
+
         
         return patches, a_obj, rgb_obj, None                    # d_obj=None
 
@@ -6325,6 +6442,38 @@ class DLPDecoder(nn.Module):
         dec_rgb_patches, a_obj, rgb_obj, d_obj = self.decode_rgb_unified(
             z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation
         )
+
+        with torch.no_grad():
+            # rgb_obj: [B, N, 3, D, H, W]
+            B, N, C, D, H, W = rgb_obj.shape
+            rgb_flat = rgb_obj.view(B*N, C, -1)                    # [B*N, 3, D*H*W]
+
+            # restrict to voxels with reasonably large alpha for that obj
+            # (otherwise you’re averaging a ton of near-zero background)
+            a_flat = a_obj.view(B*N, 1, -1)                        # [B*N, 1, D*H*W]
+            mask = (a_flat > 0.2).float()                          # keep “on” voxels
+            num = (rgb_flat * mask).sum(-1)                        # [B*N, 3]
+            den = mask.sum(-1).clamp_min(1.0)                      # [B*N, 1]
+            rgb_obj_mean = num / den                               # [B*N, 3]
+
+            print("rgb_obj_mean stats per channel:")
+            for c, name in enumerate(["R","G","B"]):
+                ch = rgb_obj_mean[:, c]
+                print(name, "min", ch.min().item(), 
+                        "max", ch.max().item(), 
+                        "mean", ch.mean().item(), 
+                        "std", ch.std().item())
+            
+            # correlation between channels for per-object color
+            r = rgb_obj_mean[:,0]; g = rgb_obj_mean[:,1]; b = rgb_obj_mean[:,2]
+            def corr(a,b):
+                a = (a - a.mean()) / (a.std() + 1e-6)
+                b = (b - b.mean()) / (b.std() + 1e-6)
+                return (a*b).mean().item()
+            print("corr_obj(R,G)=", corr(r,g),
+                "corr_obj(R,B)=", corr(r,b),
+                "corr_obj(G,B)=", corr(g,b))
+
         dec_depth_patches = None  # unified depth is not per-patch separate object unless you want to expose it
 
         # Composite (always uses z_depth for ordering)
@@ -6404,6 +6553,7 @@ class DLPDecoder(nn.Module):
 
 
         if C_bg >= 3:
+            print("triggering bg composite")
             rec_rgb = bg_mask * bg_rec[:, :3, ...] + dec_objects_trans
         else:
             rec_rgb = dec_objects_trans
@@ -6420,6 +6570,55 @@ class DLPDecoder(nn.Module):
                 rec_depth = bg_depth
             else:
                 rec_depth = bg_mask * bg_depth + dec_depth_trans
+        
+        print("REC DEPTH is none: ", rec_depth is None)
+        print("rec rgb: ", rec_rgb.shape)
+        print("dec objects trans: ", dec_objects_trans.shape)
+        print("bg only: ", (bg_mask * bg_rec[:, :3, ...]).shape)
+
+        # ---- DEBUG: final RGB stats + correlations ----
+        with torch.no_grad():
+            def tensor_stats(name, t):
+                t_flat = t.view(t.shape[0], t.shape[1], -1)
+                print(f"[{name}] shape={t.shape} "
+                      f"global min={t_flat.min().item():.4f} "
+                      f"max={t_flat.max().item():.4f} "
+                      f"mean={t_flat.mean().item():.4f} "
+                      f"std={t_flat.std().item():.4f}")
+                # per-channel
+                C = t.shape[1]
+                max_ch = min(3, C)
+                for c in range(max_ch):
+                    ch = t_flat[:, c]
+                    print(f"  ch{c}: min={ch.min().item():.4f} "
+                          f"max={ch.max().item():.4f} "
+                          f"mean={ch.mean().item():.4f} "
+                          f"std={ch.std().item():.4f}")
+
+            tensor_stats("OBJ_RGB (dec_objects_trans)", dec_objects_trans)
+
+            if C_bg >= 3:
+                tensor_stats("BG_RGB (bg_rec[:,:3])", bg_rec[:, :3, ...])
+                tensor_stats("BG_MASK", bg_mask)
+
+            tensor_stats("REC_RGB (final)", rec_rgb)
+
+            # channel correlations on final reconstruction
+            Bf, Cf, Df, Hf, Wf = rec_rgb.shape
+            if Cf >= 3:
+                rec_flat = rec_rgb.view(Bf, Cf, -1)
+                r = rec_flat[:, 0].reshape(-1)
+                g = rec_flat[:, 1].reshape(-1)
+                b = rec_flat[:, 2].reshape(-1)
+
+                def corr(a, b):
+                    a = (a - a.mean()) / (a.std() + 1e-6)
+                    b = (b - b.mean()) / (b.std() + 1e-6)
+                    return (a * b).mean().item()
+
+                print("[REC_RGB] corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
+                    corr(r, g), corr(r, b), corr(g, b)
+                ))
 
         rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
 

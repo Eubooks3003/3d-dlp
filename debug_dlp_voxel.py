@@ -547,6 +547,8 @@ def main():
                 show_axes=True,
             )
 
+
+
             log_rgb_voxels(
                 name="gt/rgb_splat_no_offset",
                 rgb_vol=gt_vol,
@@ -610,6 +612,51 @@ def main():
                 pad=2.0,
                 show_axes=True,
             )
+
+
+            rec_rgb = model_output['rec_rgb'][0]                  # composite you use now
+            fg_only = model_output['dec_objects'][0]        # dec_rgb_comp
+            bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[0]
+
+            log_rgb_voxels(
+                name="debug/rec_rgb",
+                rgb_vol=rec_rgb,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=None,
+                step=step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            log_rgb_voxels(
+                name="debug/fg_only",
+                rgb_vol=fg_only,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=None,
+                step=step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            log_rgb_voxels(
+                name="debug/bg_only",
+                rgb_vol=bg_only,
+                alpha_vol=None,          # None if you don’t have GT α
+                KPx=None,
+                step=step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
 
 
 

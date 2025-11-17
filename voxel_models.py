@@ -1328,6 +1328,7 @@ class DLP(nn.Module):
                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b,
                        'obj_on': z_obj_on, 'mu_obj_on': mu_obj_on, 'dec_objects_original': dec_objects,
                        'dec_objects_original_rgb': dec_objects_rgb, 'dec_objects': dec_objects_trans, 'rgb_obj': rgb_obj,
+                       'bg_mask': bg_mask,
                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth, 'mu_scale': mu_scale,
                        'logvar_scale': logvar_scale, 'z_scale': z_scale,
                        'alpha_masks': alpha_masks, 'mu_dyn': mu_dyn,
@@ -2378,6 +2379,7 @@ class DLP(nn.Module):
         fg_weight: float = 1.0,               # weight on foreground voxels
         bg_weight: float = 1.0,               # weight on background voxels
         occ_from_x_thresh: float = 0.05,      # threshold on |x| to treat a voxel as foreground (if use_x_occ_as_mask)
+        lambda_color: float = 0.1,  
         # regularizers / aux
         alpha_sparsity_weight: float = 1e-3,  # L1 on per-object α volume
         alpha_entropy_weight: float = 0.0,    # encourage crisp α (optional)
@@ -2453,6 +2455,19 @@ class DLP(nn.Module):
 
         spatial_dims = tuple(range(1, err_map.dim()))  # sum over C,D,H,W
         loss_rec = err_map.sum(dim=spatial_dims).mean()
+
+        L_gt = x_flat.mean(dim=1, keepdim=True)             # [B*T,1,D,H,W]
+        L_pr = pred_rgb.mean(dim=1, keepdim=True)           # [B*T,1,D,H,W]
+
+        C_gt = x_flat - L_gt                                # chroma (GT)
+        C_pr = pred_rgb - L_pr                              # chroma (pred)
+
+        # Reuse same spatial weights w (fg/bg) for the color term
+        color_err = (C_pr - C_gt) ** 2 * w                  # [B*T,3,D,H,W]
+        loss_color = color_err.sum(dim=spatial_dims).mean() # scalar
+
+        # Combine into a color-aware reconstruction loss
+        loss_rec = loss_rec + lambda_color * loss_color
         
         # --------- per-particle local RGB loss (optional, supervised mask, in-loss) ----------
         loss_local = torch.tensor(0.0, device=x.device)
@@ -2669,6 +2684,7 @@ class DLP(nn.Module):
         return {
             'loss': loss,
             'loss_rec': loss_rec,
+            'loss_color': loss_color,  
             'loss_bg_aux': loss_bg_aux,
             'alpha_sparsity': sparsity,
             'alpha_entropy': alpha_entropy,
