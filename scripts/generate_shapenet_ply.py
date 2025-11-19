@@ -10,7 +10,7 @@ EXTRACT_ROOT = os.path.expanduser("~/.cache/shapenet_core_extracted")
 
 # Scene generation params
 OUT_DIR = "tabletop_shapenet_pcs"
-SCENES = 5000
+SCENES = 20000
 OBJ_RANGE = (3, 7)
 PTS_PER_OBJ = (2000, 6000)
 NOISE_STD = 0.002
@@ -44,24 +44,45 @@ def synset_has_objs(synset):
             return True
     return False
 
-def normalize_mesh(m, min_size=0.04, max_size=0.12):
+def normalize_mesh(m, min_size=0.08, max_size=0.22):
     """
-    Rescale mesh so its largest axis extent lies in [min_size, max_size] meters.
-    Returns a *copy* of the mesh, or None if degenerate.
+    Align ShapeNet Y-up -> Z-up, recenter, and rescale mesh so its largest
+    axis extent lies in [min_size, max_size] meters.
+    Assumes ShapeNet canonical orientation (up=+Y, front=-Z).
     """
-    m = m.copy()
-    extents = np.array(m.extents, dtype=float)
-    max_extent = float(extents.max())
-    if max_extent < 1e-6 or not np.isfinite(max_extent):
+    if m.is_empty or m.vertices.shape[0] <= 20:
         return None
 
-    target_size = float(rng.uniform(min_size, max_size))  # e.g. 4–12 cm
+    m = m.copy()
+    m.remove_degenerate_faces()
+    m.remove_unreferenced_vertices()
+    m.fix_normals()
+
+    # ---- 1) Rotate ShapeNet coords (Y-up) -> our coords (Z-up) ----
+    # Rotation +90 deg about X: (x, y, z) -> (x, -z, y), so new z = old y
+    R_up = tm.transformations.rotation_matrix(np.pi / 2.0, [1, 0, 0])
+    m.apply_transform(R_up)
+
+    # ---- 2) Recenter at origin ----
+    center = m.vertices.mean(axis=0)
+    m.apply_translation(-center)
+
+    # ---- 3) Rescale so largest extent is in [min_size, max_size] ----
+    bounds = m.bounds      # [2,3]
+    extents = bounds[1] - bounds[0]
+    max_extent = float(extents.max())
+    if max_extent <= 1e-6 or not np.isfinite(max_extent):
+        return None
+
+    target_size = float(rng.uniform(min_size, max_size))  # e.g. 8–22 cm
     scale = target_size / max_extent
 
     S = np.eye(4)
     S[:3, :3] *= scale
     m.apply_transform(S)
+
     return m
+
 
 def scale_mesh(m, scale_factor=1.5):
     """Uniformly scale mesh around its centroid."""
