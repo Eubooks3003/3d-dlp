@@ -292,16 +292,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     fig_dir = os.path.join(log_dir, 'figures')
     save_dir = os.path.join(log_dir, 'saves')
 
-    # ---- Checkpoint config ----
-    save_every = int(config.get("save_every", 1))   # save epoch snapshot every N epochs
+    # ---- Checkpoint config: ONLY SAVE BEST ----
     monitor = config.get("monitor", "loss")          # which metric to track for "best"
     mode = config.get("monitor_mode", "min")         # "min" or "max"
     assert mode in ("min", "max")
     best_val = float("inf") if mode == "min" else -float("inf")
 
-    # Paths
     os.makedirs(save_dir, exist_ok=True)
-    ckpt_last = os.path.join(save_dir, "last.pt")
     ckpt_best = os.path.join(save_dir, "best.pt")
 
     # ---- Optional resume / preload ----
