@@ -557,9 +557,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             print(f"[warn] monitored metric {mon_key} is non-finite ({monitored}); skipping model selection this epoch.")
             monitored = None
 
-        # ---- Save "last" every epoch ----
-        save_checkpoint(ckpt_last, model, optimizer, scheduler, epoch, best_val,
-                        extra={"monitored": monitored, "monitor": monitor, "mode": mode})
 
         # ---- Save "best" if improved ----
         if monitored is not None:
@@ -570,11 +567,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                 extra={"monitored": monitored, "best_update": True})
                 print(f"[ckpt] New best ({mon_key}={monitored:.6f}) at epoch {epoch:04d} -> saved best.pt")
 
-        # ---- Periodic epoch snapshot ----
-        if save_every and (epoch % save_every == 0 or epoch == num_epochs - 1):
-            snap_path = os.path.join(save_dir, f"epoch_{epoch:04d}.pt")
-            save_checkpoint(snap_path, model, optimizer, scheduler, epoch, best_val,
-                            extra={"monitored": monitored, "snapshot": True})
+
 
         # ------- EVAL (voxel version) -------
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
