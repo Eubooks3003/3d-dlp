@@ -2379,7 +2379,7 @@ class DLP(nn.Module):
         fg_weight: float = 1.0,               # weight on foreground voxels
         bg_weight: float = 1.0,               # weight on background voxels
         occ_from_x_thresh: float = 0.05,      # threshold on |x| to treat a voxel as foreground (if use_x_occ_as_mask)
-        lambda_color: float = 0.1,  
+        lambda_color: float = 5.0,  
         # regularizers / aux
         alpha_sparsity_weight: float = 1e-3,  # L1 on per-object α volume
         alpha_entropy_weight: float = 0.0,    # encourage crisp α (optional)
@@ -2443,53 +2443,66 @@ class DLP(nn.Module):
         else:  # "mse"
             per_voxel_err = (pred_rgb - x_flat) ** 2         # [B*T,3,D,H,W]
 
-        # --------- (A) GLOBAL LOSS (as before, with bg_mask weighting) ----------
-        # Optional fg/bg weighting via bg_mask; default uniform
+        # --------- (A) GLOBAL LOSS (w/ bg_mask weighting, same as before) ----------
         if bg_mask is not None:
             # bg_mask ≈ 1 where background dominates; 0 where objects
             w_global = fg_weight * (1.0 - bg_mask) + bg_weight * bg_mask   # [B*T,1,D,H,W]
         else:
             # uniform weights
-            w_global = pred_rgb.new_ones(pred_rgb.shape[0], 1,
-                                         pred_rgb.shape[2], pred_rgb.shape[3], pred_rgb.shape[4])  # [B*T,1,D,H,W]
+            w_global = pred_rgb.new_ones(
+                pred_rgb.shape[0], 1,
+                pred_rgb.shape[2], pred_rgb.shape[3], pred_rgb.shape[4]
+            )   # [B*T,1,D,H,W]
 
-        # broadcast to all channels
+        # broadcast to channels
         w_global = w_global.expand(-1, pred_rgb.shape[1], -1, -1, -1)      # [B*T,3,D,H,W]
 
         err_map_global = per_voxel_err * w_global                          # [B*T,3,D,H,W]
-        spatial_dims = tuple(range(1, err_map_global.dim()))              # sum over C,D,H,W
-        loss_rec_global = err_map_global.sum(dim=spatial_dims).mean()     # scalar
+        spatial_dims = tuple(range(1, err_map_global.dim()))               # sum over C,D,H,W
+        loss_rec_global = err_map_global.sum(dim=spatial_dims).mean()      # scalar
 
-        # --------- (B) COLOR LOSS (same as before, using global weights) ----------
+        # --------- (B) GT occupancy mask from x (foreground region) ----------
+        # Use the same |x| magnitude heuristic as AE, but in 3D
+        mag = x_flat.abs().mean(dim=1, keepdim=True)                # [B*T,1,D,H,W]
+        occ_mask = (mag > occ_from_x_thresh).float()                # 1 = "object", 0 = background
+
+        # foreground-only masked MSE (like AE's masked loss)
+        w_mask = occ_mask.expand_as(per_voxel_err)                  # [B*T,3,D,H,W]
+        err_map_masked = per_voxel_err * w_mask                     # [B*T,3,D,H,W]
+        loss_rec_masked = err_map_masked.sum(dim=spatial_dims).mean()   # scalar
+
+        # mixing factor for masked vs global (can also be in self)
+        lambda_fg_rec = getattr(self, "lambda_fg_rec", 0.5)
+
+        # --------- (C) CHROMA LOSS *only on foreground* (AE-style) ----------
+        # luminance
         L_gt = x_flat.mean(dim=1, keepdim=True)          # [B*T,1,D,H,W]
         L_pr = pred_rgb.mean(dim=1, keepdim=True)        # [B*T,1,D,H,W]
-        C_gt = x_flat - L_gt                             # chroma (GT)
-        C_pr = pred_rgb - L_pr                           # chroma (pred)
+        # chroma
+        C_gt = x_flat - L_gt                             # [B*T,3,D,H,W]
+        C_pr = pred_rgb - L_pr                           # [B*T,3,D,H,W]
 
-        color_err = (C_pr - C_gt) ** 2 * w_global        # [B*T,3,D,H,W]
-        loss_color = color_err.sum(dim=spatial_dims).mean()   # scalar
+        # restrict chroma loss to foreground voxels
+        fg_chroma = occ_mask.expand_as(C_gt)             # [B*T,3,D,H,W]
+        chroma_sq = (C_pr - C_gt) ** 2 * fg_chroma
+        fg_norm = fg_chroma.sum().clamp_min(1.0)
+        loss_color = chroma_sq.sum() / fg_norm           # scalar
 
-        # --------- (C) GT-OCCUPANCY-MASKED LOSS (new) ----------
-        # Build occupancy mask directly from GT RGB magnitude
-        # You already pass occ_from_x_thresh as an arg.
-        mag = x_flat.abs().sum(dim=1, keepdim=True)               # [B*T,1,D,H,W]
-        occ_mask = (mag > occ_from_x_thresh).float()              # 1 where GT is "object", 0 background
 
-        # foreground-only weights for masked loss (background = 0)
-        w_mask = occ_mask.expand_as(per_voxel_err)                # [B*T,3,D,H,W]
-        err_map_masked = per_voxel_err * w_mask                   # [B*T,3,D,H,W]
+        bg_mask_occ = 1.0 - occ_mask                    # [B*T,1,D,H,W]
+        bg_rgb = pred_rgb * bg_mask_occ                 # [B*T,3,D,H,W]
+        bg_norm = bg_mask_occ.expand_as(pred_rgb).sum().clamp_min(1.0)
+        loss_bg_zero = (bg_rgb ** 2).sum() / bg_norm    # scalar
 
-        # sum over channels + spatial dims, then mean over batch*time
-        loss_rec_masked = err_map_masked.sum(dim=spatial_dims).mean()  # scalar
+        # --------- (E) FINAL reconstruction loss ---------
+        # global + FG-masked + FG-chroma + BG-zero
+        # set lambda_color ~ 5.0 if you want it as strong as in the AE
+        loss_rec = (
+            loss_rec_global
+            + lambda_fg_rec * loss_rec_masked
+            + lambda_color * loss_color
+        )
 
-        # mixing factor for masked vs global (pull from self if you like)
-        lambda_fg_rec = getattr(self, "lambda_fg_rec", 0.5)       # e.g. 0.5 → half global, half masked
-
-        # --------- (D) FINAL reconstruction loss ---------
-        # keep global + color exactly as before, but add masked term
-        loss_rec = loss_rec_global + lambda_color * loss_color + lambda_fg_rec * loss_rec_masked
-
-        
         # --------- per-particle local RGB loss (optional, supervised mask, in-loss) ----------
         loss_local = torch.tensor(0.0, device=x.device)
         lambda_local = 0.05  # start at 0.01–0.05 and tune
