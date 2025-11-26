@@ -41,11 +41,11 @@ def _to_float_safe(x, default=None):
     if x is None:
         return default
     try:
-        if isinstance(x, (float, int)):
+            if isinstance(x, (float, int)):
+                return float(x)
+            if hasattr(x, "detach"):
+                return float(x.detach().mean().item())
             return float(x)
-        if hasattr(x, "detach"):
-            return float(x.detach().mean().item())
-        return float(x)
     except Exception:
         return default
 
@@ -120,6 +120,18 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
 
     eval_epoch_freq = config.get("eval_epoch_freq", 10)
 
+    # ---- NEW: masking & weights ----
+    occ_thresh      = config.get("occ_thresh", 1e-6)    # threshold on |RGB| to treat voxel as occupied
+    fg_weight       = config.get("fg_weight", 5.0)      # fg weight inside occ region
+    bg_weight       = config.get("bg_weight", 0.1)      # bg weight outside occ region
+    lambda_masked   = config.get("lambda_masked", 1.0)  # weight on masked recon term
+
+    # ---- NEW: chroma loss & debugging flags ----
+    lambda_chroma   = config.get("lambda_chroma", 1.0)  # weight on chroma-only loss
+    overfit_one     = config.get("overfit_one", False)  # if True, train on a single fixed batch
+    debug_stats     = config.get("debug_stats", True)   # log per-channel stats
+    debug_every     = config.get("debug_every", 500)    # how often to log stats (iters)
+
     # W&B / checkpoint
     run_prefix = config.get("run_prefix", "")
     monitor = config.get("monitor", "loss")
@@ -142,7 +154,6 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
     print(backup_info)
 
     # ---- dataset + dataloader ----
-    # base dataset is point-cloud; VoxelizedDataset wraps it into voxel grids
     base_ds = get_point_cloud_dataset(
         ds,
         root,
@@ -150,17 +161,6 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
         max_points=4096,
         include_rgb=True,  # we want RGB info
     )
-
-    # vox_ds = VoxelizedDataset(
-    #     base_ds=base_ds,
-    #     grid_whd=voxel_grid_whd,
-    #     mode=voxel_mode,           # set to "avg_rgb" in config for RGB voxels
-    #     bounds_mode="global",
-    #     keep_points=False,
-    #     device=torch.device("cpu"),
-    #     cache_dir=config.get("voxel_cache_dir", None),
-    #     force_rebuild=config.get("voxel_force_rebuild", False),
-    # )
 
     dataloader = DataLoader(base_ds, batch_size=batch_size, shuffle=True, num_workers=4)
 
@@ -190,7 +190,12 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
         resume="never",
     )
 
-    epoch_avg = EpochAverager()
+    # ---- optional: fixed batch for overfitting experiment ----
+    fixed_batch = None
+    if overfit_one:
+        fixed_batch = next(iter(dataloader))
+        print("[AE] overfit_one=True -> will train on a single fixed batch")
+
     iteration = 0
 
     # ---------- training loop ----------
@@ -199,27 +204,124 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
         epoch_avg = EpochAverager()
         pbar = tqdm(dataloader)
 
-        for batch in pbar:
-            # batch["voxels"]: [B,C,D,H,W]
+        for batch_idx, batch in enumerate(pbar):
+            if overfit_one and fixed_batch is not None:
+                batch = fixed_batch  # ignore dataloader batch, always reuse the same one
+
             vox = batch["voxels"].to(device).float()
             # take first C=ch channels as RGB (configure ch=3 for RGB-only)
             x = vox[:, :ae_in_ch, ...]   # [B,C,D,H,W]
 
+            # ---- occupancy mask from GT ----
+            mag = x.abs().mean(dim=1, keepdim=True)         # [B,1,D,H,W]
+            occ = (mag > occ_thresh).float()                # [B,1,D,H,W]
+
             optimizer.zero_grad()
             rec_x = model(x)            # [B,C,D,H,W]
 
-            # if you also have occupancy: occ = batch.get("occ", None)
-            occ = None
-            loss, loss_dict = voxel_rgb_recon_loss(
+            # ---- 1) plain (unmasked) recon loss ----
+            loss_plain, loss_dict_plain = voxel_rgb_recon_loss(
                 x, rec_x,
                 loss_type="mse",
-                occ=occ,
+                occ=None,          # no mask here
                 fg_weight=1.0,
                 bg_weight=1.0,
             )
 
+            # ---- 2) GT-derived occupancy-masked loss (same as before) ----
+            with torch.no_grad():
+                mag_dbg = x.abs().mean(dim=1, keepdim=True)      # [B,1,D,H,W]
+                occ_dbg = (mag_dbg > occ_thresh).float()         # [B,1,D,H,W]
+
+            loss_masked, loss_dict_masked = voxel_rgb_recon_loss(
+                x, rec_x,
+                loss_type="mse",
+                occ=occ_dbg,              # use GT occupancy to reweight foreground
+                fg_weight=fg_weight,
+                bg_weight=bg_weight,
+            )
+
+            # ---- 3) chroma loss *only on foreground* ----
+            # luminance
+            L_gt = x.mean(dim=1, keepdim=True)         # [B,1,D,H,W]
+            L_pr = rec_x.mean(dim=1, keepdim=True)     # [B,1,D,H,W]
+            # chroma
+            C_gt = x - L_gt                            # [B,C,D,H,W]
+            C_pr = rec_x - L_pr                        # [B,C,D,H,W]
+
+            # foreground mask
+            fg_mask = occ_dbg                          # [B,1,D,H,W]
+            fg_chroma = fg_mask.expand_as(C_gt)        # [B,C,D,H,W]
+
+            chroma_sq = (C_pr - C_gt) ** 2 * fg_chroma
+            # normalize by number of fg voxels so scale is stable
+            fg_norm = fg_chroma.sum().clamp_min(1.0)
+            loss_chroma = chroma_sq.sum() / fg_norm
+
+            # # ---- 4) optional BG-zero penalty: discourage noisy background ----
+            # bg_mask = 1.0 - occ_dbg                    # [B,1,D,H,W]
+            # bg_rgb  = rec_x * bg_mask                  # [B,C,D,H,W]
+            # bg_norm = bg_mask.expand_as(rec_x).sum().clamp_min(1.0)
+            # loss_bg_zero = (bg_rgb ** 2).sum() / bg_norm
+
+            # ---- 5) combine losses ----
+            loss = (
+                loss_plain
+                + lambda_masked * loss_masked
+                + lambda_chroma * loss_chroma
+
+            )
+
+            # merged logging dict
+            loss_dict = {
+                "loss": loss,
+                "loss_plain": loss_plain,
+                "loss_masked": loss_masked,
+                "loss_chroma": loss_chroma,
+                "loss_rec": loss_plain,                      # keep 'loss_rec' ≈ original semantics
+                "psnr": loss_dict_plain.get("psnr", None),
+                "psnr_masked": loss_dict_masked.get("psnr", None),
+            }
+
             loss.backward()
             optimizer.step()
+
+            # ---- per-channel debug stats ----
+            if debug_stats and (iteration < 10 or iteration % debug_every == 0):
+                with torch.no_grad():
+                    B_cur = x.shape[0]
+                    # flatten spatial dims
+                    x_flat = x.view(B_cur, ae_in_ch, -1)
+                    rec_flat = rec_x.view(B_cur, ae_in_ch, -1)
+
+                    x_mean = x_flat.mean(dim=-1)      # [B,C]
+                    x_std  = x_flat.std(dim=-1)       # [B,C]
+                    r_mean = rec_flat.mean(dim=-1)    # [B,C]
+                    r_std  = rec_flat.std(dim=-1)     # [B,C]
+
+                    # just log batch-mean over samples
+                    x_mean_b = x_mean.mean(dim=0)     # [C]
+                    x_std_b  = x_std.mean(dim=0)
+                    r_mean_b = r_mean.mean(dim=0)
+                    r_std_b  = r_std.mean(dim=0)
+
+                    debug_log = {}
+                    for c in range(ae_in_ch):
+                        debug_log[f"x/ch_mean_c{c}"] = float(x_mean_b[c].item())
+                        debug_log[f"x/ch_std_c{c}"]  = float(x_std_b[c].item())
+                        debug_log[f"rec/ch_mean_c{c}"] = float(r_mean_b[c].item())
+                        debug_log[f"rec/ch_std_c{c}"]  = float(r_std_b[c].item())
+
+                    debug_log["occ/mean"] = float(occ_dbg.mean().item())
+
+                    wandb.log(debug_log, step=iteration)
+
+                    # also print once in a while
+                    print(f"[debug] iter {iteration} channel stats:")
+                    print("  x_mean:", [round(v, 4) for v in x_mean_b.tolist()])
+                    print("  x_std :", [round(v, 4) for v in x_std_b.tolist()])
+                    print("  rec_mean:", [round(v, 4) for v in r_mean_b.tolist()])
+                    print("  rec_std :", [round(v, 4) for v in r_std_b.tolist()])
 
             # log per-iter
             logged = wandb_log_lossdict(loss_dict, iteration)
@@ -233,6 +335,12 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
             )
 
             iteration += 1
+
+            # if overfitting one batch, we don't need to iterate whole loader
+            if overfit_one:
+                # just do a few steps per epoch to see the trend
+                if batch_idx >= 9:   # e.g., 10 iters/epoch
+                    break
 
         pbar.close()
 
@@ -276,14 +384,19 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             model.eval()
             with torch.no_grad():
-                batch = next(iter(dataloader))
-                vox = batch["voxels"].to(device).float()
-                x = vox[:, :ae_in_ch, ...]
-                rec_x = model(x)
+                batch_vis = next(iter(dataloader))
+                vox_vis = batch_vis["voxels"].to(device).float()
+                x_vis = vox_vis[:, :ae_in_ch, ...]
+                rec_vis = model(x_vis)
 
                 b0 = 0
-                gt_vol  = x[b0].detach().cpu()      # [C,D,H,W]
-                rec_vol = rec_x[b0].detach().cpu()  # [C,D,H,W]
+                gt_vol  = x_vis[b0].detach().cpu()      # [C,D,H,W]
+                rec_vol = rec_vis[b0].detach().cpu()    # [C,D,H,W]
+
+                mag_vis = x_vis.abs().mean(dim=1, keepdim=True)   # [B,1,D,H,W]
+                occ_vis = (mag_vis > occ_thresh).float()
+                occ_vol = occ_vis[b0, 0].detach().cpu()           # [D,H,W]
+                occ_rgb = occ_vol.unsqueeze(0).repeat(3, 1, 1, 1) # [3,D,H,W]
 
                 log_rgb_voxels(
                     name="ae/gt_rgb",
@@ -300,6 +413,18 @@ def train_voxel_ae(config_path="./configs/shapes.json"):
                 log_rgb_voxels(
                     name="ae/rec_rgb",
                     rgb_vol=rec_vol,
+                    alpha_vol=None,
+                    KPx=None,
+                    step=iteration,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+                log_rgb_voxels(
+                    name="ae/occ_mask",
+                    rgb_vol=occ_rgb,
                     alpha_vol=None,
                     KPx=None,
                     step=iteration,
