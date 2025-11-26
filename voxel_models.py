@@ -2443,15 +2443,60 @@ class DLP(nn.Module):
         else:
             rec_loss_func = calc_reconstruction_loss
 
-        # rec_loss_func with reduction='none' just like 2D calc_static_elbo
-        rec_err = rec_loss_func(
-            x_flat, rec_rgb,
-            loss_type=recon_loss_type,
-            reduction='none'
-        )                                                      # [B*T, 3, D, H, W] (or same shape)
+        # --------- reconstruction (global + GT-masked, 3D but 2D-style reduction) ---------
+        # x:       [B, T, 3, D, H, W]
+        # rec_rgb: [B*T, 3, D, H, W]
+        B = x.shape[0]
+        T = x.shape[1] if x.dim() >= 2 else 1
 
-        # match 2D reduction: sum spatial+channels, mean over batch/time
-        loss_rec = rec_err.view(B, T, -1).sum(-1).mean()
+        # flatten time to match decoder output
+        x_flat  = x.view(-1, *x.shape[2:])           # [B*T, 3, D, H, W]
+        rec_rgb = model_output["rec"]                # [B*T, 3, D, H, W]
+        assert rec_rgb.shape == x_flat.shape, f"rec_rgb {rec_rgb.shape} vs x_flat {x_flat.shape}"
+
+        # ---- per-voxel error ----
+        diff = rec_rgb - x_flat
+        if recon_loss_type == "mse":
+            per_voxel_err = diff ** 2                     # [B*T,3,D,H,W]
+        elif recon_loss_type == "l1":
+            per_voxel_err = diff.abs()
+        else:
+            raise NotImplementedError(
+                f"recon_loss_type={recon_loss_type} not supported for 3D voxels; use 'mse' or 'l1'."
+            )
+
+        # ============= 1) ORIGINAL-STYLE GLOBAL LOSS (sum over all elements per sample) =============
+        # mimic calc_reconstruction_loss(..., reduction='none'):
+        #   -> per-sample sum over all channels & voxels
+        rec_err_global = per_voxel_err.view(B * T, -1).sum(dim=1)   # [B*T]
+        loss_rec_global = rec_err_global.mean()                     # scalar
+
+        # ============= 2) GT-OCCUPANCY-MASKED LOSS (same scaling style) =============
+        # Build a GT occupancy mask from RGB magnitude:
+        #   1 where there is "object" color, 0 where it's empty/background.
+        mag = x_flat.abs().sum(dim=1, keepdim=True)                 # [B*T,1,D,H,W]
+        occ_mask = (mag > 1e-6).float()                             # tweak threshold if needed
+
+        # weights: foreground gets 1.0, background 0 (you can change bg_weight if you want)
+        fg_weight = 1.0
+        bg_weight = 0.0
+        fg = occ_mask
+        bg = 1.0 - fg
+        w = fg_weight * fg + bg_weight * bg                         # [B*T,1,D,H,W]
+
+        # broadcast weights to all channels and sum like the global loss
+        w_full = w.expand_as(per_voxel_err)                         # [B*T,3,D,H,W]
+        weighted_err = per_voxel_err * w_full                       # [B*T,3,D,H,W]
+
+        # per-sample sum over all (masked) elements -> same "sum over dims" style as calc_reconstruction_loss
+        rec_err_fg = weighted_err.view(B * T, -1).sum(dim=1)        # [B*T]
+        loss_rec_fg = rec_err_fg.mean()                             # scalar
+
+        # ============= 3) COMBINE BOTH =============
+        # lambda_fg controls how much we trust foreground-masked vs global:
+        #   lambda_fg = 1.0 -> only masked; 0.0 -> only global.
+        lambda_fg = getattr(self, "lambda_fg_rec", 0.7)
+        loss_rec = lambda_fg * loss_rec_fg + (1.0 - lambda_fg) * loss_rec_global
 
         # PSNR for logging (on full vox volume)
         with torch.no_grad():
