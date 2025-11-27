@@ -2379,7 +2379,7 @@ class DLP(nn.Module):
         fg_weight: float = 1.0,               # weight on foreground voxels
         bg_weight: float = 1.0,               # weight on background voxels
         occ_from_x_thresh: float = 0.05,      # threshold on |x| to treat a voxel as foreground (if use_x_occ_as_mask)
-        lambda_color: float = 5.0,  
+        lambda_color: float = 500.0,  
         # regularizers / aux
         alpha_sparsity_weight: float = 1e-3,  # L1 on per-object α volume
         alpha_entropy_weight: float = 0.0,    # encourage crisp α (optional)
@@ -2474,7 +2474,7 @@ class DLP(nn.Module):
         # mixing factor for masked vs global (can also be in self)
         lambda_fg_rec = getattr(self, "lambda_fg_rec", 0.5)
 
-        # --------- (C) CHROMA LOSS *only on foreground* (AE-style) ----------
+        # --------- (C) CHROMA LOSS *only on foreground* (AE-style, summed like MSE) ----------
         # luminance
         L_gt = x_flat.mean(dim=1, keepdim=True)          # [B*T,1,D,H,W]
         L_pr = pred_rgb.mean(dim=1, keepdim=True)        # [B*T,1,D,H,W]
@@ -2484,9 +2484,15 @@ class DLP(nn.Module):
 
         # restrict chroma loss to foreground voxels
         fg_chroma = occ_mask.expand_as(C_gt)             # [B*T,3,D,H,W]
-        chroma_sq = (C_pr - C_gt) ** 2 * fg_chroma
-        fg_norm = fg_chroma.sum().clamp_min(1.0)
-        loss_color = chroma_sq.sum() / fg_norm           # scalar
+        chroma_sq = (C_pr - C_gt) ** 2 * fg_chroma       # [B*T,3,D,H,W]
+
+        # sum over channels + spatial dims, mean over batch*time
+        chroma_spatial_dims = tuple(range(1, chroma_sq.dim()))  # (1,2,3,4)
+        loss_color = chroma_sq.sum(dim=chroma_spatial_dims).mean()   # scalar
+
+        print("loss_color:", float(loss_color))
+        print("loss_rec_global:", float(loss_rec_global))
+
 
 
         bg_mask_occ = 1.0 - occ_mask                    # [B*T,1,D,H,W]
