@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from datasets.point_cloud_datasets.to_scene_ds import TODataset
 from datasets.voxel_ds import VoxelDataset
+from datasets.voxelize_ds_wrapper import VoxelizedDataset
+from datasets.point_cloud_datasets.mimicgen_ds import MimicGenPointCloudDataset
 
 def get_point_cloud_dataset(
     ds: str,
@@ -14,26 +16,72 @@ def get_point_cloud_dataset(
     max_points: int = 4096,
     normalize_to_unit_cube: bool = True,
     include_rgb: bool = False,
+    *,
+    voxelize: bool = False,
+    voxel_grid_whd: tuple = (64, 64, 64),
+    voxel_mode: str = "density",
+    bounds_mode: "str|tuple" = "global",
+    keep_points: bool = True,
+    cache_dir: str = None,
+    cache_extras: bool = False,
+    force_rebuild: bool = False,
+    device=None,
 ):
-    """
-    Generic getter for point-cloud datasets. For your TO dataset, pass ds="to" or "to-scene".
-    """
-    if ds == "TO":
-        return TODataset(
+    ds_key = (ds or "").lower()
+
+    # --- precomputed voxels path (unchanged behavior) ---
+    if ds_key == "voxel":
+        return VoxelDataset(
             root=root,
             split=mode,
+            sample_length=sample_length,
+        )
+
+    # --- TO / TO-Scene (existing) ---
+    if ds_key in ("to", "to-scene", "to_scene"):
+        base = TODataset(
+            root=root, split=mode, max_points=max_points,
+            normalize_to_unit_cube=normalize_to_unit_cube,
+            include_rgb=include_rgb,
+        )
+        if voxelize:
+            return VoxelizedDataset(
+                base_ds=base,
+                grid_whd=voxel_grid_whd,
+                mode=voxel_mode,
+                bounds_mode=bounds_mode,
+                keep_points=True,
+                device=device or torch.device("cpu"),
+                cache_dir=cache_dir,
+                cache_extras=cache_extras,
+                force_rebuild=force_rebuild,
+            )
+        return base
+
+    # --- NEW: MimicGen fused PLY dataset ---
+    if ds_key in ("mimicgen", "mimicgen-pc", "mimicgen_pc"):
+        base = MimicGenPointCloudDataset(
+            root=root,
+            split=mode,                      # "train" | "val" | "test" (internal split)
             max_points=max_points,
             normalize_to_unit_cube=normalize_to_unit_cube,
             include_rgb=include_rgb,
         )
-    if ds == "voxel":
-      return VoxelDataset(
-          root=root,         # folder containing *_voxels.pt / *_meta.pt pairs
-          split=mode,        # "train" | "val" | "test"
-          sample_length=sample_length,
-      )
-    raise NotImplementedError(f"Unknown point-cloud dataset: {ds}")
+        if voxelize:
+            return VoxelizedDataset(
+                base_ds=base,
+                grid_whd=voxel_grid_whd,
+                mode=voxel_mode,
+                bounds_mode=bounds_mode,
+                keep_points=True,
+                device=device or torch.device("cpu"),
+                cache_dir=cache_dir,
+                cache_extras=cache_extras,
+                force_rebuild=force_rebuild,
+            )
+        return base
 
+    raise NotImplementedError(f"Unknown point-cloud dataset: {ds}")
 
 # -------- collate for variable-size point clouds (single-frame) --------
 def pc_collate(batch: List[Dict[str, object]]) -> Dict[str, object]:
