@@ -202,19 +202,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # Voxel Stuff
     voxel_mode = config["voxel_mode"]
     voxel_grid_whd = config["voxel_grid_whd"]
+    voxel_root = config.get("voxel_root", None)
 
-    dataset = get_point_cloud_dataset(ds, root, mode='train', max_points=4096, include_rgb=True)
-    # print("DATASET items:", dataset[0]['points'].shape)
-    # vox_ds = VoxelizedDataset(
-    #     base_ds=dataset,
-    #     grid_whd=voxel_grid_whd,          # (W,H,D) in your class name, but tensors come out [C,D,H,W]
-    #     mode="avg_rgb",                 # "occupancy" | "density" | "moments" | "avg_rgb"
-    #     bounds_mode="global",           # "per_item" | "global" | ((pmin),(pmax))
-    #     keep_points=False,              # True to also return original points
-    #     device=torch.device("cpu"),     # keep CPU if you use DataLoader workers
-    #     cache_dir="/home/ellina/Desktop/Code/voxel_shapenet_rgb",  # speeds up future runs
-    #     force_rebuild=False
-    # )
+    dataset = get_point_cloud_dataset(ds, root, mode="train",
+                             voxelize=True, voxel_grid_whd=voxel_grid_whd,
+                             voxel_mode="occupancy",
+                             cache_dir=voxel_root)
+
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
     # model
