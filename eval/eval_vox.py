@@ -904,12 +904,12 @@ def log_rgb_voxels(
         legend=dict(orientation='h'),
         scene=dict(xaxis_title="X (W)", yaxis_title="Y (H)", zaxis_title="Z (D)")
     )
-
     
 
-    if wandb is not None:
+    if step is not None:
         wandb.log({name: fig}, step=step)
     return fig
+
 def _global_to_voxel_indices(kp_xyz_global, D, H, W):
     """map (x,y,z) in [-1,1] to voxel index coordinates (X,Y,Z)"""
     K = kp_xyz_global.shape[0]
