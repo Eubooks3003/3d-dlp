@@ -407,7 +407,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
             vox  = batch["voxels"].to(device)  
-            print("VOX SHAPE:", vox.shape)
             # mask = batch["mask"].to(device) 
 
             warmup = (epoch < warmup_epoch)

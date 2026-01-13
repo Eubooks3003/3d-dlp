@@ -2506,14 +2506,6 @@ class ObjectDecoderCNN(nn.Module):
             #     f"mean={y_flat.mean().item():.4f} "
             #     f"std={y_flat.std().item():.4f}")
 
-            # If this is RGBA-style output (alpha + RGB), look at first 4 chans
-            max_ch_to_print = min(4, Cdec)
-            for c in range(max_ch_to_print):
-                ch = y_flat[:, c]
-                print(f"  ch{c}: min={ch.min().item():.4f} "
-                    f"max={ch.max().item():.4f} "
-                    f"mean={ch.mean().item():.4f} "
-                    f"std={ch.std().item():.4f}")
 
         return y
 
@@ -3408,7 +3400,6 @@ class ParticleAttributeEncoder(nn.Module):
         else:
             mu_depth = logvar_depth = None
 
-        print("MU 0: ", mu[0,0])
 
         spatial_out = {'mu': mu, 'logvar': logvar, 'mu_scale': mu_scale, 'logvar_scale': logvar_scale,
                        'lobj_on_a': lobj_on_a, 'lobj_on_b': lobj_on_b, 'obj_on': obj_on,
@@ -3531,7 +3522,6 @@ class ParticleFeaturesEncoder(nn.Module):
         """
         B, C, D, H, W = x.shape
 
-            [ (x[:,c].min().item(), x[:,c].max().item()) for c in range(x.shape[1]) ])
 
         assert x.shape[1] == self.ch, f"Expected {self.ch} channels, got {x.shape[1]}"
         K = kp.shape[1]
@@ -6569,26 +6559,6 @@ class DLPDecoder(nn.Module):
         # print("rec rgb: ", rec_rgb.shape)
         # print("dec objects trans: ", dec_objects_trans.shape)
         # print("bg only: ", (bg_mask * bg_rec[:, :3, ...]).shape)
-
-        # ---- DEBUG: final RGB stats + correlations ----
-        with torch.no_grad():
-            def tensor_stats(name, t):
-                t_flat = t.view(t.shape[0], t.shape[1], -1)
-                print(f"[{name}] shape={t.shape} "
-                      f"global min={t_flat.min().item():.4f} "
-                      f"max={t_flat.max().item():.4f} "
-                      f"mean={t_flat.mean().item():.4f} "
-                      f"std={t_flat.std().item():.4f}")
-                # per-channel
-                C = t.shape[1]
-                max_ch = min(3, C)
-                for c in range(max_ch):
-                    ch = t_flat[:, c]
-                    print(f"  ch{c}: min={ch.min().item():.4f} "
-                          f"max={ch.max().item():.4f} "
-                          f"mean={ch.mean().item():.4f} "
-                          f"std={ch.std().item():.4f}")
-
             # tensor_stats("OBJ_RGB (dec_objects_trans)", dec_objects_trans)
 
             # if C_bg >= 3:
