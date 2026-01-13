@@ -16,15 +16,15 @@ import open3d as o3d
 
 # ---------------- CONFIG ----------------
 H5_PATH    = "/home/ellina/Desktop/Code/articubot-on-mimicgen/stack_d1_rgbd_pcd.hdf5"
-OUT_DIR    = "mimicgen_from_depth_pcd_fixed"
+OUT_DIR    = "mimicgen_from_depth_pcd"
 
 CAMS       = ["agentview", "sideview", "robot0_eye_in_hand"]
 NUM_SCENES = 5
 
 # Set to None while debugging (cropping can hide issues!)
-CROP_BOUNDS = None
+# CROP_BOUNDS = None
 # Example crop (meters) once things look correct:
-# CROP_BOUNDS = {"xmin": -2.0, "xmax": 2.0, "ymin": -2.0, "ymax": 2.0, "zmin": -0.2, "zmax": 2.5}
+CROP_BOUNDS = {"xmin": -2.0, "xmax": 2.0, "ymin": -2.0, "ymax": 2.0, "zmin": -0.2, "zmax": 2.5}
 
 PIXEL_STRIDE = 1     # use 2/4 if clouds are too dense
 MAX_POINTS   = 200000  # optional random cap per frame (-1 disables)

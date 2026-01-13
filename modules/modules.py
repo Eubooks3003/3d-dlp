@@ -2500,11 +2500,11 @@ class ObjectDecoderCNN(nn.Module):
             Btot, Cdec, Dz, Hy, Wx = y.shape
             y_flat = y.view(Btot, Cdec, -1)
 
-            print("[ObjectDecoderCNN] y stats: "
-                f"min={y_flat.min().item():.4f} "
-                f"max={y_flat.max().item():.4f} "
-                f"mean={y_flat.mean().item():.4f} "
-                f"std={y_flat.std().item():.4f}")
+            # print("[ObjectDecoderCNN] y stats: "
+            #     f"min={y_flat.min().item():.4f} "
+            #     f"max={y_flat.max().item():.4f} "
+            #     f"mean={y_flat.mean().item():.4f} "
+            #     f"std={y_flat.std().item():.4f}")
 
             # If this is RGBA-style output (alpha + RGB), look at first 4 chans
             max_ch_to_print = min(4, Cdec)
@@ -3143,7 +3143,7 @@ class BgEncoder(nn.Module):
             cnn_features = feat.view(B, *cnn_features.shape[1:])
 
         z_feat = self.to_latent(cnn_features)  # [B, out_ch(or C'), D', H', W']
-        print("Z FEAT SHAPE: ", z_feat.shape)
+        # print("Z FEAT SHAPE: ", z_feat.shape)
 
         if self.projection_mode == 'fc':
             flat = z_feat.view(z_feat.shape[0], -1)  # [B, C'*D'*H'*W']
@@ -6361,29 +6361,29 @@ class DLPDecoder(nn.Module):
         # ---- DEBUG: per-object voxel RGB/alpha stats ----
         with torch.no_grad():
             B, N, C, D, H, W = patches_t.shape
-            print("[decode_rgb_unified] patches_t shape:", patches_t.shape)
+            # print("[decode_rgb_unified] patches_t shape:", patches_t.shape)
 
             # alpha logits and alpha probs
             a_logits_flat = a_logits.view(B * N, -1)
             a_obj_flat    = a_obj.view(B * N, -1)
-            print("  alpha_logits: min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
-                a_logits_flat.min().item(),
-                a_logits_flat.max().item(),
-                a_logits_flat.mean().item(),
-                a_logits_flat.std().item()))
-            print("  alpha_prob:   min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
-                a_obj_flat.min().item(),
-                a_obj_flat.max().item(),
-                a_obj_flat.mean().item(),
-                a_obj_flat.std().item()))
+            # print("  alpha_logits: min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
+            #     a_logits_flat.min().item(),
+            #     a_logits_flat.max().item(),
+            #     a_logits_flat.mean().item(),
+            #     a_logits_flat.std().item()))
+            # print("  alpha_prob:   min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
+            #     a_obj_flat.min().item(),
+            #     a_obj_flat.max().item(),
+            #     a_obj_flat.mean().item(),
+            #     a_obj_flat.std().item()))
 
             rgb_flat = rgb_obj.view(B * N, self.cdim, -1)      # [B*N,3,D*H*W]
             for c, name in enumerate(["R", "G", "B"][:self.cdim]):
                 ch = rgb_flat[:, c]
-                print(f"  voxel {name}: min={ch.min().item():.4f} "
-                      f"max={ch.max().item():.4f} "
-                      f"mean={ch.mean().item():.4f} "
-                      f"std={ch.std().item():.4f}")
+                # print(f"  voxel {name}: min={ch.min().item():.4f} "
+                #       f"max={ch.max().item():.4f} "
+                #       f"mean={ch.mean().item():.4f} "
+                #       f"std={ch.std().item():.4f}")
 
             # correlations across channels at voxel level
             if self.cdim == 3:
@@ -6396,9 +6396,9 @@ class DLPDecoder(nn.Module):
                     b = (b - b.mean()) / (b.std() + 1e-6)
                     return (a * b).mean().item()
 
-                print("  voxel corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
-                    corr(r, g), corr(r, b), corr(g, b)
-                ))
+                # print("  voxel corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
+                #     corr(r, g), corr(r, b), corr(g, b)
+                # ))
 
         return patches, a_obj, rgb_obj, None
 
@@ -6456,13 +6456,13 @@ class DLPDecoder(nn.Module):
             den = mask.sum(-1).clamp_min(1.0)                      # [B*N, 1]
             rgb_obj_mean = num / den                               # [B*N, 3]
 
-            print("rgb_obj_mean stats per channel:")
+            # print("rgb_obj_mean stats per channel:")
             for c, name in enumerate(["R","G","B"]):
                 ch = rgb_obj_mean[:, c]
-                print(name, "min", ch.min().item(), 
-                        "max", ch.max().item(), 
-                        "mean", ch.mean().item(), 
-                        "std", ch.std().item())
+                # print(name, "min", ch.min().item(), 
+                #         "max", ch.max().item(), 
+                #         "mean", ch.mean().item(), 
+                #         "std", ch.std().item())
             
             # correlation between channels for per-object color
             r = rgb_obj_mean[:,0]; g = rgb_obj_mean[:,1]; b = rgb_obj_mean[:,2]
@@ -6470,9 +6470,9 @@ class DLPDecoder(nn.Module):
                 a = (a - a.mean()) / (a.std() + 1e-6)
                 b = (b - b.mean()) / (b.std() + 1e-6)
                 return (a*b).mean().item()
-            print("corr_obj(R,G)=", corr(r,g),
-                "corr_obj(R,B)=", corr(r,b),
-                "corr_obj(G,B)=", corr(g,b))
+            # print("corr_obj(R,G)=", corr(r,g),
+            #     "corr_obj(R,B)=", corr(r,b),
+            #     "corr_obj(G,B)=", corr(g,b))
 
         dec_depth_patches = None  # unified depth is not per-patch separate object unless you want to expose it
 
@@ -6571,10 +6571,10 @@ class DLPDecoder(nn.Module):
             else:
                 rec_depth = bg_mask * bg_depth + dec_depth_trans
         
-        print("REC DEPTH is none: ", rec_depth is None)
-        print("rec rgb: ", rec_rgb.shape)
-        print("dec objects trans: ", dec_objects_trans.shape)
-        print("bg only: ", (bg_mask * bg_rec[:, :3, ...]).shape)
+        # print("REC DEPTH is none: ", rec_depth is None)
+        # print("rec rgb: ", rec_rgb.shape)
+        # print("dec objects trans: ", dec_objects_trans.shape)
+        # print("bg only: ", (bg_mask * bg_rec[:, :3, ...]).shape)
 
         # ---- DEBUG: final RGB stats + correlations ----
         with torch.no_grad():
@@ -6595,13 +6595,13 @@ class DLPDecoder(nn.Module):
                           f"mean={ch.mean().item():.4f} "
                           f"std={ch.std().item():.4f}")
 
-            tensor_stats("OBJ_RGB (dec_objects_trans)", dec_objects_trans)
+            # tensor_stats("OBJ_RGB (dec_objects_trans)", dec_objects_trans)
 
-            if C_bg >= 3:
-                tensor_stats("BG_RGB (bg_rec[:,:3])", bg_rec[:, :3, ...])
-                tensor_stats("BG_MASK", bg_mask)
+            # if C_bg >= 3:
+            #     tensor_stats("BG_RGB (bg_rec[:,:3])", bg_rec[:, :3, ...])
+            #     tensor_stats("BG_MASK", bg_mask)
 
-            tensor_stats("REC_RGB (final)", rec_rgb)
+            # tensor_stats("REC_RGB (final)", rec_rgb)
 
             # channel correlations on final reconstruction
             Bf, Cf, Df, Hf, Wf = rec_rgb.shape
@@ -6616,9 +6616,9 @@ class DLPDecoder(nn.Module):
                     b = (b - b.mean()) / (b.std() + 1e-6)
                     return (a * b).mean().item()
 
-                print("[REC_RGB] corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
-                    corr(r, g), corr(r, b), corr(g, b)
-                ))
+                # print("[REC_RGB] corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
+                #     corr(r, g), corr(r, b), corr(g, b)
+                # ))
 
         rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
 

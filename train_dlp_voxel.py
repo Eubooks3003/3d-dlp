@@ -463,7 +463,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                         "z_features", "z_obj_on", "z_depth"]:
                 t = model_output.get(name, None)
                 if t is not None and t.requires_grad:
-                    t.retain_grad()                # allow reading .grad on non-leaf tensors
+                    t.retain_grad()                 # allow reading .grad on non-leaf tensors
                     watch_tensors[name] = t
 
             # ---- compute & backprop ----

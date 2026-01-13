@@ -1208,7 +1208,7 @@ class DLP(nn.Module):
         alpha_masks = dec_dict['alpha_masks']
         rec = dec_dict['rec']
         bg_rec = dec_dict['bg_rec']
-        print("REC SHAPE:", rec.shape)
+        # print("REC SHAPE:", rec.shape)
 
         rec_rgb = dec_dict['rec_rgb']
         rgb_obj = dec_dict['rgb_obj']
@@ -1923,7 +1923,7 @@ class DLP(nn.Module):
         bg_logits (opt):        [B*T, 1, *spatial*]
         """
 
-        print(" RECON LOSS TYPE: ", recon_loss_type)
+        # print(" RECON LOSS TYPE: ", recon_loss_type)
 
         # --------- helpers ----------
         def bce_logits_weighted(logits, target, pos_weight):
@@ -2084,9 +2084,9 @@ class DLP(nn.Module):
             mu_offset.reshape(-1, mu_offset.shape[-1]),
             logvar_o=logvar_offset_p, reduce='none'
         )
-        print("shape kl kp offset:", loss_kl_kp_offset.shape)
-        print("shape mu offset:", mu_offset.shape)
-        print("shape kl mask:", kl_mask.shape)
+        # print("shape kl kp offset:", loss_kl_kp_offset.shape)
+        # print("shape mu offset:", mu_offset.shape)
+        # print("shape kl mask:", kl_mask.shape)
         loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, mu_offset.shape[2]) * kl_mask).sum(-1)
         loss_kl_kp_offset = (loss_kl_kp_offset * adaptive_beta_kl).mean()
         loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset
@@ -2277,9 +2277,9 @@ class DLP(nn.Module):
         loss_kl_kp_offset = calc_kl(logvar_offset.reshape(-1, logvar_offset.shape[-1]),
                                     mu_offset.reshape(-1, mu_offset.shape[-1]), logvar_o=logvar_offset_p,
                                     reduce='none')
-        print("shape kl kp offset:", loss_kl_kp_offset.shape)
-        print("shape mu offset:", mu_offset.shape)
-        print("shape kl mask:", kl_mask.shape)
+        # print("shape kl kp offset:", loss_kl_kp_offset.shape)
+        # print("shape mu offset:", mu_offset.shape)
+        # print("shape kl mask:", kl_mask.shape)
         loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, mu_offset.shape[2]) * kl_mask).sum(-1)
         loss_kl_kp_offset = (loss_kl_kp_offset * adaptive_beta_kl).mean()
         loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset
@@ -2490,8 +2490,8 @@ class DLP(nn.Module):
         chroma_spatial_dims = tuple(range(1, chroma_sq.dim()))  # (1,2,3,4)
         loss_color = chroma_sq.sum(dim=chroma_spatial_dims).mean()   # scalar
 
-        print("loss_color:", float(loss_color))
-        print("loss_rec_global:", float(loss_rec_global))
+        # print("loss_color:", float(loss_color))
+        # print("loss_rec_global:", float(loss_rec_global))
 
 
 
@@ -2576,7 +2576,7 @@ class DLP(nn.Module):
                 per_sample_err = diff.sum(dim=(1, 2, 3, 4, 5))       # [B*T]
                 loss_local = per_sample_err.mean()
 
-                print("Local loss (supervised, enc-detached):", loss_local.item())
+                # print("Local loss (supervised, enc-detached):", loss_local.item())
 
                 loss_rec = loss_rec + lambda_local * loss_local
 
@@ -2622,7 +2622,7 @@ class DLP(nn.Module):
                 overlap_pen = pairwise.mean()
                 loss_rec = loss_rec + overlap_weight * overlap_pen
 
-        print("obj_on: ", obj_on.shape)
+        # print("obj_on: ", obj_on.shape)
         # --------- KL masking ----------
         if use_kl_mask:
             kl_mask = obj_on.reshape(obj_on.shape[0], obj_on.shape[2])
@@ -3021,7 +3021,7 @@ if __name__ == '__main__':
         if ep_dones[i] < ep_done_mask.shape[1]:
             ep_done_mask[i, ep_dones[i]:] = 0.0
 
-    print("--- DLP ---")
+    # print("--- DLP ---")
     model = DLP(cdim=ch,  # number of input image channels
                 image_size=image_size,
                 normalize_rgb=False,  # normalize to [-1, 1] or keep [0, 1]
@@ -3098,9 +3098,9 @@ if __name__ == '__main__':
                 language_max_len=max_lang_len,
                 img_goal_condition=img_goal_cond
                 ).to(device)
-    print(f'model.info():')
-    print(model.info())
-    print("----------------------------------")
+    # print(f'model.info():')
+    # print(model.info())
+    # print("----------------------------------")
 
     x_ts = (timestep_horizon + 1) if timestep_horizon > 1 else 1
     x = torch.rand(batch_size * n_im_views, x_ts, ch, image_size, image_size, device=device)
