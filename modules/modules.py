@@ -3531,7 +3531,6 @@ class ParticleFeaturesEncoder(nn.Module):
         """
         B, C, D, H, W = x.shape
 
-        print("ParticleFeatEnc x shape:", x.shape, "min/max per channel:",
             [ (x[:,c].min().item(), x[:,c].max().item()) for c in range(x.shape[1]) ])
 
         assert x.shape[1] == self.ch, f"Expected {self.ch} channels, got {x.shape[1]}"
@@ -3897,8 +3896,6 @@ class DLPPrior(nn.Module):
         # if self.kp_mode == "kmeans":
         if True:
             kp, cov, meta = self.rgb_km(x, centers_init_global=self.get_patch_centers().to(x))
-            print("KP: ", kp.shape)
-            print("cov: ", cov.shape)
             return kp, cov
 
 
@@ -5075,7 +5072,6 @@ class ParticleEncoder(nn.Module):
         total_var = var_kp.sum(-1)  # [B, n_kp_prior]
 
         if self.n_kp_enc < self.n_kp_prior:
-            print("FILTERING!!!!!!!!!!!!")
             n_filter = self.n_kp_enc if not warmup else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior))
             _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
             batch_ind = torch.arange(batch_size, device=x.device)[:, None]
@@ -5219,7 +5215,6 @@ class ParticleEncoder(nn.Module):
             corr = (feat_flat.transpose(0,1) @ rgb_flat) / (feat_flat.shape[0] - 1)  # [F,3]
 
             max_abs_corr, idx = corr.abs().max(dim=0)  # per color channel
-            print("max |corr(feature, R/G/B)| =", max_abs_corr.tolist())
 
         return {
             'mu_features':           mu_features,
@@ -6553,7 +6548,6 @@ class DLPDecoder(nn.Module):
 
 
         if C_bg >= 3:
-            print("triggering bg composite")
             rec_rgb = bg_mask * bg_rec[:, :3, ...] + dec_objects_trans
         else:
             rec_rgb = dec_objects_trans
