@@ -1118,7 +1118,7 @@ class DLP(nn.Module):
     def forward(self, x, deterministic=False, warmup=False, with_loss=False, beta_kl=0.1, beta_dyn=0.1,
                 beta_rec=1.0, kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
                 balance=0.5, beta_dyn_rec=1.0, num_static=None, actions=None, actions_mask=None, lang_embed=None,
-                beta_obj=0.0, done_mask=None, x_goal=None):
+                beta_obj=0.0, done_mask=None, x_goal=None, lambda_color=0.0):
         if len(x.shape) == 5:
             # x: [bs, ch, h, w, l]
             batch_size = x.size(0)
@@ -1361,7 +1361,8 @@ class DLP(nn.Module):
                                        beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
                                        dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
                                        recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
-                                       num_static=num_static, beta_obj=beta_obj, done_mask=done_mask)
+                                       num_static=num_static, beta_obj=beta_obj, done_mask=done_mask,
+                                       lambda_color=lambda_color)
             output_dict['loss_dict'] = loss_dict
         else:
             output_dict['loss_dict'] = None
@@ -1371,7 +1372,7 @@ class DLP(nn.Module):
     def calc_elbo(self, x, model_output, warmup=False, beta_kl=0.1, beta_dyn=0.1, beta_rec=1.0,
                   kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None, balance=0.5,
                   beta_dyn_rec=1.0, num_static=1, use_kl_mask=True, apply_mask_on_obj_on=False, beta_obj=0.0,
-                  done_mask=None):
+                  done_mask=None, lambda_color=0.0):
         if self.is_dynamics_model:
             return self.calc_dyn_elbo(x, model_output, warmup, beta_kl, beta_dyn, beta_rec,
                                       kl_balance, dynamic_discount, recon_loss_type,
@@ -1396,6 +1397,7 @@ class DLP(nn.Module):
                 recon_loss_type=recon_loss_type,
                 use_kl_mask=use_kl_mask,
                 apply_mask_on_obj_on=apply_mask_on_obj_on,
+                lambda_color=lambda_color,
             )
 
     def calc_dyn_elbo(self, x, model_output, warmup=False, beta_kl=0.1, beta_dyn=0.1, beta_rec=1.0,

@@ -173,6 +173,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     beta_kl = config['beta_kl']
     beta_rec = config['beta_rec']
     beta_obj = config.get('beta_obj', 0.0)
+    lambda_color = config['lambda_color']
     kl_balance = config['kl_balance']  # balance between visual features and the other particle attributes
 
     # priors
@@ -417,7 +418,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                             beta_rec=beta_rec, kl_balance=kl_balance,
                                             recon_loss_type=recon_loss_type,
                                             recon_loss_func=recon_loss_func,
-                                            beta_obj=beta_obj)
+                                            beta_obj=beta_obj, lambda_color=lambda_color)
             
             with torch.no_grad():
                 # --- decoder-side diagnostics if present ---
