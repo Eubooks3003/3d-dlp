@@ -25,7 +25,7 @@
   "num_epochs": 500,
   "eval_epoch_freq": 1,
   "warmup_epoch": 1,
-  "patch_size": 16,
+  "patch_size": 8,
   "n_kp_per_patch": 1,
   "n_kp_enc": 24,
   "n_kp_prior": 64,
@@ -100,7 +100,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "ablation_without_chroma",
+  "run_prefix": "ablation_ssm_enc",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
@@ -111,5 +111,5 @@
   "depth_feature_dim": 1,
   "split_loss": false,
   "depth_loss_ratio": 0.25,
-  "lambda_color": 0.0
+  "lambda_color": 500.0
 }

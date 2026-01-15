@@ -3606,338 +3606,652 @@ import torch.nn as nn
 #   - Encoder(...)
 #   - AlternativeSpatialSoftmaxKP3D(...)
 
+import math
+import numpy as np
+from typing import Optional, Tuple, Literal, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# -------------------------
+# 3D Patcher (non-overlap)
+# -------------------------
+class VoxelPatcher(nn.Module):
+    """
+    3D patcher in canonical PyTorch layout.
+    Input:  [B, C, D, H, W]
+    Output: [B, C, N, pd, ph, pw]   (non-overlapping tiles)
+    """
+    def __init__(self, cdim=3, volume_size=(64, 64, 64), patch_size=(16, 16, 16)):
+        super().__init__()
+        self.cdim = int(cdim)
+
+        if isinstance(volume_size, int):
+            self.D = self.H = self.W = int(volume_size)
+        else:
+            self.D, self.H, self.W = map(int, volume_size)
+
+        if isinstance(patch_size, int):
+            self.pd = self.ph = self.pw = int(patch_size)
+        else:
+            self.pd, self.ph, self.pw = map(int, patch_size)
+
+        self.patch_location_idx = self.get_patch_location_idx()  # [N,3] in (d,h,w) order
+
+    def _num_tiles(self):
+        nd = self.D // self.pd
+        nh = self.H // self.ph
+        nw = self.W // self.pw
+        return nd, nh, nw
+
+    def get_patch_location_idx(self):
+        if (self.D % self.pd) or (self.H % self.ph) or (self.W % self.pw):
+            raise ValueError(
+                f"Volume dims (D,H,W)=({self.D},{self.H},{self.W}) must be divisible by "
+                f"(pd,ph,pw)=({self.pd},{self.ph},{self.pw})."
+            )
+        ds = np.arange(0, self.D, self.pd)
+        hs = np.arange(0, self.H, self.ph)
+        ws = np.arange(0, self.W, self.pw)
+        dd, hh, ww = np.meshgrid(ds, hs, ws, indexing="ij")  # (d,h,w)
+        dhws = np.stack((dd, hh, ww), axis=-1).reshape(-1, 3)
+        return torch.tensor(dhws, dtype=torch.int32)
+
+    def get_patch_centers_idx(self):
+        mid = torch.tensor([self.pd // 2, self.ph // 2, self.pw // 2], dtype=torch.int32)
+        return self.patch_location_idx + mid  # [N,3] in voxel indices (d,h,w)
+
+    @staticmethod
+    def _ensure_5d(x: torch.Tensor):
+        if x.ndim != 5:
+            raise ValueError(f"Expected [B,C,D,H,W], got {tuple(x.shape)}")
+
+    def vox_to_patches(self, x: torch.Tensor) -> torch.Tensor:
+        """[B,C,D,H,W] -> [B,C,N,pd,ph,pw]"""
+        self._ensure_5d(x)
+        B, C, D, H, W = x.shape
+        if (D, H, W) != (self.D, self.H, self.W):
+            raise ValueError(f"Input (D,H,W)=({D},{H},{W}) != configured ({self.D},{self.H},{self.W})")
+        nd, nh, nw = self._num_tiles()
+
+        # [B, C, nd, pd, nh, ph, nw, pw]
+        x = x.view(B, C, nd, self.pd, nh, self.ph, nw, self.pw)
+        # -> [B, C, nd, nh, nw, pd, ph, pw]
+        x = x.permute(0, 1, 2, 4, 6, 3, 5, 7).contiguous()
+        # -> [B, C, N, pd, ph, pw]
+        x = x.view(B, C, nd * nh * nw, self.pd, self.ph, self.pw)
+        return x
+
+    def patches_to_vox(self, patches: torch.Tensor) -> torch.Tensor:
+        """[B,C,N,pd,ph,pw] -> [B,C,D,H,W]"""
+        if patches.ndim != 6:
+            raise ValueError(f"Expected [B,C,N,pd,ph,pw], got {tuple(patches.shape)}")
+        B, C, N, pd, ph, pw = patches.shape
+        nd, nh, nw = self._num_tiles()
+        if N != nd * nh * nw:
+            raise ValueError(f"N={N} != nd*nh*nw={nd*nh*nw}")
+        if (pd, ph, pw) != (self.pd, self.ph, self.pw):
+            raise ValueError(f"Patch size mismatch: {(pd,ph,pw)} vs {(self.pd,self.ph,self.pw)}")
+
+        # [B, C, nd, nh, nw, pd, ph, pw]
+        x = patches.view(B, C, nd, nh, nw, pd, ph, pw)
+        # -> [B, C, nd, pd, nh, ph, nw, pw]
+        x = x.permute(0, 1, 2, 5, 3, 6, 4, 7).contiguous()
+        # -> [B, C, D, H, W]
+        x = x.view(B, C, nd * pd, nh * ph, nw * pw)
+        return x
+
+
+# -------------------------
+# Simple 3D Encoder for ssm_enc
+# -------------------------
+class VoxelPriorEncoder3D(nn.Module):
+    """
+    Patch encoder that outputs heatmaps: [B, out_ch, fd, fh, fw].
+    Keep it minimal for ablation sanity.
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        base_ch: int = 32,
+        ch_mult: Tuple[int, ...] = (1, 2, 3),
+        padding_mode: str = "replicate",
+    ):
+        super().__init__()
+        layers = []
+        ch = base_ch
+        layers.append(nn.Conv3d(in_ch, ch, 3, padding=1, padding_mode=padding_mode))
+        layers.append(nn.GroupNorm(8, ch))
+        layers.append(nn.SiLU())
+
+        cur = ch
+        for m in ch_mult:
+            nxt = base_ch * m
+            # stride-2 downsample
+            layers.append(nn.Conv3d(cur, nxt, 3, stride=2, padding=1, padding_mode=padding_mode))
+            layers.append(nn.GroupNorm(8, nxt))
+            layers.append(nn.SiLU())
+            cur = nxt
+
+        self.trunk = nn.Sequential(*layers)
+        self.conv_out = nn.Conv3d(cur, out_ch, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.trunk(x)
+        return self.conv_out(h)
+
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+
+
 class DLPPrior(nn.Module):
-    def __init__(self, cdim=3, volume_size=64, n_kp=1,
-                 pad_mode='replicate',
-                 patch_size=16, n_kp_prior=64,
-                 kp_range=(-1, 1),
-                 use_resblock=False,
-                 filtering_heuristic='none',
-                 ch_mult=(1, 2, 3), base_ch=32, num_res_blocks=2, cnn_mid_blocks=False,
-                 init_zero_bias=True,
-                 init_ssm_last_layer=True,
-                 init_conv_layers=True,
-                 init_conv_fg_std=0.02,
-                 use_kmeans_prior=True, kmeans_iters=5, kmeans_tau=1.0,):
+    def __init__(
+        self,
+        cdim=3,
+        image_size=64,                 # kept for compat prints / legacy
+        volume_size=None,              # your voxel code uses volume_size=image_size sometimes
+        n_kp=1,
+        pad_mode="replicate",
+        patch_size=16,
+        n_kp_prior=64,
+        kp_range=(-1, 1),
+        use_resblock=False,
+        filtering_heuristic="none",
+        ch_mult=(1, 2, 3),
+        base_ch=32,
+        num_res_blocks=2,
+        cnn_mid_blocks=False,
+        init_zero_bias=True,
+        init_ssm_last_layer=True,
+        init_conv_layers=True,
+        init_conv_fg_std=0.02,
+
+        # ---- NEW: only affects forward/encode_prior ----
+        prior_mode="ssm_enc",          # "kmeans" | "ssm_raw" | "ssm_enc"
+        raw_heatmap_mode="luma",       # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
+
+        **kwargs,
+    ):
         super().__init__()
 
-        # ---- fixed grid shape (no per-batch dependence) ----
-        if isinstance(volume_size, int):
-            D = H = W = int(volume_size)
-        else:
-            assert len(volume_size) == 3, "volume_size must be int or (D,H,W)"
-            D, H, W = map(int, volume_size)
-        self.D, self.H, self.W = D, H, W
-        self.volume_size = (D, H, W)
+        assert filtering_heuristic in ["distance", "variance", "random", "none"], \
+            f"unknown filtering heuristic: {filtering_heuristic}"
 
-        self.kp_range = kp_range  # typically (-1,1)
-        self.n_kp = int(n_kp)
-        self.n_kp_prior = int(n_kp_prior)
-        self.patch_size = int(patch_size)
+        self.kp_range = kp_range
+        self.n_kp = n_kp
+        self.patch_size = patch_size
         self.cdim = cdim
         self.use_resblock = use_resblock
         self.cnn_mid_blocks = cnn_mid_blocks
-        assert filtering_heuristic in ['distance', 'variance', 'random', 'none']
         self.filtering_heuristic = filtering_heuristic
 
-        # inits
+        # init flags (keep same names)
         self.init_zero_bias = init_zero_bias
         self.init_ssm_last_layer = init_ssm_last_layer
         self.init_conv_layers = init_conv_layers
         self.init_conv_fg_std = init_conv_fg_std
 
-        # 3D patcher (fixed grid)
-        self.patcher = VoxelPatcher(cdim=cdim, volume_size=(D, H, W), patch_size=self.patch_size)
-        pd, ph, pw = self.patcher.pd, self.patcher.ph, self.patcher.pw
-        self.nz, self.ny, self.nx = D // pd, H // ph, W // pw   # counts along (z,y,x)
-        self.num_patches = self.nx * self.ny * self.nz
+        # ---- NEW mode flags (no renaming) ----
+        self.prior_mode = prior_mode
+        self.raw_heatmap_mode = raw_heatmap_mode
+
+        # volume parsing (keep compat with image_size usage)
+        if volume_size is None:
+            volume_size = image_size
+        self.image_size = image_size  # legacy field some code prints
+        if isinstance(volume_size, int):
+            self.D = self.H = self.W = int(volume_size)
+        else:
+            self.D, self.H, self.W = map(int, volume_size)
+
+        # patch counts
+        self.num_patches = int((self.D // patch_size) * (self.H // patch_size) * (self.W // patch_size))
         self.n_kp_total = self.n_kp * self.num_patches
-        self.n_kp_prior = min(self.n_kp_total, self.n_kp_prior)
+        self.n_kp_prior = min(self.n_kp_total, n_kp_prior)
 
-        # CNN encoder over patches
+        # ---- patcher: keep your class, keep name self.patcher ----
+        self.patcher = VoxelPatcher(cdim=cdim, volume_size=(self.D, self.H, self.W), patch_size=patch_size)
+
+        # keep your feature_dim computation style
+        self.features_dim = int(patch_size // (2 ** (len(ch_mult) - 1)))
+
+        # ---- encoder: keep your Encoder object + attributes (conv_output_size etc) ----
         attn_res = [max(self.patch_size // 16, 1)]
-        self.enc = Encoder(ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
-                           attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True, in_channels=cdim,
-                           resolution=self.patch_size, z_channels=self.n_kp, double_z=False, padding_mode='replicate',
-                           residual=self.use_resblock, mid_blocks=cnn_mid_blocks)
+        self.enc = Encoder(
+            ch=base_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+            attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
+            in_channels=cdim, resolution=patch_size, z_channels=n_kp,
+            double_z=False, padding_mode=pad_mode,
+            residual=self.use_resblock, mid_blocks=cnn_mid_blocks
+        )
 
-        # 3D spatial softmax -> per-patch KPs (local coords) + covariance
+        # ---- SSM: keep existing class name ----
         self.ssm = AlternativeSpatialSoftmaxKP3D(kp_range=kp_range)
 
+        # OPTIONAL learned head for raw heatmaps (only used in ssm_raw + learned_1x1)
+        self.raw_head = None
+        if self.raw_heatmap_mode == "learned_1x1":
+            self.raw_head = nn.Conv3d(self.cdim, self.n_kp, kernel_size=1, bias=True)
 
-        # -------- precompute tile origins/centers in voxel-index space; keep as buffers --------
-        origins = self._precompute_patch_origins_xyz(
-            W, H, D, pw, ph, pd
-        ) 
-        centers = origins + torch.tensor([(pw - 1) / 2.0, (ph - 1) / 2.0, (pd - 1) / 2.0], dtype=torch.float32).view(1, 3)
-        self.register_buffer("patch_origins_xyz_idx", origins)
-        self.register_buffer("patch_centers_xyz_idx", centers)
-        self.register_buffer("size_minus1", torch.tensor([W - 1, H - 1, D - 1], dtype=torch.float32))  # (x,y,z)
-        self.register_buffer("patch_size_vec", torch.tensor([pw, ph, pd], dtype=torch.float32))
-        
-        self.use_kmeans_prior = use_kmeans_prior
-        self.kmeans_iters = int(kmeans_iters)
-        self.kmeans_tau = float(kmeans_tau)
+        # ---- kmeans helpers (same as what you posted earlier) ----
+        self.feat_mode = "lab"
+        self.append_xyz = True
+        self.saliency = "L"
+        self.keep_top = 20000
+        self.sample_m = 6000
+        self.iters = 30
+        self.tol = 1e-4
+        self.ridge = 1e-3
 
-        # TODO: Make this configurable values
-        rgbk_feat_mode="lab"     # {"lab","ilr"}
-        rgbk_append_xyz=False
-        rgbk_saliency="L"        # {"L","alpha","rgbnorm"}
-        rgbk_keep_top=80_000
-        rgbk_sample_m=50_000
-        rgbk_iters=30
-        rgbk_tol=1e-4
-        rgbk_ridge=1e-4
-        print("keep top: ", rgbk_keep_top)
-        self.rgb_km = FeatureKMeansRGB(
-                K=self.n_kp_prior,
-                feat_mode=rgbk_feat_mode,
-                append_xyz=rgbk_append_xyz,
-                saliency=rgbk_saliency,
-                keep_top=rgbk_keep_top,
-                sample_m=rgbk_sample_m,
-                iters=rgbk_iters,
-                tol=rgbk_tol,
-                ridge=rgbk_ridge,
-            )
+        self.register_buffer("D65_WHITE", torch.tensor([0.95047, 1.00000, 1.08883], dtype=torch.float32))
+        self.LAB_EPS = (6.0 / 29.0) ** 3
+        self.LAB_K = (1.0 / 3.0) * (29.0 / 6.0) ** 2
+        self.LAB_C = 4.0 / 29.0
+
+        self.register_buffer("SRGB2XYZ", torch.tensor([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ], dtype=torch.float32))
+        self.ILR_S1 = math.sqrt(1.0 / 2.0)
+        self.ILR_S2 = math.sqrt(2.0 / 3.0)
+
         self.init_weights()
 
-    # ---------- init helpers ----------
+    # -----------------------
+    # init_weights (keep name)
+    # -----------------------
     def init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d):
+            if isinstance(m, (nn.Conv3d, nn.Conv2d)):
                 if self.init_conv_layers:
                     nn.init.normal_(m.weight, 0.0, self.init_conv_fg_std)
                 if self.init_zero_bias and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.GroupNorm)):
+                if m.weight is not None:
+                    nn.init.constant_(m.weight, 1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # preserve your “SSM last layer init” behavior, but applied to enc.conv_out
         if self.init_ssm_last_layer:
-            # bias the final conv slightly negative like your original
-            m = self.enc.conv_out
-            nn.init.constant_(m.weight, -1.0 * self.init_conv_fg_std)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+            m = getattr(self.enc, "conv_out", None)
+            if isinstance(m, (nn.Conv3d, nn.Conv2d)):
+                d = -1.0 * self.init_conv_fg_std
+                nn.init.constant_(m.weight, d)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
-    @staticmethod
-    def _precompute_patch_origins_xyz(W, H, L, pw, ph, pl):
-        xs = torch.arange(0, W, step=pw, dtype=torch.float32)
-        ys = torch.arange(0, H, step=ph, dtype=torch.float32)
-        zs = torch.arange(0, L, step=pl, dtype=torch.float32)
-        X, Y, Z = torch.meshgrid(xs, ys, zs, indexing='ij')  # [nx,ny,nz]
-        return torch.stack([X.reshape(-1), Y.reshape(-1), Z.reshape(-1)], dim=-1)  # [N,3]
+        # raw head mild init
+        if self.raw_head is not None:
+            nn.init.normal_(self.raw_head.weight, 0.0, self.init_conv_fg_std)
+            if self.raw_head.bias is not None:
+                nn.init.constant_(self.raw_head.bias, 0)
 
-    # ---------- mapping utilities (no last_shape) ----------
-    def get_global_kp(self, local_kp):
-        """
-        local_kp: [B, N, K, 3] in kp_range (e.g., (-1,1)).
-        Returns global coords in kp_range, using fixed grid shape and precomputed patch origins.
-        """
-        xmin, xmax = self.kp_range
-        px, py, pz = self.patch_size_vec.unbind(-1)
-        # map local (-1,1) -> [0, ps-1]
-        scale = torch.stack([px - 1.0, py - 1.0, pz - 1.0]).to(local_kp).view(1,1,1,3)
-        lk01   = (local_kp - xmin) / (xmax - xmin)         # (x,y,z) in [0,1]
-        lk_idx = lk01 * scale                               # voxel index units (x,y,z)
+    # -----------------------
+    # patcher wrappers (keep compatibility with any old calls)
+    # -----------------------
+    def img_to_patches(self, x):
+        return self.patcher.vox_to_patches(x)
 
-        origins_xyz = self.patch_origins_xyz_idx.to(local_kp).view(1, -1, 1, 3)  # (x,y,z)
-        idx_xyz = lk_idx + origins_xyz
+    def patches_to_img(self, x):
+        return self.patcher.patches_to_vox(x)
 
-        size_m1_xyz = self.size_minus1.to(local_kp).view(1,1,1,3)                # [W-1,H-1,D-1] (x,y,z)
-        g_xyz01 = idx_xyz / size_m1_xyz
-        g_xyz   = g_xyz01 * (xmax - xmin) + xmin     
-        return g_xyz
-
-    def get_patch_centers(self):
-        """
-        Returns patch centers in global kp_range coords, shape [N,3].
-        """
-        xmin, xmax = self.kp_range
-        centers = self.patch_centers_xyz_idx
-        g01 = centers / self.size_minus1  # [N,3] / [3]
-        return g01 * (xmax - xmin) + xmin
-
-    def get_distance_from_patch_centers(self, kp_global):
-        """
-        kp_global: [B,N,K,3] already in global kp_range.
-        Returns squared L2 distance to each patch center: [B,N,K]
-        """
-        centers = self.get_patch_centers().to(kp_global.device, kp_global.dtype)  # [N,3]
-        centers_b = centers.view(1, -1, 1, 3)
-        return ((kp_global - centers_b) ** 2).sum(dim=-1)
-
-    def weighted_cov_proximity(self,pts, weights, center,
-                                alpha=1.5,           # ↑ emphasize high-mass voxels
-                                tau_mode="median",   # proximity length scale
-                                tau_mult=1.0,        # ↓ smaller → more shrink
-                                lam0=1e-4,           # base ridge
-                                mass_norm=True):
-        """
-        pts: [M,3] in global [-1,1]
-        weights: [M] >=0 (voxel mass)
-        center: [3] cluster center (x,y,z)
-
-        Effective weights = mass^alpha * exp(-||x-c||^2 / tau^2)
-        tau picked per-cluster from distances (robust).
-        """
-        w = weights.clamp_min(0)
-
-        # distances to center
-        d2 = ((pts - center[None])**2).sum(dim=-1)     # [M]
-
-        # pick tau from distances
-        if tau_mode == "median":
-            tau = d2.median().sqrt() * tau_mult + 1e-9
-        elif tau_mode == "p75":
-            tau = d2.kthvalue(int(0.75*max(1, d2.numel()))).values.sqrt() * tau_mult + 1e-9
-        else:
-            tau = d2.mean().sqrt() * tau_mult + 1e-9
-
-        w_eff = (w**alpha) * torch.exp(-d2 / (tau*tau))  # [M]
-        W = w_eff.sum() + 1e-12
-
-        # weighted mean and covariance
-        mu = (w_eff[:,None] * pts).sum(dim=0) / W
-        xc = pts - mu[None]
-        cov = (w_eff[:,None,None] * (xc[:,:,None] * xc[:,None,:])).sum(dim=0) / W
-
-        # ridge scaled inversely with mass → more mass = tighter cov
-        lam = lam0 / (W.item() if mass_norm else 1.0)
-        cov = cov + torch.eye(3, device=cov.device, dtype=cov.dtype) * lam
-        return mu, cov, W
-
-    def kmeans_hard(self,x, K, init_centers=None, iters=50, tol=1e-4):
-        """
-        x: [N,3] points in (-1,1) global coords
-        K: number of clusters
-        init_centers: [M,3] optional; if provided but M!=K, reduce/expand via KMeans++
-        """
-        device = x.device
-        x = x.float()
-        if init_centers is None:
-            # KMeans++ on data
-            idx0 = torch.randint(0, x.shape[0], (1,), device=device)
-            centers = [x[idx0]]
-            while len(centers) < K:
-                C = torch.cat(centers, dim=0)  # [k,3]
-                d2 = torch.cdist(x, C, p=2).pow(2).min(dim=1).values
-                probs = d2 / (d2.sum() + 1e-9)
-                idx = torch.multinomial(probs, 1)
-                centers.append(x[idx])
-            centers = torch.cat(centers, dim=0)
-        else:
-            C0 = init_centers.float().to(device)
-            # down/up select init to exactly K
-            if C0.shape[0] != K:
-                idx0 = torch.randint(0, C0.shape[0], (1,), device=device)
-                centers = [C0[idx0]]
-                while len(centers) < K:
-                    C = torch.cat(centers, dim=0)
-                    d2 = torch.cdist(C0, C, p=2).pow(2).min(dim=1).values
-                    probs = d2 / (d2.sum() + 1e-9)
-                    idx = torch.multinomial(probs, 1)
-                    centers.append(C0[idx])
-                centers = torch.cat(centers, dim=0)
-            else:
-                centers = C0.clone()
-
-        for _ in range(iters):
-            d2 = torch.cdist(x, centers, p=2).pow(2)
-            assign = d2.argmin(dim=1)
-            new_centers = torch.zeros_like(centers)
-            for k in range(K):
-                m = (assign == k)
-                if m.any():
-                    new_centers[k] = x[m].mean(dim=0)
-                else:
-                    j = torch.randint(0, x.shape[0], (1,), device=device)
-                    new_centers[k] = x[j]
-            shift = (new_centers - centers).norm(dim=-1).mean()
-            centers = new_centers
-            if shift.item() < tol:
-                break
-        return centers
-
-    # ---------- main API ----------
     def vox_to_patches(self, x):
         return self.patcher.vox_to_patches(x)
 
     def patches_to_vox(self, x):
         return self.patcher.patches_to_vox(x)
 
-    def zyx_to_xyz(self, v):  # [...,3]
-        print("++++++++FLIPPING ZYX TO XYZ++++++++")
-        return torch.stack([v[..., 2], v[..., 1], v[..., 0]], dim=-1)
+    # -----------------------
+    # patch centers / mapping (your code expects these)
+    # -----------------------
+    def get_patch_location_idx(self):
+        return self.patcher.get_patch_location_idx()
 
-    def encode_prior(self, x, filtering_heuristic='none', k=None):
+    def get_patch_centers(self):
         """
-        x: [B, C, D, H, W]  (D=z, H=y, W=x)
+        Returns patch centers in GLOBAL kp coordinates (x,y,z) in kp_range.
+        Shape: [N, 3]
+        """
+        loc = self.patcher.get_patch_location_idx().to(torch.float32).to(next(self.parameters()).device)  # [N,3] (d,h,w)
+        mid = torch.tensor([self.patch_size // 2, self.patch_size // 2, self.patch_size // 2],
+                           device=loc.device, dtype=loc.dtype).view(1, 3)
+        centers = loc + mid  # [N,3] in voxel idx (d,h,w) = (z,y,x)
+
+        r0, r1 = self.kp_range
+        span = (r1 - r0)
+
+        zc = centers[:, 0]
+        yc = centers[:, 1]
+        xc = centers[:, 2]
+
+        xG = (xc / (self.W - 1)) * span + r0
+        yG = (yc / (self.H - 1)) * span + r0
+        zG = (zc / (self.D - 1)) * span + r0
+        out = torch.stack([xG, yG, zG], dim=-1)
+        return out.to(dtype=next(self.parameters()).dtype)
+
+    def get_global_kp(self, local_kp):
+        """
+        local_kp: [B, num_patches, n_kp, 3] in kp_range within patch
+        returns:  [B, num_patches, n_kp, 3] in kp_range within full volume
+        """
+        B, Np, nk, _ = local_kp.shape
+        r0, r1 = self.kp_range
+        span = (r1 - r0)
+
+        # patch origins in voxel idx (d,h,w) == (z,y,x)
+        off = self.patcher.get_patch_location_idx().to(local_kp.device).to(torch.float32)  # [Np,3]
+        off_d = off[:, 0].view(1, Np, 1)
+        off_h = off[:, 1].view(1, Np, 1)
+        off_w = off[:, 2].view(1, Np, 1)
+
+        xL = local_kp[..., 0]
+        yL = local_kp[..., 1]
+        zL = local_kp[..., 2]
+
+        u_w = ((xL - r0) / span) * (self.patch_size - 1)
+        u_h = ((yL - r0) / span) * (self.patch_size - 1)
+        u_d = ((zL - r0) / span) * (self.patch_size - 1)
+
+        U_w = u_w + off_w
+        U_h = u_h + off_h
+        U_d = u_d + off_d
+
+        xG = (U_w / (self.W - 1)) * span + r0
+        yG = (U_h / (self.H - 1)) * span + r0
+        zG = (U_d / (self.D - 1)) * span + r0
+        return torch.stack([xG, yG, zG], dim=-1)
+
+    def get_distance_from_patch_centers(self, kp, global_kp=False):
+        """
+        kp: if global_kp=False: [B, num_patches, n_kp, 3] local
+            if global_kp=True:  [B, Ntot, 3] global
+        returns squared distance to its patch center (or nearest center if flattened)
+        """
+        if not global_kp:
+            kp_g = self.get_global_kp(kp)  # [B,Np,nk,3]
+            centers = self.get_patch_centers().to(kp_g.device).view(1, -1, 1, 3)  # [1,Np,1,3]
+            return ((kp_g - centers) ** 2).sum(-1)  # [B,Np,nk]
+        else:
+            # flattened case: distance to nearest patch center
+            centers = self.get_patch_centers().to(kp.device)  # [Np,3]
+            d2 = torch.cdist(kp, centers.unsqueeze(0).expand(kp.shape[0], -1, -1)).pow(2)  # [B,Ntot,Np]
+            return d2.min(dim=-1).values  # [B,Ntot]
+
+    # -----------------------
+    # SSM raw heatmap builder (only used in ssm_raw)
+    # -----------------------
+    def build_raw_heatmap(self, x_patch_bn):
+        """
+        x_patch_bn: [B*Np, C, ps, ps, ps]
+        returns:    [B*Np, n_kp, ps, ps, ps]
+        """
+        if self.raw_head is not None:
+            return self.raw_head(x_patch_bn)
+
+        if x_patch_bn.shape[1] >= 3:
+            rgb = x_patch_bn[:, :3]
+            if rgb.min() < 0:
+                rgb = (rgb + 1.0) * 0.5
+            rgb = rgb.clamp(0, 1)
+
+            if self.raw_heatmap_mode == "luma":
+                heat = 0.2989 * rgb[:, 0] + 0.5870 * rgb[:, 1] + 0.1140 * rgb[:, 2]
+            elif self.raw_heatmap_mode == "rgb_norm":
+                heat = torch.linalg.norm(rgb, dim=1)
+            else:  # "channel0"
+                heat = x_patch_bn[:, 0]
+        else:
+            heat = x_patch_bn[:, 0]
+
+        heat = heat.unsqueeze(1)  # [B*Np,1,ps,ps,ps]
+        if self.n_kp > 1:
+            heat = heat.repeat(1, self.n_kp, 1, 1, 1)
+        return heat
+
+    # -----------------------
+    # kmeans helpers (same as your earlier snippet)
+    # -----------------------
+    def srgb_to_linear(self, u):
+        a = 0.055
+        return torch.where(u <= 0.04045, u / 12.92, ((u + a) / (1 + a)).pow(2.4))
+
+    def rgb_to_xyz(self, rgb_lin):
+        M = self.SRGB2XYZ.to(rgb_lin.device, rgb_lin.dtype)
+        return torch.einsum("cd, b d... -> b c...", M, rgb_lin)
+
+    def xyz_to_lab(self, xyz, eps=1e-9):
+        Xn, Yn, Zn = self.D65_WHITE.to(xyz.device, xyz.dtype).unbind(0)
+        x = xyz[:, 0] / (Xn + eps); y = xyz[:, 1] / (Yn + eps); z = xyz[:, 2] / (Zn + eps)
+        def f(t): return torch.where(t > self.LAB_EPS, t.pow(1/3), self.LAB_K * t + self.LAB_C)
+        fx, fy, fz = f(x), f(y), f(z)
+        L = 116.0 * fy - 16.0
+        a = 500.0 * (fx - fy)
+        b = 200.0 * (fy - fz)
+        return torch.stack([L, a, b], dim=1)
+
+    def rgb_to_lab_srgb(self, rgb01):
+        rgb_lin = self.srgb_to_linear(rgb01.clamp(0, 1))
+        return self.xyz_to_lab(self.rgb_to_xyz(rgb_lin))
+
+    def rgb_to_ilr2(self, rgb01, eps=1e-6):
+        R, G, B = rgb01[:, 0].clamp_min(0.0), rgb01[:, 1].clamp_min(0.0), rgb01[:, 2].clamp_min(0.0)
+        S = (R + G + B).clamp_min(eps)
+        r, g, b = R / S, G / S, B / S
+        u1 = self.ILR_S1 * (torch.log(r + eps) - torch.log(g + eps))
+        u2 = self.ILR_S2 * (torch.log(r + eps) + torch.log(g + eps) - 2.0 * torch.log(b + eps))
+        return torch.stack([u1, u2], dim=1)
+
+    def whiten(self, X, eps=1e-6):
+        mu = X.mean(dim=0, keepdim=True)
+        sd = X.std(dim=0, keepdim=True).clamp_min(eps)
+        return (X - mu) / sd
+
+    def build_xyz_grid(self, D, H, W, device, dtype):
+        z = torch.linspace(-1, 1, steps=D, device=device, dtype=dtype)
+        y = torch.linspace(-1, 1, steps=H, device=device, dtype=dtype)
+        x = torch.linspace(-1, 1, steps=W, device=device, dtype=dtype)
+        Z, Y, X = torch.meshgrid(z, y, x, indexing="ij")
+        return torch.stack([X, Y, Z], dim=0)  # [3,D,H,W]
+
+    def kmeans_hard_feat(self, X, K, iters=30, tol=1e-4):
+        device = X.device
+        N = X.shape[0]
+        i0 = torch.randint(0, N, (1,), device=device)
+        C = X[i0].clone()
+        while C.shape[0] < K:
+            d2 = torch.cdist(X, C).pow(2).min(dim=1).values
+            probs = (d2 + 1e-12) / (d2.sum() + 1e-12)
+            i = torch.multinomial(probs, 1)
+            C = torch.cat([C, X[i]], dim=0)
+        for _ in range(iters):
+            d2 = torch.cdist(X, C).pow(2)
+            A = d2.argmin(dim=1)
+            Cn = torch.stack([X[A == k].mean(dim=0) if (A == k).any() else C[k] for k in range(K)], dim=0)
+            shift = (Cn - C).norm(dim=1).mean()
+            C = Cn
+            if shift < tol:
+                break
+        A = torch.cdist(X, C).pow(2).argmin(dim=1)
+        return C, A
+
+    @torch.no_grad()
+    def encode_prior_kmeans(self, x, k=None):
+        """
+        x: [B,C,D,H,W] expects RGB in x[:,:3]
+        returns kp [B,K,3] and cov [B,K,3,3]
         """
         B, C, D, H, W = x.shape
-        assert (D, H, W) == self.volume_size, f"got {(D,H,W)}, expected {self.volume_size}"
+        device, dtype = x.device, x.dtype
 
-        # patchify (DHW) -> [B, C, N, pd, ph, pw]
-        patches = self.vox_to_patches(x)                          # DHW patcher
-        patches = patches.permute(0, 2, 1, 3, 4, 5).contiguous()  # [B, N, C, pd, ph, pw]
-        N = patches.shape[1]
-        pd, ph, pw = self.patcher.pd, self.patcher.ph, self.patcher.pw
+        RGB = x[:, :3]
+        if RGB.min() < 0:
+            RGB = (RGB + 1.0) * 0.5
+        RGB = RGB.clamp(0, 1)
 
-        # if self.kp_mode == "kmeans":
-        if True:
-            kp, cov, meta = self.rgb_km(x, centers_init_global=self.get_patch_centers().to(x))
-            return kp, cov
+        feat = self.rgb_to_lab_srgb(RGB)  # [B,3,D,H,W]
+        XYZ = self.build_xyz_grid(D, H, W, device, dtype).unsqueeze(0).expand(B, -1, -1, -1, -1)
+        feat = torch.cat([feat, XYZ], dim=1)  # [B,6,D,H,W]
 
+        sal = feat[:, 0]  # L*
 
-        # encode
-        patches_bn = patches.view(-1, C, pd, ph, pw)              # [B*N, C, pd, ph, pw]
-        print("PATCHES BN: ", patches_bn.shape)
-        enc_out = self.enc(patches_bn)                            # -> [B*N, K, pd, ph, pw]
-        print("ENCODER OUT: ", enc_out.shape)
-        z = enc_out[1] if isinstance(enc_out, tuple) else enc_out
-        assert z.dim() == 5 and z.shape[1] == self.n_kp, f"expected [B*, {self.n_kp}, Dp, Hp, Wp], got {z.shape}"
+        xyz_flat = self.build_xyz_grid(D, H, W, device, dtype).view(3, -1)  # [3,DHW]
 
-        kp_local, cov_local = self.ssm(z, probs=False, variance=True)  # [B*N,K,3], [B*N,K,3,3]
-        kp_local  = kp_local.view(B, N, self.n_kp, 3)                  # (x,y,z) in patch-normalized coords
-        cov_local = cov_local.view(B, N, self.n_kp, 3, 3)
+        K = self.n_kp_prior if k is None else min(int(k), self.n_kp_total)
+        out_centers, out_covs = [], []
 
-        kp_global = self.get_global_kp(kp_local)                       # [B,N,K,3]  (x,y,z) in global kp_range
-        cov_global = cov_local                                         # (optionally rescale to global units)
-        kp_global_xyz = self.zyx_to_xyz(kp_global)                     # convert to (z,y,x) for output
-        print("FILTERING HEURISTIC: ", filtering_heuristic)
-        # ---- filtering ----
-        if filtering_heuristic == 'distance':
-            scores = self.get_distance_from_patch_centers(kp_global)       # [B,N,K]
-            scores = scores.view(B, -1)
-            M = scores.shape[1]
-            k_keep = min(k if k is not None else self.n_kp_prior, M)
-            _, idx = torch.topk(scores, k=k_keep, dim=-1, largest=True)    # farthest
-        elif filtering_heuristic == 'variance':
-            tr = cov_global[..., 0, 0] + cov_global[..., 1, 1] + cov_global[..., 2, 2]
-            scores = tr.view(B, -1)
-            M = scores.shape[1]
-            k_keep = min(k if k is not None else self.n_kp_prior, M)
-            _, idx = torch.topk(scores, k=k_keep, dim=-1, largest=False)   # smallest var
-        elif filtering_heuristic == 'random':
-            kp_flat = kp_global.view(B, -1, 3)
-            M = kp_flat.shape[1]
-            k_keep = min(k if k is not None else self.n_kp_prior, M)
-            idx = torch.rand(B, M, device=x.device).argsort(dim=-1)[:, :k_keep]
-            b = torch.arange(B, device=x.device)[:, None]
-            return kp_flat[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
+        for b in range(B):
+            vals = sal[b].reshape(-1)
+            k_keep = min(self.keep_top, vals.numel())
+            top = torch.topk(vals, k=k_keep, largest=True, sorted=False)
+            flat_idx = top.indices
+            wts = top.values.clamp_min(0)
+
+            Cf = feat.shape[1]
+            feat_flat = feat[b].view(Cf, -1)[:, flat_idx].t()  # [k_keep,Cf]
+            X = self.whiten(feat_flat)
+
+            probs = (wts + 1e-9) / (wts.sum() + 1e-9)
+            m = min(self.sample_m, X.shape[0])
+            sel = torch.multinomial(probs, num_samples=m, replacement=True)
+            X_sub = X[sel]
+
+            C_feat, _ = self.kmeans_hard_feat(X_sub, K, iters=self.iters, tol=self.tol)
+
+            d2 = torch.cdist(X, C_feat).pow(2)
+            assign = d2.argmin(dim=1)
+
+            pts_xyz = xyz_flat[:, flat_idx].t()  # [k_keep,3] (x,y,z)
+
+            centers_b, covs_b = [], []
+            for k_id in range(K):
+                msk = (assign == k_id)
+                if not msk.any():
+                    centers_b.append(pts_xyz.mean(dim=0))
+                    covs_b.append(torch.eye(3, device=device, dtype=dtype) * self.ridge)
+                    continue
+
+                pts_k = pts_xyz[msk]
+                wk = wts[msk]
+                Wsum = wk.sum() + 1e-12
+                mu = (wk[:, None] * pts_k).sum(dim=0) / Wsum
+                xc = pts_k - mu[None]
+                cov = (wk[:, None, None] * (xc[:, :, None] * xc[:, None, :])).sum(dim=0) / Wsum
+                cov = cov + torch.eye(3, device=device, dtype=dtype) * (self.ridge / Wsum)
+
+                centers_b.append(mu)
+                covs_b.append(cov)
+
+            out_centers.append(torch.stack(centers_b, dim=0))  # [K,3]
+            out_covs.append(torch.stack(covs_b, dim=0))        # [K,3,3]
+
+        kp = torch.stack(out_centers, dim=0)  # [B,K,3]
+        cov = torch.stack(out_covs, dim=0)    # [B,K,3,3]
+        return kp, cov
+
+    # -----------------------
+    # encode_prior (ONLY place where behavior changes by mode)
+    # -----------------------
+    def encode_prior(self, x, filtering_heuristic="none", k=None):
+        """
+        x: [B, cdim, D, H, W]
+        returns:
+          kp_p  [B, K, 3]  global kp_range
+          var_kp [B, K, 3, 3] (cov)  (kept as full cov in 3D)
+        """
+        B, cdim, D, H, W = x.shape
+        assert cdim == self.cdim, f"cdim mismatch: {cdim} vs {self.cdim}"
+
+        if filtering_heuristic is None:
+            filtering_heuristic = self.filtering_heuristic
+        if k is None:
+            k = self.n_kp_prior
+
+        # ---- MODE 1: kmeans (global proposals, already global coords) ----
+        if self.prior_mode == "kmeans":
+            kp_p, cov_p = self.encode_prior_kmeans(x, k=k)  # [B,k,3], [B,k,3,3]
+            return kp_p, cov_p
+
+        # ---- Patchify like original ----
+        x_patches = self.vox_to_patches(x)  # [B, cdim, num_patches, ps, ps, ps]
+        x_patches = x_patches.permute(0, 2, 1, 3, 4, 5).contiguous()  # [B, Np, cdim, ps, ps, ps]
+        x_patches = x_patches.view(-1, cdim, self.patch_size, self.patch_size, self.patch_size)  # [B*Np, cdim, ps,ps,ps]
+
+        # ---- MODE 2: ssm_raw (no encoder) ----
+        if self.prior_mode == "ssm_raw":
+            z = self.build_raw_heatmap(x_patches)  # [B*Np, n_kp, ps,ps,ps]
+        # ---- MODE 3: ssm_enc (original) ----
         else:
-            # none: return all
-            kp_global_xyz = self.zyx_to_xyz(kp_global) 
-            return kp_global_xyz.view(B, -1, 3), cov_global.view(B, -1, 3, 3)
+            enc_out = self.enc(x_patches)  # keep your Encoder object intact
+            z = enc_out[1] if isinstance(enc_out, tuple) else enc_out  # [B*Np, n_kp, fD,fH,fW]
 
-        # gather filtered
-        b = torch.arange(B, device=x.device)[:, None]
-        return kp_global_xyz.view(B, -1, 3)[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
+        # SSM (patch-local)
+        kp_l, cov_l = self.ssm(z, probs=False, variance=True)  # kp:[B*Np,n_kp,3], cov:[B*Np,n_kp,3,3]
+
+        # reshape back to [B, Np, n_kp, ...]
+        Np = self.num_patches
+        kp_l = kp_l.view(B, Np, self.n_kp, 3)
+        cov_l = cov_l.view(B, Np, self.n_kp, 3, 3)
+
+        # local -> global kp
+        kp_g = self.get_global_kp(kp_l)  # [B,Np,n_kp,3] global in kp_range
+
+        # scale covariance from patch coords -> global coords (diagonal scaling)
+        sx = (self.patch_size - 1) / (self.W - 1)
+        sy = (self.patch_size - 1) / (self.H - 1)
+        sz = (self.patch_size - 1) / (self.D - 1)
+        S = torch.diag(torch.tensor([sx, sy, sz], device=cov_l.device, dtype=cov_l.dtype))  # [3,3]
+        cov_g = S @ cov_l @ S.t()
+
+        # flatten proposals
+        kp_p = kp_g.view(B, -1, 3)          # [B, Np*n_kp, 3]
+        var_kp = cov_g.view(B, -1, 3, 3)    # [B, Np*n_kp, 3, 3]
+
+        # filtering to k
+        if filtering_heuristic == "none":
+            return kp_p[:, :k], var_kp[:, :k]
+
+        if filtering_heuristic == "random":
+            idx = torch.stack([torch.randperm(kp_p.shape[1], device=kp_p.device)[:k] for _ in range(B)], dim=0)
+            bidx = torch.arange(B, device=kp_p.device)[:, None]
+            return kp_p[bidx, idx], var_kp[bidx, idx]
+
+        if filtering_heuristic == "variance":
+            # smallest trace = most peaked
+            score = var_kp.diagonal(dim1=-2, dim2=-1).sum(-1)  # [B,Ntot]
+            idx = torch.topk(score, k=k, dim=-1, largest=False).indices
+            bidx = torch.arange(B, device=kp_p.device)[:, None]
+            return kp_p[bidx, idx], var_kp[bidx, idx]
+
+        if filtering_heuristic == "distance":
+            # prefer KPs far from their patch centers
+            d2 = self.get_distance_from_patch_centers(kp_p, global_kp=True)  # [B,Ntot]
+            idx = torch.topk(d2, k=k, dim=-1, largest=True).indices
+            bidx = torch.arange(B, device=kp_p.device)[:, None]
+            return kp_p[bidx, idx], var_kp[bidx, idx]
+
+        # fallback
+        return kp_p[:, :k], var_kp[:, :k]
 
     def forward(self, x):
-        return self.encode_prior(x, filtering_heuristic=self.filtering_heuristic)
-
-
+        kp_p, var_kp = self.encode_prior(x, filtering_heuristic=self.filtering_heuristic, k=self.n_kp_prior)
+        return kp_p, var_kp
 
 class ParticleInteractionEncoder(nn.Module):
     def __init__(self, n_kp_enc, dropout=0.0, learned_feature_dim=16, learned_bg_feature_dim=16, embed_init_std=0.2,
