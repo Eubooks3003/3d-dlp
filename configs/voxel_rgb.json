@@ -100,7 +100,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "ablation-patch_size_4",
+  "run_prefix": "voxel_rgb_shapes",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
@@ -117,5 +117,6 @@
   "fg_weight": 5.0,
   "bg_weight": 0.1,
   "debug_stats": true,
-  "debug_every": 200
+  "debug_every": 200,
+  "lambda_color": 500.0
 }

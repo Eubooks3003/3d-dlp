@@ -3780,7 +3780,7 @@ class DLPPrior(nn.Module):
         init_conv_fg_std=0.02,
 
         # ---- NEW: only affects forward/encode_prior ----
-        prior_mode="ssm_enc",          # "kmeans" | "ssm_raw" | "ssm_enc"
+        prior_mode="kmeans",          # "kmeans" | "ssm_raw" | "ssm_enc"
         raw_heatmap_mode="luma",       # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
 
         **kwargs,
