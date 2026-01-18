@@ -214,14 +214,17 @@ def debug_visualize_tasks(
     voxel_mode="avg_rgb",
     include_rgb=True,
     normalize_to_unit_cube=True,
-    output_dir="debug_voxel_output",
+    wandb_project="mimicgen-voxel-debug",
 ):
-    """Debug mode: voxelize one frame per task and save visualizations."""
-    import plotly.graph_objects as go
+    """Debug mode: voxelize one frame per task and log to wandb."""
+    import wandb
+    from eval.eval_vox import log_rgb_voxels
 
-    os.makedirs(output_dir, exist_ok=True)
+    # Initialize wandb
+    wandb.init(project=wandb_project, name=f"debug-voxels-{len(tasks)}-tasks")
+    print(f"[debug] Logging to wandb project: {wandb_project}")
 
-    for task in tasks:
+    for step, task in enumerate(tasks):
         files = get_task_files(root, task)
         if len(files) == 0:
             print(f"[{task}] No files found, skipping.")
@@ -242,7 +245,7 @@ def debug_visualize_tasks(
         pts_xyz = safe_tensor(pts[:, :3])
         colors = safe_tensor(pts[:, 3:6]) if (pts.shape[-1] >= 6 and voxel_mode == "avg_rgb") else None
 
-        # Compute bounds from this single frame (or use fixed [-1,1])
+        # Compute bounds from this single frame
         pmin = pts_xyz.amin(dim=0)
         pmax = pts_xyz.amax(dim=0)
         bounds = (pmin, pmax)
@@ -253,109 +256,23 @@ def debug_visualize_tasks(
         vox = vg.to_dense()  # [C, D, H, W]
         print(f"  Voxel shape: {vox.shape}, non-zero: {(vox.abs().sum(dim=0) > 0).sum().item()}")
 
-        # Create plotly visualization
-        fig = _create_voxel_plot(vox, task, voxel_mode)
-
-        # Save as HTML (interactive)
-        html_path = os.path.join(output_dir, f"{task}_voxel.html")
-        fig.write_html(html_path)
-        print(f"  Saved: {html_path}")
-
-        # Also save as PNG
-        try:
-            png_path = os.path.join(output_dir, f"{task}_voxel.png")
-            fig.write_image(png_path, width=800, height=800)
-            print(f"  Saved: {png_path}")
-        except Exception as e:
-            print(f"  (PNG export failed: {e}, install kaleido for PNG support)")
-
-    print(f"\nDebug visualizations saved to: {output_dir}/")
-
-
-def _create_voxel_plot(vox, task_name, voxel_mode, topk=60000, rgb_thresh=0.10):
-    """Create a plotly 3D scatter plot of voxels."""
-    import plotly.graph_objects as go
-
-    C, D, H, W = vox.shape
-
-    if voxel_mode == "avg_rgb" and C == 3:
-        # RGB mode
-        RGB = vox
-        mag = torch.sqrt((RGB ** 2).sum(dim=0))  # [D,H,W]
-        mask = mag >= rgb_thresh
-    else:
-        # Occupancy/density mode
-        mask = vox[0] > 0
-
-    idx = mask.nonzero(as_tuple=False)  # [N, 3] -> z, y, x
-    if idx.numel() == 0:
-        print(f"  Warning: No voxels above threshold!")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter3d(x=[], y=[], z=[], mode="markers", name="RGB voxels"))
-        return fig
-
-    # Subsample if too many
-    if idx.shape[0] > topk:
-        if voxel_mode == "avg_rgb" and C == 3:
-            score = mag[idx[:, 0], idx[:, 1], idx[:, 2]]
-        else:
-            score = vox[0, idx[:, 0], idx[:, 1], idx[:, 2]]
-        sel = torch.topk(score, k=topk, largest=True).indices
-        idx = idx[sel]
-
-    z_i, y_i, x_i = idx[:, 0], idx[:, 1], idx[:, 2]
-
-    if voxel_mode == "avg_rgb" and C == 3:
-        r = vox[0, z_i, y_i, x_i]
-        g = vox[1, z_i, y_i, x_i]
-        b = vox[2, z_i, y_i, x_i]
-
-        # Clamp to [0, 1]
-        r = r.clamp(0, 1)
-        g = g.clamp(0, 1)
-        b = b.clamp(0, 1)
-
-        Rv = (r * 255).to(torch.uint8)
-        Gv = (g * 255).to(torch.uint8)
-        Bv = (b * 255).to(torch.uint8)
-
-        Rl = Rv.tolist()
-        Gl = Gv.tolist()
-        Bl = Bv.tolist()
-
-        color_rgba = [f"rgb({Rl[k]},{Gl[k]},{Bl[k]})" for k in range(len(Rl))]
-    else:
-        # Grayscale for occupancy/density
-        vals = vox[0, z_i, y_i, x_i].clamp(0, 1)
-        Vl = (vals * 255).to(torch.uint8).tolist()
-        color_rgba = [f"rgb({v},{v},{v})" for v in Vl]
-
-    x_f = x_i.float().tolist()
-    y_f = y_i.float().tolist()
-    z_f = z_i.float().tolist()
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter3d(
-            x=x_f, y=y_f, z=z_f,
-            mode="markers",
-            marker=dict(size=2, color=color_rgba),
-            name="Voxels",
+        # Log to wandb using log_rgb_voxels
+        log_rgb_voxels(
+            name=f"debug/{task}",
+            rgb_vol=vox,
+            alpha_vol=None,
+            KPx=None,
+            step=step,
+            mode="splat",
+            topk=60000,
+            alpha_thresh=0.05,
+            pad=2.0,
+            show_axes=True,
         )
-    )
+        print(f"  Logged to wandb: debug/{task}")
 
-    fig.update_layout(
-        title=f"{task_name} - {voxel_mode} voxels ({len(x_f)} points)",
-        scene=dict(
-            xaxis_title="X (W)",
-            yaxis_title="Y (H)",
-            zaxis_title="Z (D)",
-            aspectmode="data",
-        ),
-        margin=dict(l=0, r=0, t=40, b=0),
-    )
-
-    return fig
+    wandb.finish()
+    print("\n[debug] Done! Check wandb for visualizations.")
 
 
 def main():
@@ -378,9 +295,9 @@ def main():
     parser.add_argument("--no_normalize", action="store_true",
                         help="Don't normalize to unit cube")
     parser.add_argument("--debug", action="store_true",
-                        help="Debug mode: voxelize one frame per task and save visualizations")
-    parser.add_argument("--debug_output", type=str, default="debug_voxel_output",
-                        help="Output directory for debug visualizations (default: debug_voxel_output)")
+                        help="Debug mode: voxelize one frame per task and log to wandb")
+    parser.add_argument("--wandb_project", type=str, default="mimicgen-voxel-debug",
+                        help="Wandb project for debug visualizations (default: mimicgen-voxel-debug)")
 
     args = parser.parse_args()
 
@@ -405,7 +322,7 @@ def main():
             voxel_mode=args.voxel_mode,
             include_rgb=not args.no_rgb,
             normalize_to_unit_cube=not args.no_normalize,
-            output_dir=args.debug_output,
+            wandb_project=args.wandb_project,
         )
         return
 
