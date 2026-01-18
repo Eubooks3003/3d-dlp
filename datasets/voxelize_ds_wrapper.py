@@ -137,7 +137,8 @@ class VoxelizedDataset(Dataset):
                  device: Optional[torch.device] = None,
                  cache_dir: Optional[str] = None,
                  cache_extras: bool = False,
-                 force_rebuild: bool = False):
+                 force_rebuild: bool = False,
+                 max_items: Optional[int] = None):
        # --- inside VoxelizedDataset.__init__ ---
 
         self.base_ds = base_ds
@@ -147,6 +148,7 @@ class VoxelizedDataset(Dataset):
         self.device = device or torch.device("cpu")
         self.cache_dir = cache_dir
         self.cache_extras = bool(cache_extras)
+        self.max_items = max_items  # None means no limit
 
         # Prepare manifest path (if any)
         mani_path = os.path.join(self.cache_dir, "manifest.json") if self.cache_dir else None
@@ -299,7 +301,10 @@ class VoxelizedDataset(Dataset):
 
     # ---------- Dataset API ----------
     def __len__(self):
-        return len(self.base_ds)
+        base_len = len(self.base_ds)
+        if self.max_items is not None:
+            return min(base_len, self.max_items)
+        return base_len
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Lazy load (separate run)

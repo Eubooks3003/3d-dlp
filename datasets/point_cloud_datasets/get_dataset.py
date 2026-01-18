@@ -25,6 +25,7 @@ def get_point_cloud_dataset(
     cache_dir: str = None,        # optional on-disk cache for voxelization
     cache_extras: bool = False,
     force_rebuild: bool = False,
+    max_items: Optional[int] = None,     # max items to read from cache (None = no limit)
     device=None,
     # --- mimicgen multi-task specific ---
     tasks: Optional[List[str]] = None,   # for mimicgen: list of task names or None for auto-discover
@@ -67,6 +68,7 @@ def get_point_cloud_dataset(
                 cache_dir=cache_dir,
                 cache_extras=cache_extras,
                 force_rebuild=force_rebuild,
+                max_items=max_items,
             )
         return base
 
@@ -109,6 +111,7 @@ def get_point_cloud_dataset(
                 cache_dir=cache_dir,
                 cache_extras=cache_extras,
                 force_rebuild=force_rebuild,
+                max_items=max_items,
             )
         return base
 
@@ -143,6 +146,7 @@ def get_point_cloud_dataset(
                 cache_dir=cache_dir,
                 cache_extras=cache_extras,
                 force_rebuild=force_rebuild,
+                max_items=max_items,
             )
         return base
 
