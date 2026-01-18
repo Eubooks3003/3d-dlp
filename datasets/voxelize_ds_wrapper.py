@@ -77,7 +77,12 @@ class VoxelGridXYZ:
             acc = torch.zeros(1, self.D, self.H, self.W, device=self.device, dtype=self.dtype)
             for c in range(3):
                 self.grid[c].index_put_((iz, iy, ix), colors[:, c].to(self.dtype), accumulate=True)
-            acc.index_put_((iz, iy, ix), torch.ones_like(iz, dtype=self.dtype), accumulate=True)
+            acc.index_put_(
+                (torch.zeros_like(iz), iz, iy, ix),
+                torch.ones_like(iz, dtype=self.dtype),
+                accumulate=True
+            )
+
             self.grid = torch.where(acc > 0, self.grid / acc, self.grid)
 
         self.mode = mode

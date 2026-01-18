@@ -6478,7 +6478,8 @@ class DLPDecoder(nn.Module):
             obj_on         = obj_on.view(-1, *obj_on.shape[2:])
             z_depth        = z_depth.view(-1, *z_depth.shape[2:])
             z_features     = z_features.view(-1, *z_features.shape[2:])
-            z_bg_features  = z_bg_features.view(-1, *z_bg_features.shape[2:])
+            if z_bg_features is not None:
+                z_bg_features  = z_bg_features.view(-1, *z_bg_features.shape[2:])
             if z_ctx is not None:
                 z_ctx = z_ctx.view(-1, *z_ctx.shape[2:])
         else:
@@ -6532,7 +6533,17 @@ class DLPDecoder(nn.Module):
             z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale, z_ctx=z_ctx
         )
 
-        bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C_bg, *spatial*]
+        if z_bg_features is None:
+            # spatial shape should match dec_objects_trans, e.g. [B,3,D,H,W] or [B,3,H,W]
+            spatial = dec_objects_trans.shape[2:]
+            B = dec_objects_trans.shape[0]
+
+            # pick C_bg = 4 if you want optional bg depth channel available
+            C_bg = 4 if dec_depth_trans is not None else 3
+            bg_rec = dec_objects_trans.new_zeros((B, C_bg, *spatial))
+        else:
+            bg_rec = self.bg_dec(z_bg_features, z_ctx)
+
 
         C_bg   = bg_rec.shape[1]
 
@@ -6566,24 +6577,6 @@ class DLPDecoder(nn.Module):
             #     tensor_stats("BG_MASK", bg_mask)
 
             # tensor_stats("REC_RGB (final)", rec_rgb)
-
-            # channel correlations on final reconstruction
-            Bf, Cf, Df, Hf, Wf = rec_rgb.shape
-            if Cf >= 3:
-                rec_flat = rec_rgb.view(Bf, Cf, -1)
-                r = rec_flat[:, 0].reshape(-1)
-                g = rec_flat[:, 1].reshape(-1)
-                b = rec_flat[:, 2].reshape(-1)
-
-                def corr(a, b):
-                    a = (a - a.mean()) / (a.std() + 1e-6)
-                    b = (b - b.mean()) / (b.std() + 1e-6)
-                    return (a * b).mean().item()
-
-                # print("[REC_RGB] corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
-                #     corr(r, g), corr(r, b), corr(g, b)
-                # ))
-
         rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
 
         return {

@@ -910,6 +910,7 @@ class DLP(nn.Module):
         dec_dict['dec_objects_trans']       = dec_objects_trans
         dec_dict['dec_objects_original_rgb']= dec_objects_rgb
         dec_dict['rgb_obj'] = rgb_obj
+        dec_dict['rec'] = rec
 
 
         return dec_dict

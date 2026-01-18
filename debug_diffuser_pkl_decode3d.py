@@ -363,6 +363,7 @@ def make_iso_sweep() -> List[float]:
 # ------------------------------- main -------------------------------
 
 def main():
+    import torch
     ap = argparse.ArgumentParser("Debug a trained Voxel DLP checkpoint with the same voxel eval as training.")
     ap.add_argument("--config", "-c", type=str, required=True, help="Path to config JSON (same used for training).")
     ap.add_argument("--run-dir", type=str, required=True, help="Directory containing checkpoints (e.g., ./logs/.../saves).")
@@ -447,182 +448,52 @@ def main():
     iso_sweep = make_iso_sweep()
 
     with torch.no_grad():
-        for batch in loader:
-            batch = to_device(batch, device)
-            # training fed: vox = batch["voxels"]
-            vox  = batch["voxels"]  # [B, C, D, H, W] or [B, D, H, W] depending on your wrapper
-            # forward (no loss)
-            model_output = model(vox, warmup=False, with_loss=False)
+        import pickle, torch
 
-            gt_vol = model_output['x'][0]
-            rec_vol = model_output['rec'][0]
-            print_vol_stats("GT", gt_vol)
-            print_vol_stats("REC", rec_vol)
+        pkl_path = "ecdiffuser_data/stack_replay_buffer_dlp_overfit.pkl"
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
 
+        obs = torch.from_numpy(data["observations"]).float().to(device)   # [E,T,K,Dtok]
+        x = obs[0, 0].unsqueeze(0)                                       # [1,K,Dtok]
 
+        z       = x[..., 0:3].unsqueeze(1)   # [1,1,K,3]
+        z_scale = x[..., 3:6].unsqueeze(1)   # [1,1,K,3]
+        z_depth = x[..., 6:7].unsqueeze(1)   # [1,1,K,1]
+        obj_on  = x[..., 7:8].unsqueeze(1)   # [1,1,K,1]
+        z_feat  = x[..., 8: ].unsqueeze(1)   # [1,1,K,F]
 
-            # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
-            kp_xyz = model_output.get('kp_p', None)
-            with torch.no_grad():
-                # z_base_var: [B,K,6], mu_tot: [B,K,3], obj_on: [B,K,1]
-                out = filter_topk_kps_3d(
-                    z_base_var=model_output["z_base_var"],
-                    mu_tot=model_output["z_base"] + model_output["mu_offset"],
-                    topk=cfg['topk'],
-                    obj_on=model_output.get("obj_on", None),
-                    use_posterior_in_score=False  # set True to include posterior uncertainty
-                )
-                indices  = out["indices"]
-                topk_kp  = out["topk_kp"]
-                bb_scores= out["bb_scores"]
-            
-            print("bb scores: ", bb_scores)
-            b0 = 0  # first in batch
-            topk_kp_b0 = topk_kp[b0]  # [k, 3]
-            cov_b0 = model_output["cov_kp"][b0]  # [K, 6]
+        dec = model.decode_all(z, z_scale, z_feat, obj_on, z_depth, None, None, warmup=False)
 
-            z_base_cov_b0 = model_output["z_base_cov"][b0]  # [K, 6]
-
-            z_base_b0 = model_output["z_base"][b0]  # [K, 3]
-            mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
-
-            kp_order = ("x","y","z")  # your kp_xyz is in (x,y,z) order
-
-            # REC LOGGING
-            log_rgb_voxels(
-                name="rec/rgb_splat_kp",
-                rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=mu_tot_b0,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="rec/rgb_splat",
-                rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="rec/rgb_splat_no_offset",
-                rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=z_base_b0,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+        rec_rgb = dec["rec_rgb"][0]
+        fg_only = dec["dec_objects_trans"][0]   # <-- same as your working path
 
 
-            rec_rgb = model_output['rec_rgb'][0]                  # composite you use now
-            fg_only = model_output['dec_objects'][0]        # dec_rgb_comp
-            bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[0]
+        log_rgb_voxels(
+            name="debug/fg_only_dec",
+            rgb_vol=fg_only,
+            alpha_vol=None,          # None if you don’t have GT α
+            KPx=None,
+            step=step,
+            mode="splat",
+            topk=60000,
+            alpha_thresh=0.05,
+            pad=2.0,
+            show_axes=True,
+        )
 
-            print("fg only: ", fg_only.shape)
-            log_rgb_voxels(
-                name="debug/rec_rgb",
-                rgb_vol=rec_rgb,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=None,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="debug/fg_only",
-                rgb_vol=fg_only,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=None,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="debug/bg_only",
-                rgb_vol=bg_only,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=None,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            # Decode all
-
-            z = model_output['z']
-            z_scale = model_output['z_scale']
-            z_depth = model_output['z_depth']
-            obj_on = model_output['obj_on']
-            z_feat = model_output['z_features']
-
-            print("z shape: ", z.shape)
-            print("z_scale shape: ", z_scale.shape)
-            print("z_depth shape: ", z_depth.shape)
-            print("obj_on shape: ", obj_on.shape)
-            print("z_feat shape: ", z_feat.shape)
-
-            z_bg = None
-            dec = model.decode_all(z, z_scale, z_feat, obj_on, z_depth, z_bg, None, warmup=False)
-
-            rec_rgb_dec = dec['rec_rgb'][0]
-            fg_only_dec = dec['dec_objects_trans'][0]
-
-            print("fg only dec: ", fg_only_dec.shape)
-
-
-            log_rgb_voxels(
-                name="debug/rec_rgb_dec",
-                rgb_vol=rec_rgb_dec,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=None,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="debug/fg_only_dec",
-                rgb_vol=fg_only_dec,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=None,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-            step += 1
-            if step >= max_batches:
-                break
+        log_rgb_voxels(
+            name="debug/rec_rgb_dec",
+            rgb_vol=rec_rgb,
+            alpha_vol=None,          # None if you don’t have GT α
+            KPx=None,
+            step=step,
+            mode="splat",
+            topk=60000,
+            alpha_thresh=0.05,
+            pad=2.0,
+            show_axes=True,
+        )
 
     print("[done] voxel debug pass complete.")
     if args.wandb:
