@@ -241,7 +241,8 @@ class MimicGenMultiTaskDataset(Dataset):
 
         pts = self._downsample(pts)
 
-        pts_t = torch.from_numpy(pts).float()
+        # Avoid torch.from_numpy() for AARCH compatibility
+        pts_t = torch.tensor(pts.tolist(), dtype=torch.float32)
         sample = {
             "points": pts_t,
             "mask": torch.ones(pts_t.shape[0], dtype=torch.bool),

@@ -2,9 +2,31 @@
 import json, os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, Dict, Any
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+
+def _safe_tensor(x, dtype=torch.float32, device=None):
+    """
+    Convert to torch tensor without torch.from_numpy() for AARCH compatibility.
+    Handles numpy arrays, torch tensors, and python lists.
+    """
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        t = x.to(dtype=dtype)
+        if device is not None:
+            t = t.to(device=device)
+        return t
+    if isinstance(x, np.ndarray):
+        # Avoid torch.from_numpy / torch.as_tensor on numpy for AARCH
+        x = x.tolist()
+    t = torch.tensor(x, dtype=dtype)
+    if device is not None:
+        t = t.to(device=device)
+    return t
 
 @dataclass
 class VoxelMetaXYZ:
@@ -24,8 +46,8 @@ class VoxelGridXYZ:
             pmin = points_xyz.amin(dim=0)
             pmax = points_xyz.amax(dim=0)
         else:
-            pmin = torch.as_tensor(bounds[0], device=self.device, dtype=self.dtype)
-            pmax = torch.as_tensor(bounds[1], device=self.device, dtype=self.dtype)
+            pmin = _safe_tensor(bounds[0], device=self.device, dtype=self.dtype)
+            pmax = _safe_tensor(bounds[1], device=self.device, dtype=self.dtype)
 
         span = (pmax - pmin).clamp_min(1e-6)
         self.meta = VoxelMetaXYZ(
@@ -151,8 +173,8 @@ class VoxelizedDataset(Dataset):
                 bmode_str = "global"
         elif isinstance(bounds_mode, (tuple, list)):
             pmin, pmax = bounds_mode
-            self.bounds = (torch.as_tensor(pmin, dtype=torch.float32, device=self.device),
-                        torch.as_tensor(pmax, dtype=torch.float32, device=self.device))
+            self.bounds = (_safe_tensor(pmin, dtype=torch.float32, device=self.device),
+                        _safe_tensor(pmax, dtype=torch.float32, device=self.device))
             bmode_str = "fixed"
         else:
             bmode_str = "per_item"
@@ -215,7 +237,7 @@ class VoxelizedDataset(Dataset):
         pmins, pmaxs = [], []
         for i in tqdm(range(len(self.base_ds)), desc="Scanning global bounds", leave=False):
             item = self.base_ds[i]
-            pts = torch.as_tensor(item["points"], dtype=torch.float32)[..., :3]
+            pts = _safe_tensor(item["points"], dtype=torch.float32)[..., :3]
             pmins.append(pts.amin(dim=0))
             pmaxs.append(pts.amax(dim=0))
         pmin_g = torch.stack(pmins, 0).amin(dim=0)
@@ -232,7 +254,7 @@ class VoxelizedDataset(Dataset):
 
         for i in tqdm(range(len(self.base_ds)), desc="Voxelizing dataset"):
             item = self.base_ds[i]
-            pts_all = torch.as_tensor(item["points"], dtype=torch.float32)
+            pts_all = _safe_tensor(item["points"], dtype=torch.float32)
             pts_xyz = pts_all[:, :3]
             colors  = pts_all[:, 3:6] if (pts_all.shape[-1] == 6 and self.mode == "avg_rgb") else None
 
@@ -308,9 +330,9 @@ class VoxelizedDataset(Dataset):
             # 2) attach points
             if self.keep_points:
                 if "points" in extras:
-                    pts = torch.as_tensor(extras["points"], dtype=torch.float32)
+                    pts = _safe_tensor(extras["points"], dtype=torch.float32)
                 else:
-                    pts = torch.as_tensor(base_item["points"], dtype=torch.float32)
+                    pts = _safe_tensor(base_item["points"], dtype=torch.float32)
                 out["points"] = pts.to(self.device)
 
             # 3) attach extras, voxels, meta
