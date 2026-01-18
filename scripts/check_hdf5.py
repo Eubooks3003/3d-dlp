@@ -1,289 +1,170 @@
 #!/usr/bin/env python3
 """
-HDF5 breakdown / schema inspector (robomimic-style friendly)
+Dump a few RGB + depth frames from a robomimic-style MimicGen HDF5 for sanity checks.
 
-What it prints:
-- Top-level keys + attributes
-- Episode list under /data
-- A tree view for a chosen episode (datasets show shape/dtype/compression)
-- Aggregate "schema" across episodes:
-    * which dataset paths exist
-    * how many episodes contain each path
-    * dtype(s)
-    * shape(s)
-    * time-length stats (min/median/max of dim0 when applicable)
-- (Optional) camera-specific mismatch/missing report like your original script
+Writes:
+  out_dir/demo_X_t000.png                 (RGB)
+  out_dir/demo_X_t000_depth.png           (depth, colorized)
+  out_dir/demo_X_t000_depth.npy           (raw depth array)
+
+Usage:
+  python dump_h5_rgbd.py --h5 /path/to/out.hdf5 --out sanity_dump --n-demos 2 --n-frames 5
+  python dump_h5_rgbd.py --h5 ... --cams agentview sideview --frames 0 10 20
 """
 
-import argparse
-import h5py
+import os, argparse
 import numpy as np
-from collections import defaultdict
-from statistics import median
+import h5py
 
-DEFAULT_CAMS = ["agentview", "robot0_eye_in_hand", "birdview", "sideview"]
+from PIL import Image
 
-
-def _is_dataset(obj):
-    return isinstance(obj, h5py.Dataset)
-
-
-def _is_group(obj):
-    return isinstance(obj, h5py.Group)
-
-
-def _safe_str(x):
-    try:
-        return str(x)
-    except Exception:
-        return repr(x)
-
-
-def list_episode_keys(h5, data_root="data"):
-    if data_root not in h5:
-        return []
-    eps = list(h5[data_root].keys())
-    # try to sort like "demo_0", "episode_12", etc.
-    def keyfun(k):
-        try:
-            return int(k.split("_")[-1])
-        except Exception:
-            return k
-    return sorted(eps, key=keyfun)
-
-
-def tree_print(group, prefix="", max_depth=4, depth=0):
+def _ensure_uint8_rgb(x):
     """
-    Print a tree of groups/datasets (like `h5dump -n` but with shapes).
+    Accepts [H,W,3] in uint8 or float.
+    If float in [0,1] or [0,255], converts to uint8.
     """
-    if depth > max_depth:
-        return
-    items = list(group.items())
-    items.sort(key=lambda kv: kv[0])
+    x = np.asarray(x)
+    if x.dtype == np.uint8:
+        return x
+    x = x.astype(np.float32)
+    # heuristic: if max <= 1.5 treat as [0,1]
+    if np.nanmax(x) <= 1.5:
+        x = x * 255.0
+    x = np.clip(x, 0, 255).astype(np.uint8)
+    return x
 
-    for name, obj in items:
-        path = f"{group.name}/{name}".replace("//", "/")
-        if _is_group(obj):
-            print(f"{prefix}📁 {name}/")
-            tree_print(obj, prefix + "  ", max_depth=max_depth, depth=depth + 1)
-        else:
-            ds: h5py.Dataset = obj
-            comp = ds.compression if ds.compression is not None else "none"
-            chunks = ds.chunks if ds.chunks is not None else "none"
-            print(
-                f"{prefix}🧩 {name}  shape={ds.shape}  dtype={ds.dtype}  "
-                f"compression={comp}  chunks={chunks}"
-            )
-
-
-def collect_episode_dataset_stats(h5, data_root="data", max_episodes=None):
+def _depth_to_viz(depth, vmin=None, vmax=None, percentile_clip=(1, 99), eps=1e-8):
     """
-    Aggregate dataset paths across episodes:
-      stats[path] = {
-        "count": #episodes containing it
-        "episodes": [...],
-        "dtypes": set(),
-        "shapes": set(),
-        "T_list": [time lengths],
-      }
+    Convert depth map to a colorized uint8 RGB image (simple "magma-like" via grayscale->RGB).
+    No matplotlib required.
     """
-    eps = list_episode_keys(h5, data_root=data_root)
-    if max_episodes is not None:
-        eps = eps[:max_episodes]
+    d = np.asarray(depth).astype(np.float32)
+    # squeeze possible channel dims: [H,W,1] -> [H,W]
+    if d.ndim == 3 and d.shape[-1] == 1:
+        d = d[..., 0]
+    # handle NaNs/Infs
+    finite = np.isfinite(d)
+    if not np.any(finite):
+        return np.zeros((d.shape[0], d.shape[1], 3), dtype=np.uint8), (0.0, 1.0)
 
-    stats = defaultdict(lambda: {
-        "count": 0,
-        "episodes": [],
-        "dtypes": set(),
-        "shapes": set(),
-        "T_list": [],
-    })
+    df = d[finite]
+    if vmin is None or vmax is None:
+        lo, hi = np.percentile(df, list(percentile_clip))
+        if vmin is None: vmin = float(lo)
+        if vmax is None: vmax = float(hi)
+    if vmax <= vmin + eps:
+        vmax = vmin + 1.0
 
-    per_ep_paths = {}  # ep -> set(paths)
-    for ep in eps:
-        base = f"{data_root}/{ep}"
-        if base not in h5:
-            continue
+    dn = (np.clip(d, vmin, vmax) - vmin) / (vmax - vmin + eps)
+    dn[~finite] = 0.0
 
-        paths_here = set()
+    # simple colormap: stack grayscale into RGB, with slight contrast
+    g = (dn * 255.0).astype(np.uint8)
+    rgb = np.stack([g, g, g], axis=-1)
+    return rgb, (vmin, vmax)
 
-        def visit(g: h5py.Group, rel_prefix=""):
-            for k, obj in g.items():
-                rel = f"{rel_prefix}/{k}".lstrip("/")
-                if _is_group(obj):
-                    visit(obj, rel)
-                else:
-                    ds: h5py.Dataset = obj
-                    full_rel_path = rel  # relative to episode root
-                    paths_here.add(full_rel_path)
-
-                    stats[full_rel_path]["count"] += 1
-                    stats[full_rel_path]["episodes"].append(ep)
-                    stats[full_rel_path]["dtypes"].add(_safe_str(ds.dtype))
-                    stats[full_rel_path]["shapes"].add(_safe_str(ds.shape))
-
-                    # If it looks time-indexed, treat dim0 as T
-                    if isinstance(ds.shape, tuple) and len(ds.shape) >= 1 and ds.shape[0] is not None:
-                        try:
-                            stats[full_rel_path]["T_list"].append(int(ds.shape[0]))
-                        except Exception:
-                            pass
-
-        visit(h5[base], rel_prefix="")
-        per_ep_paths[ep] = paths_here
-
-    return eps, stats, per_ep_paths
-
-
-def print_schema_summary(eps, stats, per_ep_paths, show_missing=True, max_lines=None):
-    """
-    Print per-path coverage and time-length stats.
-    """
-    all_paths = sorted(stats.keys())
-    if max_lines is not None:
-        all_paths = all_paths[:max_lines]
-
-    print("\n=== Aggregate schema across episodes ===")
-    print(f"Episodes considered: {len(eps)}")
-    print(f"Unique dataset paths (relative to each episode): {len(stats)}\n")
-
-    for p in all_paths:
-        s = stats[p]
-        cover = f"{s['count']}/{len(eps)}"
-        dtypes = ", ".join(sorted(s["dtypes"]))
-        shapes = ", ".join(sorted(s["shapes"]))
-        if s["T_list"]:
-            tmin = min(s["T_list"])
-            tmed = int(median(s["T_list"]))
-            tmax = max(s["T_list"])
-            tinfo = f"T(min/med/max)={tmin}/{tmed}/{tmax}"
-        else:
-            tinfo = "T=n/a"
-
-        print(f"- {p}")
-        print(f"    coverage: {cover} episodes")
-        print(f"    dtype(s): {dtypes}")
-        print(f"    shape(s): {shapes}")
-        print(f"    {tinfo}")
-
-    if show_missing:
-        print("\n=== Missing-path report (only if not present in all episodes) ===")
-        for p in sorted(stats.keys()):
-            if stats[p]["count"] == len(eps):
-                continue
-            missing = [ep for ep in eps if p not in per_ep_paths.get(ep, set())]
-            if missing:
-                preview = missing[:10]
-                more = "" if len(missing) <= 10 else f" ... (+{len(missing)-10} more)"
-                print(f"- {p}: missing in {len(missing)} episodes -> {preview}{more}")
-
-
-def cam_check(h5, eps, cams, data_root="data"):
-    """
-    Your original camera mismatch/missing logic, but kept as an optional mode.
-    """
-    print("\n=== Camera check (per-episode) ===")
-    diffs = 0
-    for ep in eps:
-        base = f"{data_root}/{ep}/obs"
-        if base not in h5:
-            continue
-
-        lengths = {}
-        for cam in cams:
-            rgbk = f"{cam}_image"
-            depk = f"{cam}_depth"
-            t_rgb = h5[base][rgbk].shape[0] if rgbk in h5[base] else None
-            t_dep = h5[base][depk].shape[0] if depk in h5[base] else None
-            T = t_rgb if t_rgb is not None else t_dep
-            lengths[cam] = T
-
-        have_any = any(v is not None for v in lengths.values())
-        if not have_any:
-            continue
-
-        present = {c: v for c, v in lengths.items() if v is not None}
-        if len(set(present.values())) > 1:
-            diffs += 1
-            print(f"[MISMATCH] {ep}: " + ", ".join(f"{c}={present[c]}" for c in present))
-
-        missing = [c for c, v in lengths.items() if v is None]
-        if missing:
-            print(f"[MISSING ] {ep}: missing {missing}")
-
-    print(f"\nEpisodes with length mismatches across cams: {diffs}")
-
+def _list_cameras_in_obs(obs_group):
+    cams = set()
+    for k in obs_group.keys():
+        if k.endswith("_image"):
+            cams.add(k.replace("_image", ""))
+    return sorted(list(cams))
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("h5_path", type=str)
-    ap.add_argument("--data-root", type=str, default="data",
-                    help="root group that contains episodes (default: data)")
-    ap.add_argument("--max-episodes", type=int, default=None,
-                    help="limit episodes for faster inspection")
-    ap.add_argument("--tree-episode", type=str, default=None,
-                    help="print a tree for a specific episode key (e.g., demo_0). "
-                         "If omitted, prints a tree for the first episode.")
-    ap.add_argument("--tree-depth", type=int, default=4,
-                    help="max depth for tree printing")
-    ap.add_argument("--no-schema", action="store_true",
-                    help="skip aggregate schema summary")
-    ap.add_argument("--no-missing-report", action="store_true",
-                    help="do not print missing-path report")
-    ap.add_argument("--max-schema-lines", type=int, default=None,
-                    help="limit number of schema paths printed (debug)")
-    ap.add_argument("--cam-check", action="store_true",
-                    help="run the camera mismatch/missing report (like your original script)")
-    ap.add_argument("--cams", type=str, nargs="*", default=DEFAULT_CAMS,
-                    help="camera base names to check (default: common robomimic cams)")
+    ap.add_argument("--h5", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--cams", nargs="*", default=None, help="Camera names to dump (default: auto-detect from first demo)")
+    ap.add_argument("--n-demos", type=int, default=2)
+    ap.add_argument("--n-frames", type=int, default=5, help="How many frames per demo (used if --frames not given)")
+    ap.add_argument("--frames", type=int, nargs="*", default=None, help="Specific frame indices to dump (overrides --n-frames)")
+    ap.add_argument("--seed", type=int, default=0, help="Seed for picking random frames if --frames not set")
+    ap.add_argument("--save-npy", action="store_true", help="Also save raw depth as .npy")
     args = ap.parse_args()
 
-    with h5py.File(args.h5_path, "r") as h5:
-        print("=== File ===")
-        print(args.h5_path)
-        print("\n=== Top-level keys ===")
-        for k in h5.keys():
-            print(f"- {k}/" if _is_group(h5[k]) else f"- {k}")
+    os.makedirs(args.out, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
 
-        # root attrs
-        if len(h5.attrs) > 0:
-            print("\n=== Root attributes ===")
-            for k, v in h5.attrs.items():
-                print(f"- {k}: {_safe_str(v)}")
+    with h5py.File(args.h5, "r") as f:
+        demos = sorted(list(f["data"].keys()), key=lambda x: int(x.split("_")[-1]) if "_" in x else int(x[5:]))
+        demos = demos[:args.n_demos]
+        if len(demos) == 0:
+            raise RuntimeError("No demos found under /data")
 
-        eps = list_episode_keys(h5, data_root=args.data_root)
-        print(f"\n=== Episodes under /{args.data_root} ===")
-        print(f"episodes: {len(eps)}")
-        if eps:
-            print("first 10:", eps[:10])
-
-        if not eps:
-            return
-
-        # Tree view
-        ep_for_tree = args.tree_episode if args.tree_episode is not None else eps[0]
-        ep_path = f"{args.data_root}/{ep_for_tree}"
-        if ep_path in h5:
-            print(f"\n=== Tree for episode: {ep_for_tree} (/{ep_path}) ===")
-            tree_print(h5[ep_path], max_depth=args.tree_depth)
+        # auto-detect cameras from first demo if not provided
+        if args.cams is None:
+            obs0 = f[f"data/{demos[0]}/obs"]
+            cams = _list_cameras_in_obs(obs0)
+            if not cams:
+                raise RuntimeError("No '*_image' keys found in obs. Check your dataset.")
         else:
-            print(f"\n[WARN] requested tree episode {ep_for_tree} not found under /{args.data_root}")
+            cams = list(args.cams)
 
-        # Aggregate schema
-        eps_used, stats, per_ep_paths = collect_episode_dataset_stats(
-            h5, data_root=args.data_root, max_episodes=args.max_episodes
-        )
-        if not args.no_schema:
-            print_schema_summary(
-                eps_used, stats, per_ep_paths,
-                show_missing=(not args.no_missing_report),
-                max_lines=args.max_schema_lines
-            )
+        print(f"[info] demos: {demos}")
+        print(f"[info] cams: {cams}")
 
-        # Optional cam check
-        if args.cam_check:
-            cam_check(h5, eps_used, args.cams, data_root=args.data_root)
+        # choose frames
+        for demo in demos:
+            obs = f[f"data/{demo}/obs"]
 
+            # find T from first available camera image
+            T = None
+            for cam in cams:
+                k = f"{cam}_image"
+                if k in obs:
+                    T = obs[k].shape[0]
+                    break
+            if T is None:
+                print(f"[warn] demo {demo}: none of cams have *_image keys, skipping")
+                continue
+
+            if args.frames is not None and len(args.frames) > 0:
+                frame_ids = [t for t in args.frames if 0 <= t < T]
+            else:
+                # pick a few spread-out frames if possible; otherwise random
+                if T <= args.n_frames:
+                    frame_ids = list(range(T))
+                else:
+                    # spread + a couple random
+                    lin = np.linspace(0, T - 1, num=min(args.n_frames, T), dtype=int).tolist()
+                    frame_ids = lin
+
+            print(f"[demo {demo}] T={T}, dumping frames: {frame_ids}")
+
+            for t in frame_ids:
+                for cam in cams:
+                    rgb_key = f"{cam}_image"
+                    dep_key = f"{cam}_depth"
+                    if rgb_key not in obs:
+                        print(f"  [skip] {demo} {cam}: missing {rgb_key}")
+                        continue
+
+                    rgb = obs[rgb_key][t]  # typically [H,W,3]
+                    rgb_u8 = _ensure_uint8_rgb(rgb)
+
+                    rgb_path = os.path.join(args.out, f"{demo}_{cam}_t{t:04d}.png")
+                    Image.fromarray(rgb_u8).save(rgb_path)
+
+                    if dep_key in obs:
+                        depth = obs[dep_key][t]
+                        depth_viz, (vmin, vmax) = _depth_to_viz(depth)
+                        dep_path = os.path.join(args.out, f"{demo}_{cam}_t{t:04d}_depth.png")
+                        Image.fromarray(depth_viz).save(dep_path)
+
+                        if args.save_npy:
+                            npy_path = os.path.join(args.out, f"{demo}_{cam}_t{t:04d}_depth.npy")
+                            np.save(npy_path, np.asarray(depth))
+
+                        # print one line stats
+                        d = np.asarray(depth).astype(np.float32)
+                        finite = np.isfinite(d)
+                        if np.any(finite):
+                            df = d[finite]
+                            print(f"    {demo} {cam} t={t:04d} depth: min={df.min():.4g} max={df.max():.4g} mean={df.mean():.4g} viz_clip=({vmin:.4g},{vmax:.4g})")
+                    else:
+                        print(f"    {demo} {cam} t={t:04d}: no depth key ({dep_key})")
+
+    print(f"\nWrote sanity images to: {args.out}")
 
 if __name__ == "__main__":
     main()
