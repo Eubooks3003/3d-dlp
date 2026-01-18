@@ -459,27 +459,27 @@ def main():
             print_vol_stats("GT", gt_vol)
             print_vol_stats("REC", rec_vol)
 
-            rgb_distribution_for_plotted_voxels(
-                "GT plotted stats",
-                gt_vol, alpha_vol=None,       # or your alpha if available
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.25,
-                rgb_mag_thresh=0.10,
-                use_edge_mask=True,
-                edge_percentile=80,
-            )
+            # rgb_distribution_for_plotted_voxels(
+            #     "GT plotted stats",
+            #     gt_vol, alpha_vol=None,       # or your alpha if available
+            #     mode="splat",
+            #     topk=60000,
+            #     alpha_thresh=0.25,
+            #     rgb_mag_thresh=0.10,
+            #     use_edge_mask=True,
+            #     edge_percentile=80,
+            # )
 
-            rgb_distribution_for_plotted_voxels(
-                "REC plotted stats",
-                rec_vol, alpha_vol=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.25,
-                rgb_mag_thresh=0.10,
-                use_edge_mask=True,
-                edge_percentile=80,
-            )
+            # rgb_distribution_for_plotted_voxels(
+            #     "REC plotted stats",
+            #     rec_vol, alpha_vol=None,
+            #     mode="splat",
+            #     topk=60000,
+            #     alpha_thresh=0.25,
+            #     rgb_mag_thresh=0.10,
+            #     use_edge_mask=True,
+            #     edge_percentile=80,
+            # )
 
 
             # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
@@ -512,9 +512,9 @@ def main():
 
             z_base_cov_b0 = model_output["z_base_cov"][b0]  # [K, 6]
 
-            print("TOPK kp (b0):", topk_kp_b0.cpu().numpy())
-            print("KP_P: ", kp_xyz[b0].shape)
-            print("z_base_cov_b0 B0: ", z_base_cov_b0.shape)
+            # print("TOPK kp (b0):", topk_kp_b0.cpu().numpy())
+            # print("KP_P: ", kp_xyz[b0].shape)
+            # print("z_base_cov_b0 B0: ", z_base_cov_b0.shape)
 
             # ------ Voxel overlays (same as training) ------
             # log_vox_overlay_plotly("vox/overlay_main", gt_vol, rec_vol, kps=None,

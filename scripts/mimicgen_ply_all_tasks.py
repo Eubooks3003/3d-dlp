@@ -36,7 +36,7 @@ import robosuite
 A_GL2CV = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
 
 DEFAULT_CAMS = ["agentview", "sideview"]
-DEFAULT_CROP = {"xmin": -2.0, "xmax": 2.0, "ymin": -2.0, "ymax": 2.0, "zmin": -0.2, "zmax": 2.5}
+DEFAULT_CROP = {"xmin": -0.5, "xmax": 2.0, "ymin": -0.5, "ymax": 2.0, "zmin": -0.2, "zmax": 2.5}
 
 
 def squeeze_hw(d):
@@ -72,7 +72,7 @@ def maybe_crop(xyz, rgb, bounds):
 def compute_K_from_fovy(fovy_deg, W, H):
     fovy = np.deg2rad(float(fovy_deg))
     fy = (H / 2.0) / np.tan(fovy / 2.0)
-    fx = fy
+    fx = fy * (W / H)
     cx = (W - 1) / 2.0
     cy = (H - 1) / 2.0
     return np.array([[fx, 0, cx],
@@ -225,36 +225,36 @@ def depth_to_z(depth_raw, mode: str, near_m: float, far_m: float):
 
 
 # ---------- scoring / auto-select ----------
-def score_fusion(ptsA, ptsB):
-    """
-    Lower is better.
-    - centroid distance (overlap proxy)
-    - penalize insane scene size (either tiny or galaxy)
-    """
+def score_fusion(ptsA, ptsB, max_n=20000):
     if ptsA.shape[0] == 0 or ptsB.shape[0] == 0:
         return 1e9
 
-    cA = ptsA.mean(0)
-    cB = ptsB.mean(0)
-    cd = float(np.linalg.norm(cA - cB))
+    # downsample for speed
+    rng = np.random.default_rng(0)
+    if ptsA.shape[0] > max_n:
+        ptsA = ptsA[rng.choice(ptsA.shape[0], max_n, replace=False)]
+    if ptsB.shape[0] > max_n:
+        ptsB = ptsB[rng.choice(ptsB.shape[0], max_n, replace=False)]
+
+    from scipy.spatial import cKDTree
+    tA = cKDTree(ptsA)
+    tB = cKDTree(ptsB)
+    dAB = tB.query(ptsA, k=1)[0].mean()
+    dBA = tA.query(ptsB, k=1)[0].mean()
 
     allp = np.concatenate([ptsA, ptsB], axis=0)
-    mins = allp.min(0)
-    maxs = allp.max(0)
-    diag = float(np.linalg.norm(maxs - mins))
+    diag = float(np.linalg.norm(allp.max(0) - allp.min(0)))
 
-    # prefer diag around [0.3, 5] meters; penalize outside
     size_pen = 0.0
-    if diag < 0.2:
-        size_pen += (0.2 - diag) * 50.0
-    if diag > 8.0:
-        size_pen += (diag - 8.0) * 5.0
+    if diag < 0.2: size_pen += (0.2 - diag) * 50.0
+    if diag > 8.0: size_pen += (diag - 8.0) * 5.0
 
-    # centroid distance dominates; size sanity breaks ties
-    return cd + size_pen
+    return 0.5 * (dAB + dBA) + size_pen
 
 
-def build_points_for_cam(obs, cam, tidx, K, Tc2w, near_m, far_m, depth_mode, pixel_stride, crop_bounds, max_points, rng):
+def build_points_for_cam(sim, obs, cam, tidx, K, near_m, far_m, depth_mode,
+                         pixel_stride, crop_bounds, max_points, rng, use_Rt=False):
+
     depth_key = f"{cam}_depth"
     img_key   = f"{cam}_image"
     if depth_key not in obs or img_key not in obs:
@@ -274,11 +274,17 @@ def build_points_for_cam(obs, cam, tidx, K, Tc2w, near_m, far_m, depth_mode, pix
         rgb /= 255.0
     # pts_cam[:, 1] *= -1.0
     # pts_cam[:, 2] *= -1.0
-    F = np.eye(4, dtype=np.float32)
-    F[1,1] = -1.0
-    F[2,2] = -1.0
-    Tuse = F @ np.linalg.inv(Tc2w)
-    pts_world = apply_T(Tuse, pts_cam)
+    cam_id = sim.model.camera_name2id(cam)
+    pos = np.array(sim.data.cam_xpos[cam_id], dtype=np.float32)
+    R = np.array(sim.data.cam_xmat[cam_id], dtype=np.float32).reshape(3, 3)  # NO transpose
+
+    # --- CV -> MuJoCo(OpenGL) camera coords ---
+    pts_gl = pts_cam.copy()
+    pts_gl[:, 1] *= -1.0   # y: down -> up
+    pts_gl[:, 2] *= -1.0   # z: forward -> backward
+
+    # --- camera -> world ---
+    pts_world = (R @ pts_gl.T).T + pos
     # pts_world = apply_T(np.linalg.inv(Tc2w), pts_cam)
     pts_world, rgb = maybe_crop(pts_world, rgb, crop_bounds)
 
@@ -320,13 +326,10 @@ def auto_pick_convention(env, rgbd_h5, ep, tidx, cams, H, W, pixel_stride, crop_
     for dm in depth_modes:
         for tr in transposes:
             for ax in axisflips:
-                Tc2w_A = cam_pose_from_sim(sim, camA, transpose_R=tr, apply_gl2cv=ax)
-                Tc2w_B = cam_pose_from_sim(sim, camB, transpose_R=tr, apply_gl2cv=ax)
-
-                ptsA, _ = build_points_for_cam(obs, camA, tidx, K_by_cam[camA], Tc2w_A, near_m, far_m, dm,
-                                               pixel_stride, crop_bounds, max_points, rng)
-                ptsB, _ = build_points_for_cam(obs, camB, tidx, K_by_cam[camB], Tc2w_B, near_m, far_m, dm,
-                                               pixel_stride, crop_bounds, max_points, rng)
+                ptsA, _ = build_points_for_cam(sim, obs, camA, tidx, K_by_cam[camA], near_m, far_m, dm,
+                                            pixel_stride, crop_bounds, max_points, rng, use_Rt=tr)
+                ptsB, _ = build_points_for_cam(sim, obs, camB, tidx, K_by_cam[camB], near_m, far_m, dm,
+                                            pixel_stride, crop_bounds, max_points, rng, use_Rt=tr)
 
                 if ptsA is None or ptsB is None:
                     continue
@@ -408,17 +411,18 @@ def process_task(rgbd_path, out_dir, cams_req, H, W, pixel_stride, max_points, s
 
                     for cam in cams:
                         Tc2w = cam_pose_from_sim(sim, cam, transpose_R=best["transpose_R"], apply_gl2cv=best["axisflip"])
-
                         pts, rgb = build_points_for_cam(
-                            obs=obs, cam=cam, tidx=tidx,
-                            K=K_by_cam[cam], Tc2w=Tc2w,
-                            near_m=near_m, far_m=far_m,
-                            depth_mode=best["depth_mode"],
-                            pixel_stride=pixel_stride,
-                            crop_bounds=crop_bounds,
-                            max_points=max_points,
-                            rng=rng,
+                            sim, obs, cam, tidx,
+                            K_by_cam[cam],
+                            near_m, far_m,
+                            best["depth_mode"],
+                            pixel_stride,
+                            crop_bounds,
+                            max_points,
+                            rng,
+                            use_Rt=best["transpose_R"],
                         )
+
                         if pts is None:
                             continue
 
@@ -467,6 +471,12 @@ def main():
     ap.add_argument("--debug-one", action="store_true")
     ap.add_argument("--debug-per-cam", action="store_true")
 
+    ap.add_argument("--tasks", nargs="*", default=None,
+                help="Optional explicit list of task folder names to process (e.g. hammer_cleanup_d0 kitchen_d0).")
+    ap.add_argument("--task-start", default=None,
+                help="If set, skip tasks until this task name is reached (inclusive).")
+
+
     args = ap.parse_args()
 
     if args.debug_one:
@@ -480,6 +490,23 @@ def main():
     task_dirs = [d for d in task_dirs if os.path.isdir(d)]
     if not task_dirs:
         raise RuntimeError("No task dirs matched")
+
+    all_names = [os.path.basename(d.rstrip("/")) for d in task_dirs]
+
+    if args.tasks is not None and len(args.tasks) > 0:
+        wanted = set(args.tasks)
+        task_dirs = [d for d in task_dirs if os.path.basename(d.rstrip("/")) in wanted]
+        missing = [t for t in args.tasks if t not in all_names]
+        if missing:
+            print("[warn] requested tasks not found under root:", missing)
+
+    if args.task_start is not None:
+        start = args.task_start
+        if start not in all_names:
+            raise RuntimeError(f"--task-start {start} not found. Available: {all_names}")
+        i0 = all_names.index(start)
+        task_dirs = task_dirs[i0:]
+
 
     print(f"Found {len(task_dirs)} task dirs under {root}")
 
