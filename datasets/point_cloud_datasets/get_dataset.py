@@ -1,6 +1,6 @@
 import os
 import glob
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 import numpy as np
 import torch
 from datasets.point_cloud_datasets.to_scene_ds import TODataset
@@ -20,18 +20,26 @@ def get_point_cloud_dataset(
     voxelize: bool = False,              # when True, return BOTH points and voxels
     voxel_grid_whd: tuple = (64, 64, 64),
     voxel_mode: str = "density",         # {"occupancy","density","moments","avg_rgb"}
-    bounds_mode: "str|tuple" = "global",  # "per_item" | "global" | ((pmin),(pmax))
+    bounds_mode: Union[str, tuple] = "global",  # "per_item" | "global" | ((pmin),(pmax))
     keep_points: bool = True,            # keep raw points alongside voxels
     cache_dir: str = None,        # optional on-disk cache for voxelization
     cache_extras: bool = False,
     force_rebuild: bool = False,
     device=None,
+    # --- mimicgen multi-task specific ---
+    tasks: Optional[List[str]] = None,   # for mimicgen: list of task names or None for auto-discover
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    seed: int = 42,
 ):
     """
     Generic getter for point-cloud datasets.
       - ds in {"TO", "to", "to-scene"} → loads flat .plys via TODataset
          * if voxelize=True → wraps with VoxelizedDataset, returning BOTH points and voxels
       - ds == "voxel" → precomputed voxel files (*.pt pairs) via VoxelDataset (as before)
+      - ds in {"mimicgen", "mimicgen_multitask"} → multi-task MimicGen dataset
+         * Expects: {root}/{task}_d0/core/mimicgen_from_depth_pcd/demo_*/frame*.ply
+         * Auto-saves voxel cache to: {root}/{task}_d0/core/voxel_cache/
     """
     ds_key = (ds or "").lower()
 
@@ -55,6 +63,82 @@ def get_point_cloud_dataset(
                 mode=voxel_mode,
                 bounds_mode=bounds_mode,
                 keep_points=True,                   # <-- ensures 'points' is present
+                device=device or torch.device("cpu"),
+                cache_dir=cache_dir,
+                cache_extras=cache_extras,
+                force_rebuild=force_rebuild,
+            )
+        return base
+
+    # --- MimicGen multi-task dataset ---
+    if ds_key in ("mimicgen", "mimicgen_multitask", "mimicgen_multi"):
+        from datasets.point_cloud_datasets.mimicgen_multitask_ds import MimicGenMultiTaskDataset
+
+        base = MimicGenMultiTaskDataset(
+            root=root,
+            tasks=tasks,
+            split=mode,
+            max_points=max_points,
+            normalize_to_unit_cube=normalize_to_unit_cube,
+            include_rgb=include_rgb,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+        )
+
+        if voxelize:
+            # Auto-determine cache_dir if not provided:
+            # Use a combined cache under {root}/voxel_cache_combined/
+            # or use per-task caching if only one task
+            if cache_dir is None:
+                if len(base.tasks) == 1:
+                    # Single task: use task-specific cache
+                    cache_dir = base.get_cache_dir_for_task(base.tasks[0])
+                else:
+                    # Multiple tasks: use combined cache at root level
+                    cache_dir = os.path.join(root, "voxel_cache_combined")
+                print(f"[get_point_cloud_dataset] Auto-set cache_dir: {cache_dir}")
+
+            return VoxelizedDataset(
+                base_ds=base,
+                grid_whd=voxel_grid_whd,
+                mode=voxel_mode,
+                bounds_mode=bounds_mode,
+                keep_points=keep_points,
+                device=device or torch.device("cpu"),
+                cache_dir=cache_dir,
+                cache_extras=cache_extras,
+                force_rebuild=force_rebuild,
+            )
+        return base
+
+    # --- Legacy single-task MimicGen (flat directory) ---
+    if ds_key in ("mimicgen_flat", "mimicgen_single"):
+        from datasets.point_cloud_datasets.mimicgen_ds import MimicGenPointCloudDataset
+
+        base = MimicGenPointCloudDataset(
+            root=root,
+            split=mode,
+            max_points=max_points,
+            normalize_to_unit_cube=normalize_to_unit_cube,
+            include_rgb=include_rgb,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+        )
+
+        if voxelize:
+            # For flat mimicgen, cache_dir defaults to {root}/voxel_cache if not provided
+            if cache_dir is None:
+                cache_dir = os.path.join(root, "voxel_cache")
+                print(f"[get_point_cloud_dataset] Auto-set cache_dir: {cache_dir}")
+
+            return VoxelizedDataset(
+                base_ds=base,
+                grid_whd=voxel_grid_whd,
+                mode=voxel_mode,
+                bounds_mode=bounds_mode,
+                keep_points=keep_points,
                 device=device or torch.device("cpu"),
                 cache_dir=cache_dir,
                 cache_extras=cache_extras,
