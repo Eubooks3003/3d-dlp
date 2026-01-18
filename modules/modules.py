@@ -6514,7 +6514,7 @@ class DLPDecoder(nn.Module):
 
         self.num_obj_upsample = self.particle_dec.num_upsample # TODO:This never gets used
         # bg decoder
-        self.bg_dec = BgDecoder(cdim=cdim, image_size=48,
+        self.bg_dec = BgDecoder(cdim=cdim, image_size=image_size,
                                 pad_mode='replicate', learned_bg_feature_dim=learned_bg_feature_dim,
                                 use_resblock=use_resblock, context_dim=context_dim, film=decode_with_ctx,
                                 timestep_horizon=timestep_horizon,

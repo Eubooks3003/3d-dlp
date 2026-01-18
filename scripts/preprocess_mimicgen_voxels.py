@@ -141,11 +141,10 @@ def voxelize_task(
     print(f"\n[{task}] Processing {len(files)} frames...")
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Compute global bounds for this task
-    pmin, pmax = compute_global_bounds_for_task(files, include_rgb, normalize_to_unit_cube)
-    bounds = (safe_tensor(pmin), safe_tensor(pmax))
-
-    print(f"  Bounds: min={pmin}, max={pmax}")
+    # Use per_item bounds (each frame normalized to its own min/max)
+    # This is fine for MimicGen since scenes have consistent bounds
+    bounds = None
+    print(f"  Using per_item bounds (each frame uses its own min/max)")
 
     # Voxelize each file
     for idx, (demo_idx, frame_idx, path) in enumerate(tqdm(files, desc=f"  [{task}] Voxelizing")):
@@ -196,9 +195,7 @@ def voxelize_task(
         "length": len(files),
         "grid_whd": list(grid_whd),
         "mode": voxel_mode,
-        "bounds_mode": "global",
-        "pmin": pmin.tolist(),
-        "pmax": pmax.tolist(),
+        "bounds_mode": "per_item",
         "complete": True,
     }
     with open(manifest_path, "w") as f:

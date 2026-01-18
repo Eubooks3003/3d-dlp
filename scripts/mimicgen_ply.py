@@ -16,7 +16,7 @@ import open3d as o3d
 
 # ---------------- CONFIG ----------------
 H5_PATH    = "/home/ellina/Desktop/Code/articubot-on-mimicgen/stack_d1_rgbd_pcd.hdf5"
-OUT_DIR    = "mimicgen_from_depth_pcd"
+OUT_DIR    = "mimicgen_from_depth_pcd_debug"
 
 CAMS       = ["agentview", "sideview", "robot0_eye_in_hand"]
 NUM_SCENES = 5
