@@ -2,7 +2,7 @@
 
 import os
 import glob
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -44,12 +44,14 @@ class MimicGenPointCloudDataset(Dataset):
         val_ratio: float = 0.1,
         seed: int = 42,
         proportion: float = 1.0,          # optional extra downsampling of scenes
+        max_items: Optional[int] = None,
     ):
         self.root = os.path.abspath(root)
         self.split = split
         self.max_points = int(max_points)
         self.normalize_to_unit_cube = bool(normalize_to_unit_cube)
         self.include_rgb = bool(include_rgb)
+        self.max_items = max_items
 
         # enumerate all .ply files in flat directory
         all_files = sorted(glob.glob(os.path.join(self.root, "*.ply")))
@@ -139,7 +141,10 @@ class MimicGenPointCloudDataset(Dataset):
     # ------------- Dataset API -------------
 
     def __len__(self) -> int:
-        return len(self.files)
+        base_len = len(self.files)
+        if self.max_items is not None:
+            return min(base_len, self.max_items)
+        return base_len
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
         path = self.files[idx]

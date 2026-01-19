@@ -35,7 +35,8 @@ class VoxelDataset(Dataset):
         split_ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
         proportion: float = 1.0,              # (0,1] take only this fraction of the chosen split
         seed: int = 42,                       # affects nothing unless you later shuffle externally
-        device: Optional[torch.device] = None # leave None to keep tensors on CPU when loaded
+        device: Optional[torch.device] = None, # leave None to keep tensors on CPU when loaded
+        max_items: Optional[int] = None       # max items to return (None = no limit)
     ):
         self.root = os.path.abspath(root)
         self.split = split
@@ -43,6 +44,7 @@ class VoxelDataset(Dataset):
         self.split_ratios = tuple(float(x) for x in split_ratios)
         self.proportion = float(proportion)
         self.device = device  # optional move-on-load
+        self.max_items = max_items
 
         if not os.path.isdir(self.root):
             raise FileNotFoundError(f"VoxelDataset root not found: {self.root}")
@@ -109,7 +111,10 @@ class VoxelDataset(Dataset):
     # ------------- Dataset API -------------
 
     def __len__(self) -> int:
-        return len(self.items)
+        base_len = len(self.items)
+        if self.max_items is not None:
+            return min(base_len, self.max_items)
+        return base_len
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
         id_str, vox_path, meta_path = self.items[idx]

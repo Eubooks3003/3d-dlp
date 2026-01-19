@@ -1,6 +1,6 @@
 import os
 import glob
-from typing import List, Dict, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -33,12 +33,14 @@ class TODataset(Dataset):
         normalize_to_unit_cube: bool = True,
         include_rgb: bool = False,
         proportion: float = 0.4,
+        max_items: Optional[int] = None,
     ):
         self.root = os.path.abspath(root)
         self.split = split
         self.max_points = int(max_points)
         self.normalize_to_unit_cube = bool(normalize_to_unit_cube)
         self.include_rgb = bool(include_rgb)
+        self.max_items = max_items
 
         self.split_dir = os.path.join(self.root, split)
         if not os.path.isdir(self.split_dir):
@@ -102,7 +104,10 @@ class TODataset(Dataset):
 
     # ------------- Dataset API -------------
     def __len__(self) -> int:
-        return len(self.files)
+        base_len = len(self.files)
+        if self.max_items is not None:
+            return min(base_len, self.max_items)
+        return base_len
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
         path = self.files[idx]
