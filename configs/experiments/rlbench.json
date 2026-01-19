@@ -1,10 +1,11 @@
 {
-  "ds": "voxel",
-  "root": "/home/ellina/Desktop/Code/3D-DLP-data/voxel_data/voxel_shapenet_rgb",
+  "ds": "rlbench",
+  "root": "/home/ubuntu/pathaklab/data/lyuxing/rlbench/full",
   "modality": "point_cloud",
-  "decoder_point_mode": "spawn", 
+  "decoder_point_mode": "spawn",
   "voxel_mode": "occupancy",
   "voxel_grid_whd": [64, 64, 64],
+  "voxel_root": null,
   "points_per_object": 64,
   "points_bg": 256,
   "points_per_scale": [32, 64],
@@ -13,10 +14,7 @@
   "lr": 0.00008,
   "use_scheduler": false,
   "scheduler_gamma": 0.99,
-  "adam_betas": [
-    0.9,
-    0.999
-  ],
+  "adam_betas": [0.9, 0.999],
   "adam_eps": 1e-06,
   "weight_decay": 0.0,
   "load_model": false,
@@ -62,24 +60,12 @@
   "null_action_embed": false,
   "image_goal_condition": true,
   "obj_res_from_fc": 4,
-  "obj_ch_mult_prior": [
-    1,
-    4
-  ],
-  "obj_ch_mult": [
-    1,
-    2,
-	4
-  ],
+  "obj_ch_mult_prior": [1, 4],
+  "obj_ch_mult": [1, 2, 4],
   "obj_base_ch": 32,
   "obj_final_cnn_ch": 32,
   "bg_res_from_fc": 8,
-  "bg_ch_mult": [
-    1,
-    1,
-    2,
-    4
-  ],
+  "bg_ch_mult": [1, 1, 2, 4],
   "bg_base_ch": 32,
   "bg_final_cnn_ch": 32,
   "pad_mode": "zeros",
@@ -100,7 +86,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "ablation_patch_size_4",
+  "run_prefix": "rlbench_slide_block",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,

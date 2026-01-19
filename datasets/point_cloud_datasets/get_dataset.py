@@ -150,6 +150,47 @@ def get_point_cloud_dataset(
             )
         return base
 
+    # --- RLBench multi-task dataset ---
+    if ds_key in ("rlbench", "rlbench_multitask"):
+        from datasets.point_cloud_datasets.rlbench_ds import RLBenchPointCloudDataset
+
+        # For RLBench, 'tasks' is the list of task names
+        # 'splits' would be data splits like ['train', 'test_data']
+        # We pass 'tasks' as tasks and use a separate kwarg for data splits if needed
+        base = RLBenchPointCloudDataset(
+            root=root,
+            splits=None,  # Auto-discover data splits (train/test_data/etc)
+            tasks=tasks,  # Task names (slide_block_to_color_target, etc)
+            split=mode,   # Internal train/val/test split
+            max_points=max_points,
+            normalize_to_unit_cube=normalize_to_unit_cube,
+            include_rgb=include_rgb,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+        )
+
+        if voxelize:
+            # For RLBench, voxel caches are stored per-episode
+            # Use a combined cache at root level for training
+            if cache_dir is None:
+                cache_dir = os.path.join(root, "voxel_cache_combined")
+                print(f"[get_point_cloud_dataset] Auto-set cache_dir: {cache_dir}")
+
+            return VoxelizedDataset(
+                base_ds=base,
+                grid_whd=voxel_grid_whd,
+                mode=voxel_mode,
+                bounds_mode=bounds_mode,
+                keep_points=keep_points,
+                device=device or torch.device("cpu"),
+                cache_dir=cache_dir,
+                cache_extras=cache_extras,
+                force_rebuild=force_rebuild,
+                max_items=max_items,
+            )
+        return base
+
     raise NotImplementedError(f"Unknown point-cloud dataset: {ds}")
 
 # -------- collate for variable-size point clouds (single-frame) --------
