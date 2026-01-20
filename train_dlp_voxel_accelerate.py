@@ -242,7 +242,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                              voxel_mode="occupancy",
                              cache_dir=voxel_root)
 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
     # Validation dataset
     val_dataset = get_point_cloud_dataset(ds, root, mode="val",
@@ -250,7 +250,17 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                              voxel_mode="occupancy",
                              cache_dir=voxel_root)
 
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=16,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
 
     # Model
     model = DLP(
@@ -299,6 +309,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         prior_mode=prior_mode,
         raw_heatmap_mode=raw_heatmap_mode,
     )
+
 
     model_info = model.info()
     if accelerator.is_main_process:
@@ -403,7 +414,8 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
 
         pbar = tqdm(iterable=dataloader, disable=not accelerator.is_local_main_process)
         for batch in pbar:
-            vox = batch["voxels"].to(accelerator.device)
+            vox = batch["voxels"].to(accelerator.device, non_blocking=True)
+            vox = vox.to(memory_format=torch.channels_last_3d)
 
             warmup = (epoch < warmup_epoch)
 
