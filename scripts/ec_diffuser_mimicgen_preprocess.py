@@ -371,6 +371,8 @@ def main():
 
     # output
     ap.add_argument("--out-pkl", required=True)
+    ap.add_argument("--voxel-cache-dir", type=str, default=None,
+                    help="Directory to save voxel cache (per-demo/frame structure). If not set, voxels are not saved.")
 
     args = ap.parse_args()
 
@@ -571,6 +573,37 @@ def main():
                         voxel_mode="avg_rgb",
                         bounds_pm=bounds_pm,
                     )  # [C,D,H,W] on device
+
+                    # Save voxel cache per-demo/frame if requested
+                    if args.voxel_cache_dir is not None:
+                        demo_cache_dir = os.path.join(args.voxel_cache_dir, demo)
+                        os.makedirs(demo_cache_dir, exist_ok=True)
+
+                        vox_path = os.path.join(demo_cache_dir, f"frame{tt}_voxels.pt")
+                        meta_path = os.path.join(demo_cache_dir, f"frame{tt}_meta.pt")
+                        extras_path = os.path.join(demo_cache_dir, f"frame{tt}_extras.pt")
+
+                        # Save voxel tensor
+                        torch.save(vox_t.cpu(), vox_path)
+
+                        # Save metadata (bounds info)
+                        meta = {
+                            "grid_dhw": (D, H, W),
+                            "voxel_mode": args.voxel_mode,
+                            "bounds_mode": args.bounds_mode,
+                            "bounds_pm": bounds_pm,
+                        }
+                        torch.save(meta, meta_path)
+
+                        # Save extras (path info for later reference)
+                        extras = {
+                            "path": ply_path,
+                            "demo": demo,
+                            "frame": tt,
+                            "points": pts_t.cpu().numpy(),
+                        }
+                        torch.save(extras, extras_path)
+
                     vox_list.append(vox_t)
                     valid_ts.append(tt)
 
@@ -679,6 +712,25 @@ def main():
     print(f"\nWrote: {args.out_pkl}")
     print(f"E={E}, Tmax={Tmax}, K={K}, Dtok={Dtok}, A={A}, G={G} (gripper_dim), action_mode={args.action_mode}")
     print(f"gripper_state shape: {gripper_state.shape} (format: pos(3) + rot6d(6) + gripper_open(1))")
+
+    # Write voxel cache manifest if voxel cache was saved
+    if args.voxel_cache_dir is not None:
+        import json
+        manifest_path = os.path.join(args.voxel_cache_dir, "manifest.json")
+        manifest = {
+            "total_demos": E,
+            "total_frames": int(total_written),
+            "grid_dhw": [D, H, W],
+            "voxel_mode": args.voxel_mode,
+            "bounds_mode": args.bounds_mode,
+            "bounds_pm": bounds_pm if bounds_pm is None else [list(bounds_pm[0]), list(bounds_pm[1])],
+            "normalize_to_unit_cube": args.normalize_to_unit_cube,
+            "max_points": args.max_points,
+            "complete": True,
+        }
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"Voxel cache saved to: {args.voxel_cache_dir} ({total_written} frames across {E} demos)")
 
 
 if __name__ == "__main__":

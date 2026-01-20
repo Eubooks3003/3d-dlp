@@ -10,7 +10,7 @@ Run on multiple machines with different --tasks to parallelize:
 Or process all tasks on one machine:
     python preprocess_mimicgen_voxels.py --root /path/to/mimicgen
 
-Each task's voxels are saved to: {root}/{task}_d1/core/voxel_cache/
+Each task's voxels are saved to: {root}/{task}_d0/core/voxel_cache/
 """
 
 import os
@@ -88,14 +88,14 @@ def center_scale_unit_cube(pts: np.ndarray) -> np.ndarray:
 
 
 def discover_tasks(root: str):
-    """Auto-discover all *_d1 task folders."""
-    task_dirs = sorted(glob.glob(os.path.join(root, "*_d1")))
-    return [os.path.basename(d).replace("_d1", "") for d in task_dirs]
+    """Auto-discover all *_d0 task folders."""
+    task_dirs = sorted(glob.glob(os.path.join(root, "*_d0")))
+    return [os.path.basename(d).replace("_d0", "") for d in task_dirs]
 
 
 def get_task_files(root: str, task: str):
     """Get all .ply files for a task, sorted by demo and frame."""
-    task_pcd_root = os.path.join(root, f"{task}_d1", "core", "mimicgen_from_depth_pcd")
+    task_pcd_root = os.path.join(root, f"{task}_d0", "core", "mimicgen_from_depth_pcd")
     if not os.path.isdir(task_pcd_root):
         return []
 
@@ -153,7 +153,7 @@ def voxelize_task(
 ):
     """Voxelize all frames for a single task and save to cache."""
     cache_name = f"voxel_cache{cache_suffix}"
-    cache_dir = os.path.join(root, f"{task}_d1", "core", cache_name)
+    cache_dir = os.path.join(root, f"{task}_d0", "core", cache_name)
     manifest_path = os.path.join(cache_dir, "manifest.json")
 
     # Check if already done
@@ -194,9 +194,13 @@ def voxelize_task(
 
     # Voxelize each file
     for idx, (demo_idx, frame_idx, path) in enumerate(tqdm(files, desc=f"  [{task}] Voxelizing")):
-        vox_path = os.path.join(cache_dir, f"{idx:06d}_voxels.pt")
-        meta_path = os.path.join(cache_dir, f"{idx:06d}_meta.pt")
-        extras_path = os.path.join(cache_dir, f"{idx:06d}_extras.pt")
+        # Save per-demo, matching the PLY folder structure: demo_X/frameY_voxels.pt
+        demo_cache_dir = os.path.join(cache_dir, f"demo_{demo_idx}")
+        os.makedirs(demo_cache_dir, exist_ok=True)
+
+        vox_path = os.path.join(demo_cache_dir, f"frame{frame_idx}_voxels.pt")
+        meta_path = os.path.join(demo_cache_dir, f"frame{frame_idx}_meta.pt")
+        extras_path = os.path.join(demo_cache_dir, f"frame{frame_idx}_extras.pt")
 
         # Skip if already exists
         if not force_rebuild and os.path.exists(vox_path) and os.path.exists(meta_path):
@@ -335,7 +339,7 @@ def debug_visualize_tasks(
 def main():
     parser = argparse.ArgumentParser(description="Preprocess MimicGen point clouds to voxels")
     parser.add_argument("--root", type=str, required=True,
-                        help="Root directory containing *_d1 task folders")
+                        help="Root directory containing *_d0 task folders")
     parser.add_argument("--tasks", type=str, nargs="*", default=None,
                         help="Specific tasks to process (default: all)")
     parser.add_argument("--grid_whd", type=int, nargs=3, default=[64, 64, 64],
