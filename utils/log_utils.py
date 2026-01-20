@@ -1,10 +1,17 @@
 import time
 import random
+import sys
 import numpy as np
 import torch
 import os
 
 import wandb
+
+# NumPy 2.x -> 1.x compatibility shim for loading checkpoints
+# Checkpoints saved with NumPy 2.x use numpy._core, which doesn't exist in NumPy 1.x
+if not hasattr(np, '_core'):
+    sys.modules['numpy._core'] = np.core
+    sys.modules['numpy._core.multiarray'] = np.core.multiarray
 
 def _rng_state_pack():
     return {

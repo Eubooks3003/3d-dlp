@@ -30,9 +30,9 @@ from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, 
                             topk_indices_from_output, wandb_log_iter_losses)
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
-from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, log_cov_ellipsoids_over_voxels, 
+from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, log_cov_ellipsoids_over_voxels,
                            extract_volumes_for_vis, print_vol_stats, log_voxel_rec_distributions, filter_topk_kps_3d,
-                           log_rgb_voxels)
+                           log_rgb_voxels, evaluate_validation_voxel, plot_loss_curves)
 import wandb
 
 matplotlib.use("Agg")
@@ -183,7 +183,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     obj_on_beta = config['obj_on_beta']  # transparency beta distribution "b"
 
     # evaluation
-    eval_epoch_freq = config['eval_epoch_freq']
+    eval_epoch_freq = 1
     eval_im_metrics = config['eval_im_metrics']
 
     # visualization
@@ -211,6 +211,14 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                              cache_dir=voxel_root)
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+    # Validation dataset
+    val_dataset = get_point_cloud_dataset(ds, root, mode="val",
+                             voxelize=True, voxel_grid_whd=voxel_grid_whd,
+                             voxel_mode="occupancy",
+                             cache_dir=voxel_root)
+
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # model
 
@@ -356,6 +364,11 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     losses_kl_scale = []
     losses_kl_depth = []
     losses_kl_obj_on = []
+
+    # validation statistics
+    val_losses = []
+    val_losses_rec = []
+    val_losses_kl = []
 
 
 
@@ -520,6 +533,11 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         print(log_str)
         log_line(log_dir, log_str)
 
+        # Store epoch losses for loss curves
+        losses.append(means.get('loss', 0.0))
+        losses_rec.append(means.get('loss_rec', 0.0))
+        losses_kl.append(means.get('kl', 0.0))
+
         wandb.log({**{f"epoch/{k}": v for k, v in means.items()},
             "epoch_idx": epoch}, step=iteration)
 
@@ -565,7 +583,71 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
 
 
-        # ------- EVAL (voxel version) -------
+        # ------- VALIDATION -------
+        if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
+            print(f"\n[Validation] Running validation at epoch {epoch}...")
+
+            # Run validation
+            val_results = evaluate_validation_voxel(
+                model=model,
+                val_dataloader=val_dataloader,
+                device=device,
+                config=config,
+                epoch=epoch,
+                recon_loss_func=recon_loss_func,
+                beta_kl=beta_kl,
+                beta_rec=beta_rec,
+                beta_obj=beta_obj,
+                kl_balance=kl_balance,
+                lambda_color=lambda_color,
+                recon_loss_type=recon_loss_type,
+                fig_dir=fig_dir,
+                save_visuals=True,
+                topk=topk,
+                iteration=iteration,
+            )
+
+            # Store validation losses
+            val_losses.append(val_results.get('val_loss', 0.0))
+            val_losses_rec.append(val_results.get('val_loss_rec', 0.0))
+            val_losses_kl.append(val_results.get('val_kl', 0.0))
+
+            # Log validation metrics - main metrics: Occ IoU + Masked Color PSNR
+            val_log_str = f"[Val] epoch {epoch:04d}"
+            if 'occ_iou' in val_results:
+                val_log_str += f" | Occ IoU: {val_results['occ_iou']:.4f}"
+            if 'masked_color_psnr' in val_results:
+                val_log_str += f" | Masked PSNR: {val_results['masked_color_psnr']:.2f} dB"
+            val_log_str += f" | val_loss: {val_results.get('val_loss', 0.0):.4f}"
+            if 'val_loss_rec' in val_results:
+                val_log_str += f" | val_rec: {val_results['val_loss_rec']:.4f}"
+            if 'val_kl' in val_results:
+                val_log_str += f" | val_kl: {val_results['val_kl']:.4f}"
+            print(val_log_str)
+            log_line(log_dir, val_log_str)
+
+            # Log to wandb
+            wandb.log({f"val/{k}": v for k, v in val_results.items()}, step=iteration)
+
+            # Plot and save loss curves
+            loss_curve_path = os.path.join(fig_dir, f"loss_curves_epoch{epoch:04d}.png")
+            plot_loss_curves(
+                train_losses=losses,
+                val_losses=val_losses,
+                train_losses_rec=losses_rec,
+                val_losses_rec=val_losses_rec,
+                train_losses_kl=losses_kl,
+                val_losses_kl=val_losses_kl,
+                save_path=loss_curve_path,
+                title=f"Training Progress - Epoch {epoch}",
+            )
+
+            # Also save to wandb
+            wandb.log({"loss_curves": wandb.Image(loss_curve_path)}, step=iteration)
+
+            model.train()  # Back to training mode
+
+        # ------- TRAIN VISUALS (voxel version) -------
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
             b0 = 0
 

@@ -1064,3 +1064,345 @@ def filter_topk_kps_3d(
     topk_kp = torch.gather(mu, 1, idx_exp)
     bb_scores = -unc
     return {"indices": idx, "topk_kp": topk_kp, "unc": unc, "bb_scores": bb_scores}
+
+
+# ----------------------------------------------------------------------
+# Validation for Voxel models
+# ----------------------------------------------------------------------
+
+def compute_occupancy_iou(gt_rgb, pred_rgb, occ_thresh=0.1):
+    """
+    Compute IoU between GT and predicted occupancy masks.
+    Occupancy is determined by RGB magnitude > threshold.
+
+    Args:
+        gt_rgb: [C, D, H, W] or [B, C, D, H, W] GT RGB voxels
+        pred_rgb: [C, D, H, W] or [B, C, D, H, W] predicted RGB voxels
+        occ_thresh: threshold for determining occupancy from RGB magnitude
+
+    Returns:
+        float: IoU value
+    """
+    # Handle batch dimension
+    if gt_rgb.dim() == 5:
+        gt_rgb = gt_rgb.reshape(-1, *gt_rgb.shape[2:])
+        pred_rgb = pred_rgb.reshape(-1, *pred_rgb.shape[2:])
+
+    # Compute RGB magnitude (L2 norm across color channels)
+    gt_mag = torch.sqrt((gt_rgb ** 2).sum(dim=0))  # [D, H, W] or [B, D, H, W]
+    pred_mag = torch.sqrt((pred_rgb ** 2).sum(dim=0))
+
+    # Handle normalized RGB in [-1, 1] range
+    if gt_mag.min() < 0:
+        gt_mag = (gt_mag + 1) * 0.5
+    if pred_mag.min() < 0:
+        pred_mag = (pred_mag + 1) * 0.5
+
+    # Create binary occupancy masks
+    gt_occ = (gt_mag > occ_thresh).float()
+    pred_occ = (pred_mag > occ_thresh).float()
+
+    # Compute IoU
+    intersection = (gt_occ * pred_occ).sum()
+    union = ((gt_occ + pred_occ) > 0).float().sum()
+
+    if union < 1e-8:
+        return 1.0  # Both empty = perfect match
+
+    iou = float(intersection / union)
+    return iou
+
+
+def compute_masked_color_psnr(gt_rgb, pred_rgb, occ_thresh=0.1, max_val=1.0):
+    """
+    Compute PSNR only on occupied voxels (masked by GT occupancy).
+
+    Args:
+        gt_rgb: [C, D, H, W] or [B, C, D, H, W] GT RGB voxels
+        pred_rgb: [C, D, H, W] or [B, C, D, H, W] predicted RGB voxels
+        occ_thresh: threshold for determining occupancy from RGB magnitude
+        max_val: maximum value for PSNR calculation (1.0 for normalized, 255 for uint8)
+
+    Returns:
+        float: PSNR value (dB)
+    """
+    # Handle batch dimension
+    if gt_rgb.dim() == 5:
+        gt_rgb = gt_rgb.reshape(-1, *gt_rgb.shape[2:])
+        pred_rgb = pred_rgb.reshape(-1, *pred_rgb.shape[2:])
+
+    # Ensure same device
+    pred_rgb = pred_rgb.to(gt_rgb.device)
+
+    # Compute GT occupancy mask from RGB magnitude
+    gt_mag = torch.sqrt((gt_rgb ** 2).sum(dim=0))  # [D, H, W]
+
+    # Handle normalized RGB in [-1, 1] range - convert to [0, 1]
+    if gt_rgb.min() < 0:
+        gt_rgb = (gt_rgb + 1) * 0.5
+        pred_rgb = (pred_rgb + 1) * 0.5
+        gt_mag = torch.sqrt((gt_rgb ** 2).sum(dim=0))
+
+    gt_occ = gt_mag > occ_thresh  # [D, H, W]
+
+    # Expand mask to match RGB channels: [C, D, H, W]
+    mask = gt_occ.unsqueeze(0).expand_as(gt_rgb)
+
+    # Count occupied voxels (per-channel)
+    n_occupied = mask.sum()
+
+    if n_occupied < 1:
+        return float('inf')  # No occupied voxels
+
+    # Compute MSE only on occupied voxels
+    diff_sq = (gt_rgb - pred_rgb) ** 2
+    mse = (diff_sq * mask).sum() / n_occupied
+
+    if mse < 1e-10:
+        return float('inf')  # Perfect reconstruction
+
+    psnr = 10 * torch.log10(max_val ** 2 / mse)
+    return float(psnr)
+
+
+@torch.no_grad()
+def evaluate_validation_voxel(
+    model,
+    val_dataloader,
+    device,
+    config,
+    epoch,
+    *,
+    recon_loss_func=None,
+    beta_kl=1.0,
+    beta_rec=1.0,
+    beta_obj=0.0,
+    kl_balance=0.001,
+    lambda_color=1.0,
+    recon_loss_type="mse",
+    fig_dir="./",
+    save_visuals=True,
+    topk=10,
+    iteration=None,
+    accelerator=None,
+    occ_thresh=0.1,  # threshold for occupancy detection
+):
+    """
+    Evaluate model on validation set for voxel-based DLP.
+
+    Main metrics:
+        - occ_iou: Occupancy IoU between GT and predicted voxels
+        - masked_color_psnr: PSNR computed only on occupied voxels
+
+    Returns:
+        dict with validation metrics
+    """
+    from utils.loss_functions import calc_reconstruction_loss
+
+    model.eval()
+
+    if recon_loss_func is None:
+        recon_loss_func = calc_reconstruction_loss
+
+    # Collect losses and metrics across batches
+    val_losses = []
+    val_losses_rec = []
+    val_losses_kl = []
+    all_loss_dicts = []
+
+    # Main metrics: Occ IoU + Masked Color PSNR
+    occ_ious = []
+    masked_psnrs = []
+
+    last_model_output = None
+
+    for batch in val_dataloader:
+        vox = batch["voxels"].to(device)
+
+        model_output = model(
+            vox,
+            warmup=False,
+            with_loss=True,
+            beta_kl=beta_kl,
+            beta_rec=beta_rec,
+            kl_balance=kl_balance,
+            recon_loss_type=recon_loss_type,
+            recon_loss_func=recon_loss_func,
+            beta_obj=beta_obj,
+            lambda_color=lambda_color,
+        )
+
+        loss_dict = model_output['loss_dict']
+        val_losses.append(float(loss_dict['loss'].cpu().item()))
+        if 'loss_rec' in loss_dict:
+            val_losses_rec.append(float(loss_dict['loss_rec'].cpu().item()))
+        if 'kl' in loss_dict:
+            val_losses_kl.append(float(loss_dict['kl'].cpu().item()))
+
+        # Store loss dict for averaging
+        all_loss_dicts.append({k: float(v.cpu().item()) if torch.is_tensor(v) else float(v)
+                              for k, v in loss_dict.items() if v is not None})
+
+        # Compute main metrics: Occ IoU + Masked Color PSNR
+        gt_rgb = model_output['x']      # [B, C, D, H, W]
+        pred_rgb = model_output['rec']  # [B, C, D, H, W]
+
+        # Per-batch metrics
+        B = gt_rgb.shape[0]
+        for b in range(B):
+            iou = compute_occupancy_iou(gt_rgb[b], pred_rgb[b], occ_thresh=occ_thresh)
+            psnr = compute_masked_color_psnr(gt_rgb[b], pred_rgb[b], occ_thresh=occ_thresh)
+
+            occ_ious.append(iou)
+            if np.isfinite(psnr):
+                masked_psnrs.append(psnr)
+
+        last_model_output = model_output
+
+    # Compute mean metrics
+    results = {
+        'val_loss': float(np.mean(val_losses)),
+    }
+
+    # Main metrics
+    if occ_ious:
+        results['occ_iou'] = float(np.mean(occ_ious))
+    if masked_psnrs:
+        results['masked_color_psnr'] = float(np.mean(masked_psnrs))
+
+    if val_losses_rec:
+        results['val_loss_rec'] = float(np.mean(val_losses_rec))
+    if val_losses_kl:
+        results['val_kl'] = float(np.mean(val_losses_kl))
+
+    # Average all metrics from loss_dict
+    if all_loss_dicts:
+        all_keys = set()
+        for d in all_loss_dicts:
+            all_keys.update(d.keys())
+        for k in all_keys:
+            vals = [d[k] for d in all_loss_dicts if k in d]
+            if vals:
+                results[f'val_{k}'] = float(np.mean(vals))
+
+    # Save validation visuals
+    if save_visuals and last_model_output is not None:
+        is_main = accelerator is None or accelerator.is_main_process
+        if is_main:
+            b0 = 0
+            gt_vol = last_model_output['x'][b0]
+            rec_vol = last_model_output['rec'][b0]
+
+            # Get keypoint info
+            z_base_b0 = last_model_output["z_base"][b0]
+            mu_tot_b0 = z_base_b0 + last_model_output["mu_offset"][b0]
+
+            # Log validation RGB voxels
+            log_rgb_voxels(
+                name="val/gt_rgb_splat",
+                rgb_vol=gt_vol,
+                alpha_vol=None,
+                KPx=mu_tot_b0,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            log_rgb_voxels(
+                name="val/rec_rgb_splat",
+                rgb_vol=rec_vol,
+                alpha_vol=None,
+                KPx=mu_tot_b0,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+    model.train()
+    return results
+
+
+def plot_loss_curves(
+    train_losses: list,
+    val_losses: list,
+    *,
+    train_losses_rec: list = None,
+    val_losses_rec: list = None,
+    train_losses_kl: list = None,
+    val_losses_kl: list = None,
+    save_path: str = None,
+    title: str = "Training Progress",
+):
+    """
+    Plot training and validation loss curves.
+
+    Args:
+        train_losses: List of training losses per epoch
+        val_losses: List of validation losses per epoch (can be shorter if eval_freq > 1)
+        train_losses_rec: Optional reconstruction losses
+        val_losses_rec: Optional validation reconstruction losses
+        train_losses_kl: Optional KL losses
+        val_losses_kl: Optional validation KL losses
+        save_path: Path to save the figure
+        title: Plot title
+    """
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    # Total loss
+    ax = axes[0]
+    epochs_train = list(range(1, len(train_losses) + 1))
+    ax.plot(epochs_train, train_losses, 'b-', label='Train', linewidth=1.5)
+    if val_losses:
+        # Validation may be computed at different frequency
+        epochs_val = np.linspace(1, len(train_losses), len(val_losses))
+        ax.plot(epochs_val, val_losses, 'r-', label='Val', linewidth=1.5)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Total Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Reconstruction loss
+    ax = axes[1]
+    if train_losses_rec:
+        ax.plot(epochs_train, train_losses_rec, 'b-', label='Train Rec', linewidth=1.5)
+    if val_losses_rec:
+        epochs_val = np.linspace(1, len(train_losses), len(val_losses_rec))
+        ax.plot(epochs_val, val_losses_rec, 'r-', label='Val Rec', linewidth=1.5)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Reconstruction Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # KL loss
+    ax = axes[2]
+    if train_losses_kl:
+        ax.plot(epochs_train, train_losses_kl, 'b-', label='Train KL', linewidth=1.5)
+    if val_losses_kl:
+        epochs_val = np.linspace(1, len(train_losses), len(val_losses_kl))
+        ax.plot(epochs_val, val_losses_kl, 'r-', label='Val KL', linewidth=1.5)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('KL Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.suptitle(title, fontsize=14)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return fig

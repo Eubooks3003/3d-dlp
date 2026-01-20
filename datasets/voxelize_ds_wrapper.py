@@ -55,7 +55,7 @@ class VoxelGridXYZ:
             pmin=pmin, pmax=pmax,
             voxel_size=torch.stack([span[0]/(self.W-1), span[1]/(self.H-1), span[2]/(self.D-1)])
         )
-
+        
         p01 = (points_xyz - pmin) / span
         ix = (p01[:,0] * (self.W-1)).floor().clamp(0, self.W-1).long()
         iy = (p01[:,1] * (self.H-1)).floor().clamp(0, self.H-1).long()

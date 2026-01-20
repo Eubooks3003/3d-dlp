@@ -51,7 +51,7 @@ from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
 from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, log_cov_ellipsoids_over_voxels,
                            extract_volumes_for_vis, print_vol_stats, log_voxel_rec_distributions, filter_topk_kps_3d,
-                           log_rgb_voxels)
+                           log_rgb_voxels, evaluate_validation_voxel, plot_loss_curves)
 import wandb
 
 # Accelerate imports
@@ -237,6 +237,14 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
+    # Validation dataset
+    val_dataset = get_point_cloud_dataset(ds, root, mode="val",
+                             voxelize=True, voxel_grid_whd=voxel_grid_whd,
+                             voxel_mode="occupancy",
+                             cache_dir=voxel_root)
+
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
     # Model
     model = DLP(
         cdim=ch,
@@ -320,8 +328,8 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr, betas=adam_betas, eps=adam_eps, weight_decay=weight_decay)
 
-    # Prepare model, optimizer, dataloader with accelerator
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    # Prepare model, optimizer, dataloaders with accelerator
+    model, optimizer, dataloader, val_dataloader = accelerator.prepare(model, optimizer, dataloader, val_dataloader)
 
     # Scheduler (after accelerator.prepare for optimizer)
     if use_scheduler:
@@ -349,6 +357,14 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     valid_loss = best_valid_loss = 1e8
     valid_losses = []
     best_valid_epoch = 0
+
+    # Training/validation loss tracking for loss curves
+    train_losses = []
+    train_losses_rec = []
+    train_losses_kl = []
+    val_losses = []
+    val_losses_rec = []
+    val_losses_kl = []
 
     # Image metrics
     if eval_im_metrics:
@@ -465,6 +481,12 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         # Pretty print (robust to missing keys)
         log_str = build_epoch_log(epoch, means)
         accelerator.print(log_str)
+
+        # Store epoch losses for loss curves
+        train_losses.append(means.get('loss', 0.0))
+        train_losses_rec.append(means.get('loss_rec', 0.0))
+        train_losses_kl.append(means.get('kl', 0.0))
+
         if accelerator.is_main_process:
             log_line(log_dir, log_str)
             wandb.log({**{f"epoch/{k}": v for k, v in means.items()},
@@ -502,7 +524,71 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         # Synchronize before eval
         accelerator.wait_for_everyone()
 
-        # EVAL (voxel version) - only main process
+        # ------- VALIDATION -------
+        if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
+            accelerator.print(f"\n[Validation] Running validation at epoch {epoch}...")
+
+            # Run validation (use unwrapped model for eval)
+            unwrapped_model = accelerator.unwrap_model(model)
+            val_results = evaluate_validation_voxel(
+                model=unwrapped_model,
+                val_dataloader=val_dataloader,
+                device=accelerator.device,
+                config=config,
+                epoch=epoch,
+                recon_loss_func=recon_loss_func,
+                beta_kl=beta_kl,
+                beta_rec=beta_rec,
+                beta_obj=beta_obj,
+                kl_balance=kl_balance,
+                lambda_color=lambda_color,
+                recon_loss_type=recon_loss_type,
+                fig_dir=fig_dir,
+                save_visuals=accelerator.is_main_process,
+                topk=topk,
+                iteration=iteration,
+                accelerator=accelerator,
+            )
+
+            # Store validation losses
+            val_losses.append(val_results.get('val_loss', 0.0))
+            val_losses_rec.append(val_results.get('val_loss_rec', 0.0))
+            val_losses_kl.append(val_results.get('val_kl', 0.0))
+
+            # Log validation metrics - main metrics: Occ IoU + Masked Color PSNR
+            val_log_str = f"[Val] epoch {epoch:04d}"
+            if 'occ_iou' in val_results:
+                val_log_str += f" | Occ IoU: {val_results['occ_iou']:.4f}"
+            if 'masked_color_psnr' in val_results:
+                val_log_str += f" | Masked PSNR: {val_results['masked_color_psnr']:.2f} dB"
+            val_log_str += f" | val_loss: {val_results.get('val_loss', 0.0):.4f}"
+            if 'val_loss_rec' in val_results:
+                val_log_str += f" | val_rec: {val_results['val_loss_rec']:.4f}"
+            if 'val_kl' in val_results:
+                val_log_str += f" | val_kl: {val_results['val_kl']:.4f}"
+            accelerator.print(val_log_str)
+
+            if accelerator.is_main_process:
+                log_line(log_dir, val_log_str)
+                wandb.log({f"val/{k}": v for k, v in val_results.items()}, step=iteration)
+
+                # Plot and save loss curves
+                loss_curve_path = os.path.join(fig_dir, f"loss_curves_epoch{epoch:04d}.png")
+                plot_loss_curves(
+                    train_losses=train_losses,
+                    val_losses=val_losses,
+                    train_losses_rec=train_losses_rec,
+                    val_losses_rec=val_losses_rec,
+                    train_losses_kl=train_losses_kl,
+                    val_losses_kl=val_losses_kl,
+                    save_path=loss_curve_path,
+                    title=f"Training Progress - Epoch {epoch}",
+                )
+                wandb.log({"loss_curves": wandb.Image(loss_curve_path)}, step=iteration)
+
+            model.train()  # Back to training mode
+
+        # TRAIN VISUALS (voxel version) - only main process
         if (epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1) and accelerator.is_main_process:
             b0 = 0
 
