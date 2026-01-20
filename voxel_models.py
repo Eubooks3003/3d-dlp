@@ -133,6 +133,10 @@ class DLP(nn.Module):
                  depth_feature_dim=16,  # depth feature dimension if separate encoding
                  split_loss=False,  # split loss into components for logging
                  depth_loss_ratio=1.0,  # weight of depth loss if split_loss is True
+
+                 # Prior mode configuration
+                 prior_mode="kmeans",  # "kmeans" | "ssm_raw" | "ssm_enc"
+                 raw_heatmap_mode="luma",  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
                  ):
         super(DLP, self).__init__()
         """
@@ -285,6 +289,11 @@ class DLP(nn.Module):
         assert filtering_heuristic in ['distance', 'variance',
                                        'random', 'none'], f'unknown filtering heuristic: {filtering_heuristic}'
         self.filtering_heuristic = filtering_heuristic
+
+        # prior mode configuration
+        assert prior_mode in ['kmeans', 'ssm_raw', 'ssm_enc'], f'unknown prior_mode: {prior_mode}'
+        self.prior_mode = prior_mode
+        self.raw_heatmap_mode = raw_heatmap_mode
 
         self.particle_score = particle_score
         # self.use_z_orig = use_z_orig if (self.n_kp_enc == self.n_kp_prior and timestep_horizon > 1) else False
@@ -463,6 +472,8 @@ class DLP(nn.Module):
                                          init_conv_bg_std=init_conv_bg_std,  # std for conv bg normal dist
                                          separate_depth_features=separate_depth_features,
                                          depth_feature_dim=depth_feature_dim,
+                                         prior_mode=prior_mode,
+                                         raw_heatmap_mode=raw_heatmap_mode,
                                          )
 
         # prior

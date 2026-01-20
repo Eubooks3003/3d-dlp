@@ -205,6 +205,10 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     voxel_grid_whd = config["voxel_grid_whd"]
     voxel_root = config.get("voxel_root", None)
 
+    # Prior mode configuration
+    prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
+    raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
+
     dataset = get_point_cloud_dataset(ds, root, mode="train",
                              voxelize=True, voxel_grid_whd=voxel_grid_whd,
                              voxel_mode="occupancy",
@@ -281,11 +285,15 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         timestep_horizon=1,
         
         #RGBD Stuff
-        separate_depth_features=separate_depth_features, 
+        separate_depth_features=separate_depth_features,
         depth_feature_dim=depth_feature_dim,
-        split_loss=split_loss, 
+        split_loss=split_loss,
         depth_loss_ratio=depth_loss_ratio,
-    
+
+        # Prior mode configuration
+        prior_mode=prior_mode,
+        raw_heatmap_mode=raw_heatmap_mode,
+
         ).to(device)
         
     model_info = model.info()

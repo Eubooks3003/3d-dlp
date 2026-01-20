@@ -5094,7 +5094,10 @@ class ParticleEncoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  separate_depth_features=False,
-                 depth_feature_dim=16,):
+                 depth_feature_dim=16,
+                 # prior mode configuration
+                 prior_mode="kmeans",  # "kmeans" | "ssm_raw" | "ssm_enc"
+                 raw_heatmap_mode="luma",):  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
         super(ParticleEncoder, self).__init__()
         """
         DLP Foreground Module – Extracts objects from an image using keypoints and learned features. 
@@ -5183,7 +5186,7 @@ class ParticleEncoder(nn.Module):
         self.separate_depth_features = separate_depth_features
         self.depth_feature_dim = depth_feature_dim
 
-        print("Creating DLP Prior with cdim: ", cdim)
+        print("Creating DLP Prior with cdim: ", cdim, " prior_mode: ", prior_mode)
         self.prior_encoder = DLPPrior(cdim=cdim, volume_size=image_size, n_kp=self.n_kp_per_patch,
                                       patch_size=patch_size, kp_range=kp_range, pad_mode=pad_mode,
                                       n_kp_prior=n_kp_prior,
@@ -5191,7 +5194,8 @@ class ParticleEncoder(nn.Module):
                                       ch_mult=obj_ch_mult_prior, base_ch=obj_base_ch, num_res_blocks=num_res_blocks,
                                       use_resblock=use_resblock, cnn_mid_blocks=cnn_mid_blocks,
                                       init_ssm_last_layer=init_ssm_last_layer, init_conv_layers=init_conv_layers,
-                                      init_conv_fg_std=init_conv_fg_std)
+                                      init_conv_fg_std=init_conv_fg_std,
+                                      prior_mode=prior_mode, raw_heatmap_mode=raw_heatmap_mode)
 
         # attribute encoder - anchor (z_a), offset (z_o), scale (z_s)
         anchor_s_att = patch_size / image_size
@@ -5781,9 +5785,12 @@ class DLPEncoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
-                 #RGBD 
+                 #RGBD
                  separate_depth_features=False, # use separate feature encoder for RGB and Depth channels
                  depth_feature_dim=16, # feature dimension for depth channel
+                 # prior mode configuration
+                 prior_mode="kmeans",  # "kmeans" | "ssm_raw" | "ssm_enc"
+                 raw_heatmap_mode="luma",  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
                  ):
         """
         DLP Encoder Module
@@ -5972,7 +5979,9 @@ class DLPEncoder(nn.Module):
                                             init_conv_layers=init_conv_layers,
                                             init_conv_fg_std=init_conv_fg_std,
                                             separate_depth_features=separate_depth_features,
-                                            depth_feature_dim=depth_feature_dim)
+                                            depth_feature_dim=depth_feature_dim,
+                                            prior_mode=prior_mode,
+                                            raw_heatmap_mode=raw_heatmap_mode)
 
         self.prior_encoder = self.particle_enc.prior_encoder
         self.bg_encoder = BgEncoder(cdim=cdim, image_size=image_size, pad_mode=pad_mode,
