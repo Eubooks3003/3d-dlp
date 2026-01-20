@@ -120,6 +120,96 @@ def get_task_files(root: str, task: str):
     return files
 
 
+def get_ply_structure(root: str, task: str):
+    """
+    Get the structure of PLY files: {demo_idx: [frame_indices]}.
+    Returns dict mapping demo index to list of frame indices.
+    """
+    task_pcd_root = os.path.join(root, f"{task}_d0", "core", "mimicgen_from_depth_pcd")
+    if not os.path.isdir(task_pcd_root):
+        return {}
+
+    structure = {}
+    demo_dirs = sorted(
+        glob.glob(os.path.join(task_pcd_root, "demo_*")),
+        key=lambda x: int(os.path.basename(x).split("_")[1])
+    )
+
+    for demo_dir in demo_dirs:
+        demo_idx = int(os.path.basename(demo_dir).split("_")[1])
+        ply_files = sorted(glob.glob(os.path.join(demo_dir, "*.ply")))
+        frame_indices = []
+        for ply_path in ply_files:
+            fname = os.path.basename(ply_path)
+            try:
+                frame_idx = int(fname.split("_")[0].replace("frame", ""))
+                frame_indices.append(frame_idx)
+            except (ValueError, IndexError):
+                pass
+        structure[demo_idx] = sorted(frame_indices)
+
+    return structure
+
+
+def get_cache_structure(cache_dir: str):
+    """
+    Get the structure of cached voxels: {demo_idx: [frame_indices]}.
+    Returns dict mapping demo index to list of frame indices that have been cached.
+    """
+    if not os.path.isdir(cache_dir):
+        return {}
+
+    structure = {}
+    demo_dirs = sorted(
+        glob.glob(os.path.join(cache_dir, "demo_*")),
+        key=lambda x: int(os.path.basename(x).split("_")[1])
+    )
+
+    for demo_dir in demo_dirs:
+        demo_idx = int(os.path.basename(demo_dir).split("_")[1])
+        # Look for frame*_voxels.pt files
+        vox_files = sorted(glob.glob(os.path.join(demo_dir, "frame*_voxels.pt")))
+        frame_indices = []
+        for vox_path in vox_files:
+            fname = os.path.basename(vox_path)
+            try:
+                # Extract frame index from "frameN_voxels.pt"
+                frame_idx = int(fname.replace("frame", "").replace("_voxels.pt", ""))
+                frame_indices.append(frame_idx)
+            except (ValueError, IndexError):
+                pass
+        structure[demo_idx] = sorted(frame_indices)
+
+    return structure
+
+
+def find_resume_point(ply_structure: dict, cache_structure: dict):
+    """
+    Find where to resume processing by comparing PLY structure to cache structure.
+
+    Returns:
+        (start_demo, start_frame) - the first (demo, frame) that needs processing
+        None if everything is complete
+    """
+    if not ply_structure:
+        return None  # No PLY files
+
+    ply_demos = sorted(ply_structure.keys())
+
+    for demo_idx in ply_demos:
+        ply_frames = set(ply_structure.get(demo_idx, []))
+        cache_frames = set(cache_structure.get(demo_idx, []))
+
+        # Find missing frames in this demo
+        missing_frames = ply_frames - cache_frames
+        if missing_frames:
+            # Return the first missing frame in this demo
+            return (demo_idx, min(missing_frames))
+
+    # All complete
+    return None
+
+
 def compute_global_bounds_for_task(files, include_rgb=True, normalize_to_unit_cube=True):
     """Compute global bounds across all files for a task."""
     print(f"  Computing global bounds across {len(files)} files...")
@@ -146,24 +236,55 @@ def voxelize_task(
     include_rgb=True,
     normalize_to_unit_cube=True,
     max_points=None,
-    force_rebuild=False,
     cache_suffix="",        # e.g., "_debug" for voxel_cache_debug
     max_files=None,         # limit number of files to process (for debug)
     use_fixed_bounds=False, # use MIMICGEN_CROP_BOUNDS as fixed voxelization bounds
 ):
-    """Voxelize all frames for a single task and save to cache."""
+    """Voxelize all frames for a single task and save to cache. Automatically resumes from where it left off."""
     cache_name = f"voxel_cache{cache_suffix}"
     cache_dir = os.path.join(root, f"{task}_d0", "core", cache_name)
     manifest_path = os.path.join(cache_dir, "manifest.json")
 
-    # Check if already done
-    if not force_rebuild and os.path.exists(manifest_path):
-        with open(manifest_path, "r") as f:
-            mani = json.load(f)
-        if mani.get("complete", False):
-            print(f"[{task}] Already complete ({mani.get('length', '?')} files), skipping. Use --force to rebuild.")
-            return
+    # Get structure of PLY files and cached voxels
+    ply_structure = get_ply_structure(root, task)
+    if not ply_structure:
+        print(f"[{task}] No PLY files found, skipping.")
+        return
 
+    cache_structure = get_cache_structure(cache_dir)
+
+    # Find resume point
+    resume_point = find_resume_point(ply_structure, cache_structure)
+
+    # Count totals
+    total_ply_frames = sum(len(frames) for frames in ply_structure.values())
+    total_cached_frames = sum(len(frames) for frames in cache_structure.values())
+    total_demos = len(ply_structure)
+    cached_demos = len(cache_structure)
+
+    if resume_point is None:
+        print(f"[{task}] Already complete: {total_cached_frames}/{total_ply_frames} frames across {total_demos} demos.")
+        # Update manifest to mark complete
+        os.makedirs(cache_dir, exist_ok=True)
+        manifest = {
+            "task": task,
+            "length": total_ply_frames,
+            "grid_whd": list(grid_whd),
+            "mode": voxel_mode,
+            "bounds_mode": "fixed_mimicgen_crop" if use_fixed_bounds else "per_item",
+            "complete": True,
+        }
+        if use_fixed_bounds:
+            manifest["fixed_bounds"] = MIMICGEN_CROP_BOUNDS
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        return
+
+    start_demo, start_frame = resume_point
+    print(f"\n[{task}] Resuming from demo_{start_demo}/frame{start_frame}")
+    print(f"  Progress: {total_cached_frames}/{total_ply_frames} frames cached ({cached_demos}/{total_demos} demos)")
+
+    # Get all files to process
     files = get_task_files(root, task)
     if len(files) == 0:
         print(f"[{task}] No files found, skipping.")
@@ -172,9 +293,8 @@ def voxelize_task(
     # Limit files if max_files is set (for debug mode)
     if max_files is not None and max_files > 0:
         files = files[:max_files]
-        print(f"\n[{task}] Processing {len(files)} frames (limited to {max_files} for debug)...")
-    else:
-        print(f"\n[{task}] Processing {len(files)} frames...")
+        print(f"  Processing up to {len(files)} frames (limited to {max_files} for debug)...")
+
     os.makedirs(cache_dir, exist_ok=True)
 
     # Determine bounds mode
@@ -192,8 +312,17 @@ def voxelize_task(
         bounds_mode = "per_item"
         print(f"  Using per_item bounds (each frame uses its own min/max)")
 
-    # Voxelize each file
-    for idx, (demo_idx, frame_idx, path) in enumerate(tqdm(files, desc=f"  [{task}] Voxelizing")):
+    # Count how many we need to process
+    to_process = []
+    for demo_idx, frame_idx, path in files:
+        cached_frames = set(cache_structure.get(demo_idx, []))
+        if frame_idx not in cached_frames:
+            to_process.append((demo_idx, frame_idx, path))
+
+    print(f"  {len(to_process)} frames remaining to process...")
+
+    # Voxelize each file that's not already cached
+    for idx, (demo_idx, frame_idx, path) in enumerate(tqdm(to_process, desc=f"  [{task}] Voxelizing")):
         # Save per-demo, matching the PLY folder structure: demo_X/frameY_voxels.pt
         demo_cache_dir = os.path.join(cache_dir, f"demo_{demo_idx}")
         os.makedirs(demo_cache_dir, exist_ok=True)
@@ -201,10 +330,6 @@ def voxelize_task(
         vox_path = os.path.join(demo_cache_dir, f"frame{frame_idx}_voxels.pt")
         meta_path = os.path.join(demo_cache_dir, f"frame{frame_idx}_meta.pt")
         extras_path = os.path.join(demo_cache_dir, f"frame{frame_idx}_extras.pt")
-
-        # Skip if already exists
-        if not force_rebuild and os.path.exists(vox_path) and os.path.exists(meta_path):
-            continue
 
         # Read and preprocess
         pts = read_ply(path, include_rgb=include_rgb)
@@ -242,7 +367,7 @@ def voxelize_task(
     # Write manifest
     manifest = {
         "task": task,
-        "length": len(files),
+        "length": total_ply_frames,
         "grid_whd": list(grid_whd),
         "mode": voxel_mode,
         "bounds_mode": bounds_mode,
@@ -253,7 +378,7 @@ def voxelize_task(
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"  [{task}] Done! Saved {len(files)} voxels to {cache_dir}")
+    print(f"  [{task}] Done! Total {total_ply_frames} voxels in {cache_dir}")
 
 
 def debug_visualize_tasks(
@@ -349,8 +474,6 @@ def main():
                         help="Voxelization mode (default: avg_rgb)")
     parser.add_argument("--max_points", type=int, default=None,
                         help="Max points per cloud (default: no limit)")
-    parser.add_argument("--force", action="store_true",
-                        help="Force rebuild even if cache exists")
     parser.add_argument("--no_rgb", action="store_true",
                         help="Don't include RGB (xyz only)")
     parser.add_argument("--no_normalize", action="store_true",
@@ -406,7 +529,6 @@ def main():
                 include_rgb=not args.no_rgb,
                 normalize_to_unit_cube=not args.no_normalize,
                 max_points=args.max_points,
-                force_rebuild=True,  # always rebuild in debug mode
                 cache_suffix="_debug",
                 max_files=args.debug_n,
                 use_fixed_bounds=args.fixed_bounds,
@@ -414,7 +536,7 @@ def main():
         print(f"\nDebug dataset saved to voxel_cache_debug/ in each task folder")
         return
 
-    # Process each task (full mode)
+    # Process each task (full mode) - automatically resumes from where it left off
     for task in tasks:
         voxelize_task(
             root=args.root,
@@ -424,7 +546,6 @@ def main():
             include_rgb=not args.no_rgb,
             normalize_to_unit_cube=not args.no_normalize,
             max_points=args.max_points,
-            force_rebuild=args.force,
             use_fixed_bounds=args.fixed_bounds,
         )
 
