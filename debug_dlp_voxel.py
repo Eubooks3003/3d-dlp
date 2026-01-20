@@ -362,17 +362,50 @@ def make_iso_sweep() -> List[float]:
 
 # ------------------------------- main -------------------------------
 
+class VoxelDirDataset(torch.utils.data.Dataset):
+    """Simple dataset that loads voxels from a directory of .pt files."""
+
+    def __init__(self, voxel_dir: str, max_files: int = None):
+        self.voxel_dir = voxel_dir
+        self.files = []
+
+        # Find all voxel files (multiple patterns)
+        patterns = [
+            os.path.join(voxel_dir, "*_voxels.pt"),
+            os.path.join(voxel_dir, "frame_*_voxels.pt"),
+            os.path.join(voxel_dir, "*voxels*.pt"),
+        ]
+        for pattern in patterns:
+            self.files = sorted(glob.glob(pattern))
+            if self.files:
+                break
+
+        if max_files is not None:
+            self.files = self.files[:max_files]
+
+        print(f"[VoxelDirDataset] Found {len(self.files)} voxel files in {voxel_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        vox = torch.load(self.files[idx], map_location="cpu")
+        return {"voxels": vox, "path": self.files[idx]}
+
+
 def main():
     ap = argparse.ArgumentParser("Debug a trained Voxel DLP checkpoint with the same voxel eval as training.")
     ap.add_argument("--config", "-c", type=str, required=True, help="Path to config JSON (same used for training).")
-    ap.add_argument("--run-dir", type=str, required=True, help="Directory containing checkpoints (e.g., ./logs/.../saves).")
-    ap.add_argument("--ckpt", type=str, default="", help="Explicit checkpoint path (overrides latest in run-dir).")
+    ap.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint file (.pth/.pt/.ckpt).")
+    ap.add_argument("--run-dir", type=str, default="", help="(Optional) Directory to search for latest checkpoint if --ckpt not given.")
     ap.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split.")
     ap.add_argument("--batch-size", type=int, default=1, help="Batch size for debug pass.")
     ap.add_argument("--max-batches", type=int, default=4, help="How many batches to visualize.")
     ap.add_argument("--wandb", action="store_true", help="If set, logs visualizations to W&B.")
     ap.add_argument("--project", type=str, default="dlp-debug", help="W&B project name.")
     ap.add_argument("--name", type=str, default="", help="Optional W&B run name.")
+    ap.add_argument("--voxel-dir", type=str, default=None,
+                    help="Load voxels from this directory instead of dataset (e.g., saved mimicgen voxels)")
     args = ap.parse_args()
 
     # ----- config + device -----
@@ -385,22 +418,28 @@ def main():
     device = torch.device(device if ('cuda' in device and torch.cuda.is_available()) else 'cpu')
     print(f"[info] Using device: {device}")
 
-    # ----- dataset → voxelized wrapper (mirrors training’s input batch['voxels']) -----
-    ds_name = cfg['ds']
-    root    = cfg['root']
-
-    base_ds = get_point_cloud_dataset(
-        ds_name, root, mode=args.split, max_points=4096, include_rgb=(ch == 6)
-    )
-    loader = DataLoader(base_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    # ----- dataset → voxelized wrapper (mirrors training's input batch['voxels']) -----
+    if args.voxel_dir is not None:
+        # Load directly from saved voxel files
+        print(f"[info] Loading voxels from directory: {args.voxel_dir}")
+        base_ds = VoxelDirDataset(args.voxel_dir, max_files=args.max_batches * args.batch_size)
+        loader = DataLoader(base_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    else:
+        # Load from point cloud dataset (original behavior)
+        ds_name = cfg['ds']
+        root    = cfg['root']
+        base_ds = get_point_cloud_dataset(
+            ds_name, root, mode=args.split, max_points=4096, include_rgb=(ch == 6)
+        )
+        loader = DataLoader(base_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # ----- model -----
     model = load_model_from_config(cfg, device)
 
     # ----- checkpoint -----
-    ckpt_path = args.ckpt or find_latest_checkpoint(os.path.join(args.run_dir))
-    if ckpt_path is None:
-        print(f"[!] No checkpoint found in {args.run_dir}")
+    ckpt_path = args.ckpt
+    if not os.path.isfile(ckpt_path):
+        print(f"[!] Checkpoint not found: {ckpt_path}")
         sys.exit(1)
 
     print(f"[info] Loading checkpoint: {ckpt_path}")
@@ -435,7 +474,8 @@ def main():
 
     # ----- W&B -----
     if args.wandb:
-        runname = args.name or f"debug-vox-{os.path.basename(args.run_dir)}-{int(time.time())}"
+        ckpt_basename = os.path.splitext(os.path.basename(ckpt_path))[0]
+        runname = args.name or f"debug-vox-{ckpt_basename}-{int(time.time())}"
         wandb.init(project=args.project, name=runname,
                    config={"config_path": args.config, "ckpt": ckpt_path, "split": args.split})
         print("[info] W&B logging enabled.")
@@ -458,6 +498,20 @@ def main():
             rec_vol = model_output['rec'][0]
             print_vol_stats("GT", gt_vol)
             print_vol_stats("REC", rec_vol)
+
+            # Log GT voxels
+            log_rgb_voxels(
+                name="gt/rgb_splat",
+                rgb_vol=gt_vol,
+                alpha_vol=None,
+                KPx=None,
+                step=step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
 
 
 

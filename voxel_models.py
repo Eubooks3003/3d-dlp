@@ -873,7 +873,6 @@ class DLP(nn.Module):
                 z_features    = z_features.reshape(orig_shape[0], orig_shape[1], *z_features.shape[1:])
                 obj_on_sample = obj_on_sample.reshape(orig_shape[0], orig_shape[1], *obj_on_sample.shape[1:])
 
-        print("z shape: ", z.shape)
         # delegate to the decoder module
         dec_dict = self.decoder_module(
             z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup
