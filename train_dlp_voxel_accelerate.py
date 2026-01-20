@@ -66,6 +66,14 @@ torch.set_float32_matmul_precision("high")
 
 
 from collections import defaultdict
+import time
+
+
+def cuda_sync():
+    """Synchronize CUDA for accurate timing."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
 
 def _to_float_safe(x, default=None):
     if x is None:
@@ -413,9 +421,19 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         epoch_avg = EpochAverager()
 
         pbar = tqdm(iterable=dataloader, disable=not accelerator.is_local_main_process)
-        for batch in pbar:
-            vox = batch["voxels"].to(accelerator.device, non_blocking=True)
-            vox = vox.to(memory_format=torch.channels_last_3d)
+        for it, batch in enumerate(pbar):
+            t0 = time.time()
+
+            # Get batch (already on CPU from dataloader)
+            vox_cpu = batch["voxels"]
+            cuda_sync()
+            t1 = time.time()
+
+            # Host to device transfer + channels_last_3d for better perf
+            vox = vox_cpu.to(accelerator.device, non_blocking=True)
+            vox = vox.contiguous(memory_format=torch.channels_last_3d)
+            cuda_sync()
+            t2 = time.time()
 
             warmup = (epoch < warmup_epoch)
 
@@ -426,15 +444,33 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
                                  beta_obj=beta_obj, lambda_color=lambda_color)
+            loss = model_output['loss_dict']['loss']
+            cuda_sync()
+            t3 = time.time()
 
-            # Compute & backprop
-            all_losses = model_output['loss_dict']
-            loss = all_losses['loss']
-            optimizer.zero_grad()
+            # Backward pass
+            optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
+            cuda_sync()
+            t4 = time.time()
+
+            # Optimizer step
             optimizer.step()
+            cuda_sync()
+            t5 = time.time()
+
+            # Print timing for first 10 iterations of first epoch
+            if accelerator.is_main_process and epoch == start_epoch and it < 10:
+                print(f"iter {it:03d} | "
+                      f"get_batch {t1-t0:.3f}s | "
+                      f"H2D {t2-t1:.3f}s | "
+                      f"fwd {t3-t2:.3f}s | "
+                      f"bwd {t4-t3:.3f}s | "
+                      f"step {t5-t4:.3f}s | "
+                      f"total {t5-t0:.3f}s")
 
             # Collect losses for epoch averaging (no per-iter wandb logging)
+            all_losses = model_output['loss_dict']
             logged = {k: _to_float_safe(v) for k, v in all_losses.items()}
             epoch_avg.add(logged)
 
