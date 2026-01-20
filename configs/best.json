@@ -1,6 +1,6 @@
 {
   "ds": "voxel",
-  "root": "/home/ellina/Desktop/Code/3D-DLP-data/voxel_data/voxel_shapenet_rgb",
+  "root": "/home/ellina/Desktop/Code/articubot-on-mimicgen/mimicgen_data/stack_d1/core/voxel_cache",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn",
   "voxel_mode": "occupancy",
