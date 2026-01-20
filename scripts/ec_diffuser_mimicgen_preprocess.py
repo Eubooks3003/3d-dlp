@@ -5,12 +5,109 @@ import h5py
 import torch
 import open3d as o3d
 
+import sys                                                                                                                   
+import numpy.core as _core                                                                                                   
+sys.modules['numpy._core'] = _core                                                                                           
+sys.modules['numpy._core.multiarray'] = _core.multiarray    
 from voxel_models import DLP
 from utils.util_func import get_config
 from utils.log_utils import load_checkpoint
 
 from datasets.voxelize_ds_wrapper import VoxelGridXYZ
 from robomimic_converter import RobomimicAbsoluteActionConverter
+
+
+# ----------------------------
+# Gripper state extraction
+# ----------------------------
+def quat_to_rot6d(quat: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion (w,x,y,z) or (x,y,z,w) to 6D rotation representation.
+    6D = first two columns of rotation matrix, flattened.
+
+    Args:
+        quat: [..., 4] quaternion array
+    Returns:
+        rot6d: [..., 6] rotation representation
+    """
+    # Robomimic uses (x,y,z,w) convention
+    x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+
+    # Rotation matrix from quaternion
+    # First column
+    r00 = 1 - 2*(y*y + z*z)
+    r10 = 2*(x*y + w*z)
+    r20 = 2*(x*z - w*y)
+
+    # Second column
+    r01 = 2*(x*y - w*z)
+    r11 = 1 - 2*(x*x + z*z)
+    r21 = 2*(y*z + w*x)
+
+    # Stack first two columns as 6D representation
+    rot6d = np.stack([r00, r10, r20, r01, r11, r21], axis=-1)
+    return rot6d.astype(np.float32)
+
+
+def extract_gripper_state(h5, demo: str) -> np.ndarray:
+    """
+    Extract gripper state from H5 file for a demo.
+
+    Gripper state format: [pos(3), rot_6d(6), gripper_open(1)] = 10 dims
+
+    Args:
+        h5: open h5py.File
+        demo: demo name like "demo_0"
+
+    Returns:
+        gripper_state: [T, 10] array
+    """
+    obs_group = h5[f"data/{demo}/obs"]
+
+    # End-effector position (3D)
+    eef_pos_key = None
+    for key in ["robot0_eef_pos", "eef_pos"]:
+        if key in obs_group:
+            eef_pos_key = key
+            break
+    if eef_pos_key is None:
+        raise RuntimeError(f"Cannot find eef_pos in {demo}/obs. Available keys: {list(obs_group.keys())}")
+    eef_pos = np.asarray(obs_group[eef_pos_key], dtype=np.float32)  # [T, 3]
+
+    # End-effector quaternion (4D) -> convert to 6D rotation
+    eef_quat_key = None
+    for key in ["robot0_eef_quat", "eef_quat"]:
+        if key in obs_group:
+            eef_quat_key = key
+            break
+    if eef_quat_key is None:
+        raise RuntimeError(f"Cannot find eef_quat in {demo}/obs. Available keys: {list(obs_group.keys())}")
+    eef_quat = np.asarray(obs_group[eef_quat_key], dtype=np.float32)  # [T, 4]
+    eef_rot6d = quat_to_rot6d(eef_quat)  # [T, 6]
+
+    # Gripper state (openness) - typically from gripper joint positions
+    gripper_key = None
+    for key in ["robot0_gripper_qpos", "gripper_qpos"]:
+        if key in obs_group:
+            gripper_key = key
+            break
+
+    if gripper_key is not None:
+        gripper_qpos = np.asarray(obs_group[gripper_key], dtype=np.float32)  # [T, 2] typically
+        # Take mean of two finger positions as gripper openness (normalized)
+        # MimicGen gripper: 0 = closed, 0.04 = open (for Panda)
+        gripper_open = gripper_qpos.mean(axis=-1, keepdims=True)  # [T, 1]
+        # Normalize to roughly [-1, 1] range (0.02 is roughly middle)
+        gripper_open = (gripper_open - 0.02) / 0.02
+    else:
+        # Fallback: try to get from actions (last dim is often gripper command)
+        print(f"[warn] No gripper_qpos found for {demo}, using zeros")
+        gripper_open = np.zeros((eef_pos.shape[0], 1), dtype=np.float32)
+
+    # Concatenate: [pos(3), rot6d(6), gripper_open(1)] = 10D
+    gripper_state = np.concatenate([eef_pos, eef_rot6d, gripper_open], axis=-1)
+
+    return gripper_state
 
 
 # ----------------------------
@@ -241,14 +338,20 @@ def main():
     # data
     ap.add_argument("--h5", required=True)
     ap.add_argument("--ply-dir", required=True)
-    ap.add_argument("--ply-pattern", default=r"(?P<demo>demo_\d+)_frame(?P<t>\d+)_.*\.ply")
+    ap.add_argument("--ply-pattern", default=r"frame(?P<t>\d+)_fused_envcalib\.ply")
     ap.add_argument("--max-demos", type=int, default=None)
     ap.add_argument("--max-frames", type=int, default=None)
 
     # PC preprocessing (TODataset knobs)
     ap.add_argument("--max-points", type=int, default=4096)
-    ap.add_argument("--normalize-to-unit-cube", action="store_true")
-    ap.add_argument("--include-rgb", action="store_true")
+    ap.add_argument("--normalize-to-unit-cube", action="store_true", default=True,
+                    help="Normalize point cloud to unit cube (default: True, matching preprocessing pipeline)")
+    ap.add_argument("--no-normalize", dest="normalize_to_unit_cube", action="store_false",
+                    help="Disable unit cube normalization")
+    ap.add_argument("--include-rgb", action="store_true", default=True,
+                    help="Include RGB in point cloud (default: True)")
+    ap.add_argument("--no-rgb", dest="include_rgb", action="store_false",
+                    help="Exclude RGB from point cloud")
 
     # voxelization (VoxelizedDataset knobs)
     ap.add_argument("--grid-dhw", default="64,64,64")
@@ -274,24 +377,63 @@ def main():
     D, H, W = map(int, args.grid_dhw.split(","))
     device = torch.device(args.device if ("cuda" in args.device and torch.cuda.is_available()) else "cpu")
 
-    # Build PLY index
-    pat = re.compile(args.ply_pattern)
+    # Build PLY index - supports two structures:
+    # 1. Nested: demo_X/frameYYYYYY_fused_envcalib.ply
+    # 2. Flat:   demo_X_frameYYYYYY_fused.ply
     ply_map = {}
-    for fn in os.listdir(args.ply_dir):
-        m = pat.match(fn)
-        if not m:
+    frame_pat = re.compile(args.ply_pattern)
+
+    # First try nested structure (demo_* subdirectories)
+    nested_found = False
+    for demo_dir in sorted(os.listdir(args.ply_dir)):
+        demo_path = os.path.join(args.ply_dir, demo_dir)
+        if not os.path.isdir(demo_path):
             continue
-        demo = m.group("demo")
-        t = int(m.group("t"))
-        ply_map.setdefault(demo, {})[t] = os.path.join(args.ply_dir, fn)
+        if not demo_dir.startswith("demo_"):
+            continue
+
+        demo = demo_dir  # e.g., "demo_0"
+
+        # Scan PLY files in this demo directory
+        for fn in os.listdir(demo_path):
+            m = frame_pat.match(fn)
+            if not m:
+                continue
+            t = int(m.group("t"))
+            ply_map.setdefault(demo, {})[t] = os.path.join(demo_path, fn)
+            nested_found = True
+
+    # If no nested structure found, try flat structure (demo_X_frameYYYYYY_fused.ply)
+    if not nested_found:
+        print("[ply] No nested structure found, trying flat file naming...")
+        flat_pat = re.compile(r"(?P<demo>demo_\d+)_frame(?P<t>\d+)_fused\.ply")
+
+        for fn in sorted(os.listdir(args.ply_dir)):
+            if not fn.endswith(".ply"):
+                continue
+            m = flat_pat.match(fn)
+            if not m:
+                continue
+            demo = m.group("demo")  # e.g., "demo_0"
+            t = int(m.group("t"))
+            ply_map.setdefault(demo, {})[t] = os.path.join(args.ply_dir, fn)
 
     demos = sorted(ply_map.keys(), key=lambda s: int(s.split("_")[-1]))
     if args.max_demos is not None:
         demos = demos[:args.max_demos]
     if len(demos) == 0:
-        raise RuntimeError("No demos found in ply-dir with given ply-pattern.")
+        raise RuntimeError(
+            f"No demos found in ply-dir with given ply-pattern.\n"
+            f"  Tried nested structure: {args.ply_dir}/demo_X/frame000000_fused_envcalib.ply\n"
+            f"  Tried flat structure:   {args.ply_dir}/demo_X_frame000000_fused.ply\n"
+            f"  Pattern used: {args.ply_pattern}"
+        )
 
     print(f"[ply] demos found: {len(demos)}")
+    if demos:
+        sample_demo = demos[0]
+        sample_frames = sorted(ply_map[sample_demo].keys())
+        print(f"[ply] sample: {sample_demo} has {len(sample_frames)} frames (t={sample_frames[0]}..{sample_frames[-1]})")
 
     # Bounds mode (match VoxelizedDataset behavior)
     bounds_pm = None
@@ -321,7 +463,7 @@ def main():
     expected_c = int(cfg.get("ch", 3))
 
     # Per-demo episode building
-    ep_obs, ep_act, path_lengths = [], [], []
+    ep_obs, ep_act, ep_gripper, path_lengths = [], [], [], []
     total_written = 0
 
     # Action converter (only needed for absolute mode)
@@ -387,10 +529,12 @@ def main():
             init_states.append(init_state)
             demo_indices.append(demo_idx)
 
-
+            # Extract gripper state for this demo
+            gripper_state_full = extract_gripper_state(h5, demo)  # [T_full, 10]
 
             obs_steps = []
             act_steps = []
+            gripper_steps = []
 
             t0 = 0
             while t0 < T:
@@ -441,6 +585,7 @@ def main():
                 toks_np = toks.detach().cpu().numpy().astype(np.float32)
                 obs_steps.append(toks_np)
                 act_steps.append(actions[valid_ts].astype(np.float32))
+                gripper_steps.append(gripper_state_full[valid_ts].astype(np.float32))
 
                 total_written += toks_np.shape[0]
 
@@ -449,10 +594,12 @@ def main():
 
             obs_ep = np.concatenate(obs_steps, axis=0)  # [L,K,Dtok]
             act_ep = np.concatenate(act_steps, axis=0)  # [L,A]
+            gripper_ep = np.concatenate(gripper_steps, axis=0)  # [L, 10]
             L = obs_ep.shape[0]
 
             ep_obs.append(obs_ep)
             ep_act.append(act_ep)
+            ep_gripper.append(gripper_ep)
             path_lengths.append(L)
 
             print(f"[demo] {demo}: wrote {L} frames (TOTAL={total_written})")
@@ -466,18 +613,21 @@ def main():
     K = int(ep_obs[0].shape[1])
     Dtok = int(ep_obs[0].shape[2])
     A = int(ep_act[0].shape[1])
+    G = int(ep_gripper[0].shape[1])  # gripper_dim = 10
 
-    observations = np.zeros((E, Tmax, K, Dtok), dtype=np.float32)
-    actions      = np.zeros((E, Tmax, A),       dtype=np.float32)
-    rewards      = np.zeros((E, Tmax, 1),       dtype=np.float32)
-    terminals    = np.zeros((E, Tmax, 1),       dtype=np.float32)
-    timeouts     = np.zeros((E, Tmax, 1),       dtype=np.float32)
-    goals        = np.zeros((E, Tmax, K, Dtok), dtype=np.float32)
+    observations  = np.zeros((E, Tmax, K, Dtok), dtype=np.float32)
+    actions       = np.zeros((E, Tmax, A),       dtype=np.float32)
+    gripper_state = np.zeros((E, Tmax, G),       dtype=np.float32)
+    rewards       = np.zeros((E, Tmax, 1),       dtype=np.float32)
+    terminals     = np.zeros((E, Tmax, 1),       dtype=np.float32)
+    timeouts      = np.zeros((E, Tmax, 1),       dtype=np.float32)
+    goals         = np.zeros((E, Tmax, K, Dtok), dtype=np.float32)
 
     for e in range(E):
         L = int(path_lengths[e])
-        observations[e, :L] = ep_obs[e]
-        actions[e, :L]      = ep_act[e]
+        observations[e, :L]  = ep_obs[e]
+        actions[e, :L]       = ep_act[e]
+        gripper_state[e, :L] = ep_gripper[e]
 
         g = ep_obs[e][L - 1]          # [K,Dtok]
         goals[e, :L] = g[None, :, :]
@@ -485,10 +635,11 @@ def main():
         terminals[e, L - 1, 0] = 1.0
 
         if L < Tmax:
-            observations[e, L:] = observations[e, L - 1:L]
-            goals[e, L:]        = goals[e, L - 1:L]
-            actions[e, L:]      = 0.0
-            timeouts[e, L:, 0]  = 1.0
+            observations[e, L:]  = observations[e, L - 1:L]
+            goals[e, L:]         = goals[e, L - 1:L]
+            actions[e, L:]       = 0.0
+            gripper_state[e, L:] = gripper_state[e, L - 1:L]  # repeat last gripper state
+            timeouts[e, L:, 0]   = 1.0
 
     path_lengths = np.asarray(path_lengths, dtype=np.int32)
     info_goals_reached = np.ones((E,), dtype=np.float32)
@@ -499,15 +650,18 @@ def main():
             "K": int(K),
             "Dtok": int(Dtok),
             "A": int(A),
+            "G": int(G),  # gripper_dim
             "Tmax": int(Tmax),
             "repr": "DLP_tokens_k24",
             "voxel_mode": args.voxel_mode,
             "bounds_mode": args.bounds_mode,
             "action_mode": args.action_mode,  # "absolute" or "relative"
             "demo_indices": np.asarray(demo_indices, dtype=np.int32),
+            "gripper_state_format": "pos(3)_rot6d(6)_open(1)",  # document the format
         },
         "observations": observations,
         "actions": actions,
+        "gripper_state": gripper_state,  # [E, Tmax, 10] - eef_pos(3) + rot6d(6) + gripper_open(1)
         "rewards": rewards,
         "terminals": terminals,
         "timeouts": timeouts,
@@ -523,7 +677,8 @@ def main():
         pickle.dump(paths_dict, f)
 
     print(f"\nWrote: {args.out_pkl}")
-    print(f"E={E}, Tmax={Tmax}, K={K}, Dtok={Dtok}, A={A}, action_mode={args.action_mode}")
+    print(f"E={E}, Tmax={Tmax}, K={K}, Dtok={Dtok}, A={A}, G={G} (gripper_dim), action_mode={args.action_mode}")
+    print(f"gripper_state shape: {gripper_state.shape} (format: pos(3) + rot6d(6) + gripper_open(1))")
 
 
 if __name__ == "__main__":

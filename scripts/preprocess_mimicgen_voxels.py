@@ -10,7 +10,7 @@ Run on multiple machines with different --tasks to parallelize:
 Or process all tasks on one machine:
     python preprocess_mimicgen_voxels.py --root /path/to/mimicgen
 
-Each task's voxels are saved to: {root}/{task}_d0/core/voxel_cache/
+Each task's voxels are saved to: {root}/{task}_d1/core/voxel_cache/
 """
 
 import os
@@ -28,6 +28,33 @@ import open3d as o3d
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets.voxelize_ds_wrapper import VoxelGridXYZ
+
+
+# Fixed crop bounds from mimicgen_ply_all_tasks.py - these define the workspace
+# that the PLY generation script uses to crop point clouds
+MIMICGEN_CROP_BOUNDS = {
+    "xmin": -0.7, "xmax": 0.9,
+    "ymin": -0.5, "ymax": 0.5,
+    "zmin": -0.2, "zmax": 2.5
+}
+
+
+def get_fixed_voxel_bounds():
+    """
+    Convert MIMICGEN_CROP_BOUNDS to voxelization bounds (pmin, pmax tensors).
+    These bounds match what's used in mimicgen_ply_all_tasks.py for cropping.
+    """
+    pmin = torch.tensor([
+        MIMICGEN_CROP_BOUNDS["xmin"],
+        MIMICGEN_CROP_BOUNDS["ymin"],
+        MIMICGEN_CROP_BOUNDS["zmin"]
+    ], dtype=torch.float32)
+    pmax = torch.tensor([
+        MIMICGEN_CROP_BOUNDS["xmax"],
+        MIMICGEN_CROP_BOUNDS["ymax"],
+        MIMICGEN_CROP_BOUNDS["zmax"]
+    ], dtype=torch.float32)
+    return pmin, pmax
 
 
 def safe_tensor(arr, dtype=torch.float32):
@@ -61,14 +88,14 @@ def center_scale_unit_cube(pts: np.ndarray) -> np.ndarray:
 
 
 def discover_tasks(root: str):
-    """Auto-discover all *_d0 task folders."""
-    task_dirs = sorted(glob.glob(os.path.join(root, "*_d0")))
-    return [os.path.basename(d).replace("_d0", "") for d in task_dirs]
+    """Auto-discover all *_d1 task folders."""
+    task_dirs = sorted(glob.glob(os.path.join(root, "*_d1")))
+    return [os.path.basename(d).replace("_d1", "") for d in task_dirs]
 
 
 def get_task_files(root: str, task: str):
     """Get all .ply files for a task, sorted by demo and frame."""
-    task_pcd_root = os.path.join(root, f"{task}_d0", "core", "mimicgen_from_depth_pcd")
+    task_pcd_root = os.path.join(root, f"{task}_d1", "core", "mimicgen_from_depth_pcd")
     if not os.path.isdir(task_pcd_root):
         return []
 
@@ -120,9 +147,13 @@ def voxelize_task(
     normalize_to_unit_cube=True,
     max_points=None,
     force_rebuild=False,
+    cache_suffix="",        # e.g., "_debug" for voxel_cache_debug
+    max_files=None,         # limit number of files to process (for debug)
+    use_fixed_bounds=False, # use MIMICGEN_CROP_BOUNDS as fixed voxelization bounds
 ):
     """Voxelize all frames for a single task and save to cache."""
-    cache_dir = os.path.join(root, f"{task}_d0", "core", "voxel_cache")
+    cache_name = f"voxel_cache{cache_suffix}"
+    cache_dir = os.path.join(root, f"{task}_d1", "core", cache_name)
     manifest_path = os.path.join(cache_dir, "manifest.json")
 
     # Check if already done
@@ -138,13 +169,28 @@ def voxelize_task(
         print(f"[{task}] No files found, skipping.")
         return
 
-    print(f"\n[{task}] Processing {len(files)} frames...")
+    # Limit files if max_files is set (for debug mode)
+    if max_files is not None and max_files > 0:
+        files = files[:max_files]
+        print(f"\n[{task}] Processing {len(files)} frames (limited to {max_files} for debug)...")
+    else:
+        print(f"\n[{task}] Processing {len(files)} frames...")
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Use per_item bounds (each frame normalized to its own min/max)
-    # This is fine for MimicGen since scenes have consistent bounds
-    bounds = None
-    print(f"  Using per_item bounds (each frame uses its own min/max)")
+    # Determine bounds mode
+    if use_fixed_bounds:
+        # Use fixed bounds from MIMICGEN_CROP_BOUNDS (same as PLY generation crop)
+        bounds = get_fixed_voxel_bounds()
+        bounds_mode = "fixed_mimicgen_crop"
+        print(f"  Using FIXED bounds from MIMICGEN_CROP_BOUNDS:")
+        print(f"    x: [{MIMICGEN_CROP_BOUNDS['xmin']}, {MIMICGEN_CROP_BOUNDS['xmax']}]")
+        print(f"    y: [{MIMICGEN_CROP_BOUNDS['ymin']}, {MIMICGEN_CROP_BOUNDS['ymax']}]")
+        print(f"    z: [{MIMICGEN_CROP_BOUNDS['zmin']}, {MIMICGEN_CROP_BOUNDS['zmax']}]")
+    else:
+        # Use per_item bounds (each frame normalized to its own min/max)
+        bounds = None
+        bounds_mode = "per_item"
+        print(f"  Using per_item bounds (each frame uses its own min/max)")
 
     # Voxelize each file
     for idx, (demo_idx, frame_idx, path) in enumerate(tqdm(files, desc=f"  [{task}] Voxelizing")):
@@ -195,9 +241,11 @@ def voxelize_task(
         "length": len(files),
         "grid_whd": list(grid_whd),
         "mode": voxel_mode,
-        "bounds_mode": "per_item",
+        "bounds_mode": bounds_mode,
         "complete": True,
     }
+    if use_fixed_bounds:
+        manifest["fixed_bounds"] = MIMICGEN_CROP_BOUNDS
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -212,6 +260,7 @@ def debug_visualize_tasks(
     include_rgb=True,
     normalize_to_unit_cube=True,
     wandb_project="mimicgen-voxel-debug",
+    use_fixed_bounds=False,
 ):
     """Debug mode: voxelize one frame per task and log to wandb."""
     import wandb
@@ -220,6 +269,13 @@ def debug_visualize_tasks(
     # Initialize wandb
     wandb.init(project=wandb_project, name=f"debug-voxels-{len(tasks)}-tasks")
     print(f"[debug] Logging to wandb project: {wandb_project}")
+
+    # Get fixed bounds if requested
+    if use_fixed_bounds:
+        fixed_bounds = get_fixed_voxel_bounds()
+        print(f"[debug] Using FIXED bounds from MIMICGEN_CROP_BOUNDS")
+    else:
+        fixed_bounds = None
 
     for step, task in enumerate(tasks):
         files = get_task_files(root, task)
@@ -235,18 +291,22 @@ def debug_visualize_tasks(
         pts = read_ply(path, include_rgb=include_rgb)
         print(f"  Raw points: {pts.shape}")
 
-        if normalize_to_unit_cube:
+        if normalize_to_unit_cube and not use_fixed_bounds:
             pts = center_scale_unit_cube(pts)
             print(f"  After normalization: min={pts[:,:3].min(axis=0)}, max={pts[:,:3].max(axis=0)}")
 
         pts_xyz = safe_tensor(pts[:, :3])
         colors = safe_tensor(pts[:, 3:6]) if (pts.shape[-1] >= 6 and voxel_mode == "avg_rgb") else None
 
-        # Compute bounds from this single frame
-        pmin = pts_xyz.amin(dim=0)
-        pmax = pts_xyz.amax(dim=0)
-        bounds = (pmin, pmax)
-        print(f"  Bounds: min={pmin.tolist()}, max={pmax.tolist()}")
+        # Compute bounds
+        if use_fixed_bounds:
+            bounds = fixed_bounds
+            print(f"  Using fixed bounds: min={bounds[0].tolist()}, max={bounds[1].tolist()}")
+        else:
+            pmin = pts_xyz.amin(dim=0)
+            pmax = pts_xyz.amax(dim=0)
+            bounds = (pmin, pmax)
+            print(f"  Bounds: min={pmin.tolist()}, max={pmax.tolist()}")
 
         # Voxelize
         vg = VoxelGridXYZ(pts_xyz, colors, grid_whd=grid_whd, bounds=bounds, mode=voxel_mode)
@@ -275,7 +335,7 @@ def debug_visualize_tasks(
 def main():
     parser = argparse.ArgumentParser(description="Preprocess MimicGen point clouds to voxels")
     parser.add_argument("--root", type=str, required=True,
-                        help="Root directory containing *_d0 task folders")
+                        help="Root directory containing *_d1 task folders")
     parser.add_argument("--tasks", type=str, nargs="*", default=None,
                         help="Specific tasks to process (default: all)")
     parser.add_argument("--grid_whd", type=int, nargs=3, default=[64, 64, 64],
@@ -293,8 +353,14 @@ def main():
                         help="Don't normalize to unit cube")
     parser.add_argument("--debug", action="store_true",
                         help="Debug mode: voxelize one frame per task and log to wandb")
+    parser.add_argument("--debug_dataset", action="store_true",
+                        help="Debug dataset mode: voxelize first N frames and save to voxel_cache_debug")
+    parser.add_argument("--debug_n", type=int, default=10,
+                        help="Number of frames to process in debug_dataset mode (default: 10)")
     parser.add_argument("--wandb_project", type=str, default="mimicgen-voxel-debug",
                         help="Wandb project for debug visualizations (default: mimicgen-voxel-debug)")
+    parser.add_argument("--fixed_bounds", action="store_true",
+                        help="Use fixed MIMICGEN_CROP_BOUNDS for voxelization instead of per-item bounds")
 
     args = parser.parse_args()
 
@@ -320,10 +386,31 @@ def main():
             include_rgb=not args.no_rgb,
             normalize_to_unit_cube=not args.no_normalize,
             wandb_project=args.wandb_project,
+            use_fixed_bounds=args.fixed_bounds,
         )
         return
 
-    # Process each task
+    # Debug dataset mode: process limited files and save to voxel_cache_debug
+    if args.debug_dataset:
+        print(f"\n=== DEBUG DATASET MODE: Processing {args.debug_n} frames per task ===")
+        for task in tasks:
+            voxelize_task(
+                root=args.root,
+                task=task,
+                grid_whd=tuple(args.grid_whd),
+                voxel_mode=args.voxel_mode,
+                include_rgb=not args.no_rgb,
+                normalize_to_unit_cube=not args.no_normalize,
+                max_points=args.max_points,
+                force_rebuild=True,  # always rebuild in debug mode
+                cache_suffix="_debug",
+                max_files=args.debug_n,
+                use_fixed_bounds=args.fixed_bounds,
+            )
+        print(f"\nDebug dataset saved to voxel_cache_debug/ in each task folder")
+        return
+
+    # Process each task (full mode)
     for task in tasks:
         voxelize_task(
             root=args.root,
@@ -334,6 +421,7 @@ def main():
             normalize_to_unit_cube=not args.no_normalize,
             max_points=args.max_points,
             force_rebuild=args.force,
+            use_fixed_bounds=args.fixed_bounds,
         )
 
     print("\nAll done!")

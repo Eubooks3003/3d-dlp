@@ -36,7 +36,7 @@ import robosuite
 A_GL2CV = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
 
 DEFAULT_CAMS = ["agentview", "sideview"]
-DEFAULT_CROP = {"xmin": -0.5, "xmax": 2.0, "ymin": -0.5, "ymax": 2.0, "zmin": -0.2, "zmax": 2.5}
+DEFAULT_CROP = {"xmin": -0.7, "xmax": 0.9, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 2.5}
 
 
 def squeeze_hw(d):
