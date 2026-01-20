@@ -232,6 +232,10 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     voxel_grid_whd = config["voxel_grid_whd"]
     voxel_root = config.get("voxel_root", None)
 
+    # Prior mode configuration
+    prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
+    raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
+
     # Dataset
     dataset = get_point_cloud_dataset(ds, root, mode="train",
                              voxelize=True, voxel_grid_whd=voxel_grid_whd,
@@ -291,6 +295,9 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         depth_feature_dim=depth_feature_dim,
         split_loss=split_loss,
         depth_loss_ratio=depth_loss_ratio,
+        # Prior mode configuration
+        prior_mode=prior_mode,
+        raw_heatmap_mode=raw_heatmap_mode,
     )
 
     model_info = model.info()
@@ -402,57 +409,21 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
 
             # Forward pass
             model_output = model(vox, warmup=warmup, with_loss=True,
-                                beta_kl=beta_kl,
-                                beta_rec=beta_rec, kl_balance=kl_balance,
-                                recon_loss_type=recon_loss_type,
-                                recon_loss_func=recon_loss_func,
-                                beta_obj=beta_obj, lambda_color=lambda_color)
-
-            # Diagnostics logging (only main process)
-            if accelerator.is_main_process:
-                with torch.no_grad():
-                    d = model_output.get("diag", None)
-                    if d:
-                        wandb.log({
-                            "spawn/r_s0": float(d["radii"][:,0].mean().item()) if d["radii"].size(1) >= 1 else None,
-                            "spawn/r_s1": float(d["radii"][:,1].mean().item()) if d["radii"].size(1) >= 2 else None,
-                            "spawn/u_std_s0": float(d["u_std"][:,0].mean().item()) if d["u_std"].size(1) >= 1 else None,
-                            "spawn/u_std_s1": float(d["u_std"][:,1].mean().item()) if d["u_std"].size(1) >= 2 else None,
-                            "spawn/scale_mean": float(d["scale_mean"].mean().item()),
-                            "spawn/d2kp_mean": float(d["d2kp_mean"].mean().item()),
-                            "spawn/d2kp_std":  float(d["d2kp_std"].mean().item()),
-                        }, step=iteration)
-
-                    # Object-cloud spread in world space
-                    pts_obj = model_output.get("points_obj", None)
-                    kp = model_output.get("kp_p", None)
-                    if (pts_obj is not None) and (kp is not None):
-                        d = (pts_obj - kp.unsqueeze(2)).norm(dim=-1)
-                        world_rad_mean = d.mean(dim=(1,2)).mean().item()
-                        world_rad_std = d.std(dim=(1,2)).mean().item()
-                        wandb.log({
-                            "obj/rad_mean": world_rad_mean,
-                            "obj/rad_std": world_rad_std
-                        }, step=iteration)
-
-                        B,K,M,_ = pts_obj.shape
-                        m_sub = min(256, M)
-                        idx = torch.randperm(M, device=pts_obj.device)[:m_sub]
-                        Psub = pts_obj[:,:,idx]
-                        D = torch.cdist(Psub.reshape(B*K, m_sub, 3), Psub.reshape(B*K, m_sub, 3), p=2)
-                        D[torch.arange(B*K, device=D.device).unsqueeze(-1), torch.arange(m_sub, device=D.device)] = 1e9
-                        min_nn = D.min(dim=-1).values.mean().item()
-                        wandb.log({"obj/min_nn_dist_mean": min_nn}, step=iteration)
+                                 beta_kl=beta_kl,
+                                 beta_rec=beta_rec, kl_balance=kl_balance,
+                                 recon_loss_type=recon_loss_type,
+                                 recon_loss_func=recon_loss_func,
+                                 beta_obj=beta_obj, lambda_color=lambda_color)
 
             # Compute & backprop
             all_losses = model_output['loss_dict']
             loss = all_losses['loss']
             optimizer.zero_grad()
-            accelerator.backward(loss)  # Use accelerator.backward instead of loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
 
-            # Log losses (only main process)
-            logged = wandb_log_lossdict(all_losses, iteration, accelerator=accelerator)
+            # Collect losses for epoch averaging (no per-iter wandb logging)
+            logged = {k: _to_float_safe(v) for k, v in all_losses.items()}
             epoch_avg.add(logged)
 
             # Progress bar
@@ -468,10 +439,6 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 loss=pick('loss'),
                 rec=pick('loss_rec'),
                 KL=pick('kl'),
-                kp=pick('loss_kl_kp'),
-                feat=pick('loss_kl_feat'),
-                scale=pick('loss_kl_scale'),
-                obj=pick('loss_kl_obj_on'),
             )
 
             iteration += 1

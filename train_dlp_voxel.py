@@ -429,86 +429,29 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
-            vox  = batch["voxels"].to(device)  
-            # mask = batch["mask"].to(device) 
+            vox = batch["voxels"].to(device)
 
             warmup = (epoch < warmup_epoch)
             # forward pass
             model_output = model(vox, warmup=warmup, with_loss=True,
-                                            beta_kl=beta_kl,
-                                            beta_rec=beta_rec, kl_balance=kl_balance,
-                                            recon_loss_type=recon_loss_type,
-                                            recon_loss_func=recon_loss_func,
-                                            beta_obj=beta_obj, lambda_color=lambda_color)
-            
-            with torch.no_grad():
-                # --- decoder-side diagnostics if present ---
-                d = model_output.get("diag", None)
-                if d:
-                    # Means across batch for concise scalars
-                    wandb.log({
-                        "spawn/r_s0": float(d["radii"][:,0].mean().item()) if d["radii"].size(1) >= 1 else None,
-                        "spawn/r_s1": float(d["radii"][:,1].mean().item()) if d["radii"].size(1) >= 2 else None,
-                        "spawn/u_std_s0": float(d["u_std"][:,0].mean().item()) if d["u_std"].size(1) >= 1 else None,
-                        "spawn/u_std_s1": float(d["u_std"][:,1].mean().item()) if d["u_std"].size(1) >= 2 else None,
-                        "spawn/scale_mean": float(d["scale_mean"].mean().item()),
-                        "spawn/d2kp_mean": float(d["d2kp_mean"].mean().item()),
-                        "spawn/d2kp_std":  float(d["d2kp_std"].mean().item()),
-                    }, step=iteration)
-                # --- object-cloud spread in world space ---
-            pts_obj = model_output.get("points_obj", None)     # [B,K,M,3]
-            kp      = model_output.get("kp_p", None)           # [B,K,3]
-            if (pts_obj is not None) and (kp is not None):
-                # per-object mean radial distance and std
-                d = (pts_obj - kp.unsqueeze(2)).norm(dim=-1)   # [B,K,M]
-                world_rad_mean = d.mean(dim=(1,2)).mean().item()
-                world_rad_std  = d.std(dim=(1,2)).mean().item()
-                wandb.log({
-                    "obj/rad_mean": world_rad_mean,
-                    "obj/rad_std":  world_rad_std
-                }, step=iteration)
+                                 beta_kl=beta_kl,
+                                 beta_rec=beta_rec, kl_balance=kl_balance,
+                                 recon_loss_type=recon_loss_type,
+                                 recon_loss_func=recon_loss_func,
+                                 beta_obj=beta_obj, lambda_color=lambda_color)
 
-                # min-NN distance inside each object (sampled to keep it cheap)
-                # subsample points to avoid O(M^2)
-                B,K,M,_ = pts_obj.shape
-                m_sub = min(256, M)
-                idx = torch.randperm(M, device=pts_obj.device)[:m_sub]
-                Psub = pts_obj[:,:,idx]                        # [B,K,m_sub,3]
-                # compute KNN=2 to skip self
-                D = torch.cdist(Psub.reshape(B*K, m_sub, 3), Psub.reshape(B*K, m_sub, 3), p=2)
-                D[torch.arange(B*K, device=D.device).unsqueeze(-1), torch.arange(m_sub, device=D.device)] = 1e9
-                min_nn = D.min(dim=-1).values.mean().item()
-                wandb.log({"obj/min_nn_dist_mean": min_nn}, step=iteration)
-            # --- pick tensors inside model_output to watch gradient flow through ---
-            watch_tensors = {}
-            for name in ["kp_p", "z", "z_scale", "mu_offset", "mu_scale",
-                        "z_features", "z_obj_on", "z_depth"]:
-                t = model_output.get(name, None)
-                if t is not None and t.requires_grad:
-                    t.retain_grad()                 # allow reading .grad on non-leaf tensors
-                    watch_tensors[name] = t
-
-            # ---- compute & backprop ----
-            all_losses = model_output['loss_dict']          # whatever your calc_* returned
-            loss = all_losses['loss']                       # must exist
+            # Compute & backprop
+            all_losses = model_output['loss_dict']
+            loss = all_losses['loss']
             optimizer.zero_grad()
             loss.backward()
-
-            # grads (unchanged)
-            for k, v in watch_tensors.items():
-                gm = (v.grad.abs().mean().item() if v.grad is not None else 0.0)
-                gM = (v.grad.abs().max().item()  if v.grad is not None else 0.0)
-                wandb.log({f"grad/{k}_mean": gm, f"grad/{k}_max": gM}, step=iteration)
-            log_block_grads(model, iteration)
-            plot_grad_flow(list(model.named_parameters()), iteration)
-
             optimizer.step()
 
-            # ---- log exactly what your loss dict contains ----
-            logged = wandb_log_lossdict(all_losses, iteration)   # returns dict of floats
+            # Collect losses for epoch averaging (no per-iter wandb logging)
+            logged = {k: _to_float_safe(v) for k, v in all_losses.items()}
             epoch_avg.add(logged)
 
-            # ---- compact tqdm postfix using available keys ----
+            # Progress bar
             def pick(key, default=0.0):
                 return logged.get(key, default)
 
@@ -521,16 +464,10 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 loss=pick('loss'),
                 rec=pick('loss_rec'),
                 KL=pick('kl'),
-                kp=pick('loss_kl_kp'),
-                feat=pick('loss_kl_feat'),
-                scale=pick('loss_kl_scale'),
-                obj=pick('loss_kl_obj_on'),
             )
 
             iteration += 1
 
-
-            # break  # for debug
         pbar.close()
         # at end of epoch
         # end of epoch
