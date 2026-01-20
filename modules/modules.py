@@ -3850,9 +3850,9 @@ class DLPPrior(nn.Module):
         self.feat_mode = "lab"
         self.append_xyz = True
         self.saliency = "L"
-        self.keep_top = 20000
-        self.sample_m = 6000
-        self.iters = 30
+        self.keep_top = 4000
+        self.sample_m = 2048
+        self.iters = 5
         self.tol = 1e-4
         self.ridge = 1e-3
 
