@@ -2,164 +2,231 @@
 
 import os
 import glob
-from typing import Dict, Optional
+import json
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import open3d as o3d
 
 
-class MimicGenPointCloudDataset(Dataset):
+class MimicGenVoxelDataset(Dataset):
     """
-    MimicGen fused point-cloud dataset.
+    MimicGen voxel dataset that reads from precomputed voxel cache.
 
-    Expects flat .ply files under:
-        <root>/
-          demo_0_frame000000_fused.ply
-          demo_0_frame000001_fused.ply
-          ...
+    Expects cache structure created by preprocess_mimicgen_voxels.py:
+        <root>/{task}_d0/core/voxel_cache/
+          manifest.json
+          demo_0/
+            frame0_voxels.pt
+            frame0_meta.pt
+            frame0_extras.pt
+            frame1_voxels.pt
+            ...
+          demo_1/
+            ...
 
-    Train/val/test are done *internally* via index splitting, NOT folders.
-
-    Returns one point cloud per __getitem__ (use sample_length=1).
+    Train/val/test are done *internally* via index splitting on demos.
+    Use max_demos to limit the number of demos (complete trajectories) used.
 
     Each sample:
         {
-          "points": [N, C]  (C=3 or 6 for xyz[+rgb]),
-          "mask":   [N] bool (all True),
-          "path":   str,
-          "id":     str   # filename without extension
+          "voxels": [C, D, H, W] tensor,
+          "meta": dict with pmin, pmax, voxel_size, etc.,
+          "fg_mask": [D, H, W] bool tensor,
+          "id": str,
+          "task": str,
+          "demo": int,
+          "frame": int,
+          "path": str (original PLY path),
         }
     """
 
     def __init__(
         self,
         root: str,
+        task: str,
         split: str = "train",             # "train" | "val" | "test"
-        max_points: int = 4096,
-        normalize_to_unit_cube: bool = True,
-        include_rgb: bool = False,
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         seed: int = 42,
-        proportion: float = 1.0,          # optional extra downsampling of scenes
-        max_items: Optional[int] = None,
+        proportion: float = 1.0,          # optional extra downsampling
+        max_demos: Optional[int] = None,  # limit number of demos (not frames)
+        cache_suffix: str = "",           # e.g., "_debug" for voxel_cache_debug
+        device: Optional[torch.device] = None,
     ):
         self.root = os.path.abspath(root)
+        self.task = task
         self.split = split
-        self.max_points = int(max_points)
-        self.normalize_to_unit_cube = bool(normalize_to_unit_cube)
-        self.include_rgb = bool(include_rgb)
-        self.max_items = max_items
+        self.max_demos = max_demos
+        self.device = device
 
-        # enumerate all .ply files in flat directory
-        all_files = sorted(glob.glob(os.path.join(self.root, "*.ply")))
-        if len(all_files) == 0:
-            raise RuntimeError(f"No .ply files found in {self.root}")
+        # Build cache directory path
+        cache_name = f"voxel_cache{cache_suffix}"
+        self.cache_dir = os.path.join(self.root, f"{task}_d0", "core", cache_name)
 
-        # optional scene-level proportion (like TODataset)
+        if not os.path.isdir(self.cache_dir):
+            raise FileNotFoundError(f"Voxel cache not found: {self.cache_dir}")
+
+        # Read manifest if available
+        manifest_path = os.path.join(self.cache_dir, "manifest.json")
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "r") as f:
+                self.manifest = json.load(f)
+        else:
+            self.manifest = {}
+
+        # Discover all cached frames: list of (demo_idx, frame_idx, vox_path, meta_path, extras_path)
+        all_frames = self._discover_frames()
+        if len(all_frames) == 0:
+            raise RuntimeError(f"No voxel files found in {self.cache_dir}")
+
+        # Optional proportion downsampling (applied before split)
         proportion = float(proportion)
         if not (0.0 < proportion <= 1.0):
             raise ValueError(f"proportion must be in (0,1], got {proportion}")
-        n_total = len(all_files)
+        n_total = len(all_frames)
         n_keep = max(1, int(round(n_total * proportion)))
-        all_files = all_files[:n_keep]
+        all_frames = all_frames[:n_keep]
 
-        # ------- internal train/val/test split via indices -------
+        # ------- internal train/val/test split via demo indices -------
+        # Split by demo to avoid data leakage between train/val/test
         train_ratio = float(train_ratio)
         val_ratio = float(val_ratio)
         if train_ratio + val_ratio > 1.0 + 1e-6:
             raise ValueError(f"train_ratio + val_ratio must be <= 1, got {train_ratio + val_ratio}")
 
-        N = len(all_files)
-        indices = np.arange(N)
+        # Group frames by demo
+        demos = {}
+        for demo_idx, frame_idx, vox_path, meta_path, extras_path in all_frames:
+            if demo_idx not in demos:
+                demos[demo_idx] = []
+            demos[demo_idx].append((demo_idx, frame_idx, vox_path, meta_path, extras_path))
+
+        demo_indices = sorted(demos.keys())
+
+        # Shuffle demos deterministically
         rng = np.random.RandomState(seed)
-        rng.shuffle(indices)
+        shuffled_demos = demo_indices.copy()
+        rng.shuffle(shuffled_demos)
 
-        n_train = int(round(train_ratio * N))
-        n_val = int(round(val_ratio * N))
-        n_train = min(n_train, N)
-        n_val = min(n_val, max(0, N - n_train))
-        n_test = N - n_train - n_val
+        # Apply max_demos BEFORE split (so max_demos=10 → 8 train, 1 val, 1 test)
+        if self.max_demos is not None and self.max_demos < len(shuffled_demos):
+            shuffled_demos = shuffled_demos[:self.max_demos]
 
-        train_idx = indices[:n_train]
-        val_idx = indices[n_train:n_train + n_val]
-        test_idx = indices[n_train + n_val:]
+        N_demos = len(shuffled_demos)
+        n_train = int(round(train_ratio * N_demos))
+        n_val = int(round(val_ratio * N_demos))
+        n_train = min(n_train, N_demos)
+        n_val = min(n_val, max(0, N_demos - n_train))
+
+        train_demos = set(shuffled_demos[:n_train])
+        val_demos = set(shuffled_demos[n_train:n_train + n_val])
+        test_demos = set(shuffled_demos[n_train + n_val:])
 
         split_l = split.lower()
         if split_l == "train":
-            chosen_idx = np.sort(train_idx)
+            chosen_demos = train_demos
         elif split_l == "val":
-            chosen_idx = np.sort(val_idx)
+            chosen_demos = val_demos
         elif split_l == "test":
-            chosen_idx = np.sort(test_idx)
+            chosen_demos = test_demos
         else:
             raise ValueError(f"Unknown split '{split}' (expected 'train'/'val'/'test')")
 
-        # finally, keep only the files for this split
-        self.files = [all_files[i] for i in chosen_idx]
-        if len(self.files) == 0:
-            raise RuntimeError(f"No files assigned to split '{split}' (N={N})")
+        # Collect all frames from chosen demos
+        self.items: List[Tuple[int, int, str, str, str]] = []
+        for demo_idx in sorted(chosen_demos):
+            self.items.extend(demos[demo_idx])
 
-    # ------------- helpers -------------
+        if len(self.items) == 0:
+            raise RuntimeError(f"No files assigned to split '{split}' (N_demos={N_demos})")
 
-    def _read_ply(self, path: str) -> np.ndarray:
+    def _discover_frames(self) -> List[Tuple[int, int, str, str, str]]:
         """
-        Reads a .ply file with Open3D. Returns np.ndarray [N, C] where C=3 (xyz) or 6 (xyzrgb).
+        Discover all cached voxel frames.
+        Returns list of (demo_idx, frame_idx, vox_path, meta_path, extras_path).
         """
-        pc = o3d.io.read_point_cloud(path)
-        xyz = np.asarray(pc.points, dtype=np.float32)
-        if self.include_rgb and len(pc.colors) > 0:
-            rgb = np.asarray(pc.colors, dtype=np.float32)  # already 0..1 in Open3D
-            if rgb.shape[0] == xyz.shape[0]:
-                return np.concatenate([xyz, rgb], axis=-1)
-        return xyz
+        frames = []
 
-    @staticmethod
-    def _center_scale_unit_cube(pts: np.ndarray) -> np.ndarray:
-        """
-        Center and isotropically scale to fit in [-1,1]^3 (only xyz affected).
-        """
-        out = pts.copy()
-        xyz = out[:, :3]
-        if xyz.shape[0] == 0:
-            return out
-        mins = xyz.min(axis=0)
-        maxs = xyz.max(axis=0)
-        center = (mins + maxs) / 2.0
-        scale = (maxs - mins).max() + 1e-8
-        out[:, :3] = (xyz - center[None, :]) / scale * 2.0
-        return out
+        demo_dirs = sorted(
+            glob.glob(os.path.join(self.cache_dir, "demo_*")),
+            key=lambda x: int(os.path.basename(x).split("_")[1])
+        )
 
-    def _downsample(self, pts: np.ndarray) -> np.ndarray:
-        if pts.shape[0] <= self.max_points:
-            return pts
-        idx = np.random.choice(pts.shape[0], self.max_points, replace=False)
-        return pts[idx]
+        for demo_dir in demo_dirs:
+            demo_idx = int(os.path.basename(demo_dir).split("_")[1])
 
-    # ------------- Dataset API -------------
+            # Find all voxel files in this demo
+            vox_files = sorted(glob.glob(os.path.join(demo_dir, "frame*_voxels.pt")))
+
+            for vox_path in vox_files:
+                fname = os.path.basename(vox_path)
+                try:
+                    # Extract frame index from "frameN_voxels.pt"
+                    frame_idx = int(fname.replace("frame", "").replace("_voxels.pt", ""))
+                except (ValueError, IndexError):
+                    continue
+
+                # Build paths for meta and extras
+                meta_path = os.path.join(demo_dir, f"frame{frame_idx}_meta.pt")
+                extras_path = os.path.join(demo_dir, f"frame{frame_idx}_extras.pt")
+
+                # Only include if voxels file exists (meta/extras are optional)
+                if os.path.exists(vox_path):
+                    frames.append((demo_idx, frame_idx, vox_path, meta_path, extras_path))
+
+        return frames
 
     def __len__(self) -> int:
-        base_len = len(self.files)
-        if self.max_items is not None:
-            return min(base_len, self.max_items)
-        return base_len
+        return len(self.items)
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
-        path = self.files[idx]
-        pts = self._read_ply(path)                  # [N, 3] or [N, 6]
+        demo_idx, frame_idx, vox_path, meta_path, extras_path = self.items[idx]
 
-        if self.normalize_to_unit_cube:
-            pts = self._center_scale_unit_cube(pts)
+        # Load voxels
+        vox = torch.load(vox_path)  # [C, D, H, W]
 
-        pts = self._downsample(pts)
+        # Load meta if available
+        if os.path.exists(meta_path):
+            meta = torch.load(meta_path)
+        else:
+            meta = {}
 
-        pts_t = torch.from_numpy(pts).float()       # [N, C]
+        # Load extras if available
+        if os.path.exists(extras_path):
+            extras = torch.load(extras_path)
+        else:
+            extras = {}
+
+        # Move to device if specified
+        if self.device is not None:
+            if isinstance(vox, torch.Tensor):
+                vox = vox.to(self.device, non_blocking=True)
+            meta = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in meta.items()}
+
+        # Create foreground mask
+        if isinstance(vox, torch.Tensor) and vox.dim() == 4:
+            if vox.shape[0] == 1:
+                fg_mask = (vox[0] > 0).to(torch.bool)
+            else:
+                fg_mask = (vox.abs().sum(dim=0) > 0).to(torch.bool)
+        else:
+            fg_mask = None
+
         sample = {
-            "points": pts_t,                        # [N, C], C=3 or 6
-            "mask": torch.ones(pts_t.shape[0], dtype=torch.bool),
-            "path": path,
-            "id": os.path.splitext(os.path.basename(path))[0],
+            "voxels": vox,                          # [C, D, H, W]
+            "meta": meta,                           # dict with pmin, pmax, voxel_size, etc.
+            "fg_mask": fg_mask,                     # [D, H, W] bool
+            "id": f"{self.task}_demo{demo_idx}_frame{frame_idx}",
+            "task": self.task,
+            "demo": demo_idx,
+            "frame": frame_idx,
+            "path": extras.get("path", vox_path),   # Original PLY path if available
+            "voxels_path": vox_path,
         }
         return sample
+
+
+# Keep the old class name as an alias for backwards compatibility
+MimicGenPointCloudDataset = MimicGenVoxelDataset
