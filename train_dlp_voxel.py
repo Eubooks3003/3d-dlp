@@ -467,6 +467,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             )
 
             iteration += 1
+           
 
         pbar.close()
         # at end of epoch
