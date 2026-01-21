@@ -4101,66 +4101,71 @@ class DLPPrior(nn.Module):
         B, C, D, H, W = x.shape
         device, dtype = x.device, x.dtype
 
-        RGB = x[:, :3]
-        if RGB.min() < 0:
-            RGB = (RGB + 1.0) * 0.5
-        RGB = RGB.clamp(0, 1)
+        with timed_section("kmeans/preprocess"):
+            RGB = x[:, :3]
+            if RGB.min() < 0:
+                RGB = (RGB + 1.0) * 0.5
+            RGB = RGB.clamp(0, 1)
 
-        feat = self.rgb_to_lab_srgb(RGB)  # [B,3,D,H,W]
-        XYZ = self.build_xyz_grid(D, H, W, device, dtype).unsqueeze(0).expand(B, -1, -1, -1, -1)
-        feat = torch.cat([feat, XYZ], dim=1)  # [B,6,D,H,W]
+            feat = self.rgb_to_lab_srgb(RGB)  # [B,3,D,H,W]
+            XYZ = self.build_xyz_grid(D, H, W, device, dtype).unsqueeze(0).expand(B, -1, -1, -1, -1)
+            feat = torch.cat([feat, XYZ], dim=1)  # [B,6,D,H,W]
 
-        sal = feat[:, 0]  # L*
+            sal = feat[:, 0]  # L*
 
-        xyz_flat = self.build_xyz_grid(D, H, W, device, dtype).view(3, -1)  # [3,DHW]
+            xyz_flat = self.build_xyz_grid(D, H, W, device, dtype).view(3, -1)  # [3,DHW]
 
         K = self.n_kp_prior if k is None else min(int(k), self.n_kp_total)
         out_centers, out_covs = [], []
 
-        for b in range(B):
-            vals = sal[b].reshape(-1)
-            k_keep = min(self.keep_top, vals.numel())
-            top = torch.topk(vals, k=k_keep, largest=True, sorted=False)
-            flat_idx = top.indices
-            wts = top.values.clamp_min(0)
+        with timed_section("kmeans/batch_loop"):
+            for b in range(B):
+                with timed_section("kmeans/topk_sample"):
+                    vals = sal[b].reshape(-1)
+                    k_keep = min(self.keep_top, vals.numel())
+                    top = torch.topk(vals, k=k_keep, largest=True, sorted=False)
+                    flat_idx = top.indices
+                    wts = top.values.clamp_min(0)
 
-            Cf = feat.shape[1]
-            feat_flat = feat[b].view(Cf, -1)[:, flat_idx].t()  # [k_keep,Cf]
-            X = self.whiten(feat_flat)
+                    Cf = feat.shape[1]
+                    feat_flat = feat[b].view(Cf, -1)[:, flat_idx].t()  # [k_keep,Cf]
+                    X = self.whiten(feat_flat)
 
-            probs = (wts + 1e-9) / (wts.sum() + 1e-9)
-            m = min(self.sample_m, X.shape[0])
-            sel = torch.multinomial(probs, num_samples=m, replacement=True)
-            X_sub = X[sel]
+                    probs = (wts + 1e-9) / (wts.sum() + 1e-9)
+                    m = min(self.sample_m, X.shape[0])
+                    sel = torch.multinomial(probs, num_samples=m, replacement=True)
+                    X_sub = X[sel]
 
-            C_feat, _ = self.kmeans_hard_feat(X_sub, K, iters=self.iters, tol=self.tol)
+                with timed_section("kmeans/kmeans_hard_feat"):
+                    C_feat, _ = self.kmeans_hard_feat(X_sub, K, iters=self.iters, tol=self.tol)
 
-            d2 = torch.cdist(X, C_feat).pow(2)
-            assign = d2.argmin(dim=1)
+                with timed_section("kmeans/assign_cov"):
+                    d2 = torch.cdist(X, C_feat).pow(2)
+                    assign = d2.argmin(dim=1)
 
-            pts_xyz = xyz_flat[:, flat_idx].t()  # [k_keep,3] (x,y,z)
+                    pts_xyz = xyz_flat[:, flat_idx].t()  # [k_keep,3] (x,y,z)
 
-            centers_b, covs_b = [], []
-            for k_id in range(K):
-                msk = (assign == k_id)
-                if not msk.any():
-                    centers_b.append(pts_xyz.mean(dim=0))
-                    covs_b.append(torch.eye(3, device=device, dtype=dtype) * self.ridge)
-                    continue
+                    centers_b, covs_b = [], []
+                    for k_id in range(K):
+                        msk = (assign == k_id)
+                        if not msk.any():
+                            centers_b.append(pts_xyz.mean(dim=0))
+                            covs_b.append(torch.eye(3, device=device, dtype=dtype) * self.ridge)
+                            continue
 
-                pts_k = pts_xyz[msk]
-                wk = wts[msk]
-                Wsum = wk.sum() + 1e-12
-                mu = (wk[:, None] * pts_k).sum(dim=0) / Wsum
-                xc = pts_k - mu[None]
-                cov = (wk[:, None, None] * (xc[:, :, None] * xc[:, None, :])).sum(dim=0) / Wsum
-                cov = cov + torch.eye(3, device=device, dtype=dtype) * (self.ridge / Wsum)
+                        pts_k = pts_xyz[msk]
+                        wk = wts[msk]
+                        Wsum = wk.sum() + 1e-12
+                        mu = (wk[:, None] * pts_k).sum(dim=0) / Wsum
+                        xc = pts_k - mu[None]
+                        cov = (wk[:, None, None] * (xc[:, :, None] * xc[:, None, :])).sum(dim=0) / Wsum
+                        cov = cov + torch.eye(3, device=device, dtype=dtype) * (self.ridge / Wsum)
 
-                centers_b.append(mu)
-                covs_b.append(cov)
+                        centers_b.append(mu)
+                        covs_b.append(cov)
 
-            out_centers.append(torch.stack(centers_b, dim=0))  # [K,3]
-            out_covs.append(torch.stack(covs_b, dim=0))        # [K,3,3]
+                    out_centers.append(torch.stack(centers_b, dim=0))  # [K,3]
+                    out_covs.append(torch.stack(covs_b, dim=0))        # [K,3,3]
 
         kp = torch.stack(out_centers, dim=0)  # [B,K,3]
         cov = torch.stack(out_covs, dim=0)    # [B,K,3,3]
@@ -4186,24 +4191,29 @@ class DLPPrior(nn.Module):
 
         # ---- MODE 1: kmeans (global proposals, already global coords) ----
         if self.prior_mode == "kmeans":
-            kp_p, cov_p = self.encode_prior_kmeans(x, k=k)  # [B,k,3], [B,k,3,3]
+            with timed_section("DLPPrior/kmeans"):
+                kp_p, cov_p = self.encode_prior_kmeans(x, k=k)  # [B,k,3], [B,k,3,3]
             return kp_p, cov_p
 
         # ---- Patchify like original ----
-        x_patches = self.vox_to_patches(x)  # [B, cdim, num_patches, ps, ps, ps]
-        x_patches = x_patches.permute(0, 2, 1, 3, 4, 5).contiguous()  # [B, Np, cdim, ps, ps, ps]
-        x_patches = x_patches.view(-1, cdim, self.patch_size, self.patch_size, self.patch_size)  # [B*Np, cdim, ps,ps,ps]
+        with timed_section("DLPPrior/vox_to_patches"):
+            x_patches = self.vox_to_patches(x)  # [B, cdim, num_patches, ps, ps, ps]
+            x_patches = x_patches.permute(0, 2, 1, 3, 4, 5).contiguous()  # [B, Np, cdim, ps, ps, ps]
+            x_patches = x_patches.view(-1, cdim, self.patch_size, self.patch_size, self.patch_size)  # [B*Np, cdim, ps,ps,ps]
 
         # ---- MODE 2: ssm_raw (no encoder) ----
         if self.prior_mode == "ssm_raw":
-            z = self.build_raw_heatmap(x_patches)  # [B*Np, n_kp, ps,ps,ps]
+            with timed_section("DLPPrior/build_raw_heatmap"):
+                z = self.build_raw_heatmap(x_patches)  # [B*Np, n_kp, ps,ps,ps]
         # ---- MODE 3: ssm_enc (original) ----
         else:
-            enc_out = self.enc(x_patches)  # keep your Encoder object intact
-            z = enc_out[1] if isinstance(enc_out, tuple) else enc_out  # [B*Np, n_kp, fD,fH,fW]
+            with timed_section("DLPPrior/enc_cnn"):
+                enc_out = self.enc(x_patches)  # keep your Encoder object intact
+                z = enc_out[1] if isinstance(enc_out, tuple) else enc_out  # [B*Np, n_kp, fD,fH,fW]
 
         # SSM (patch-local)
-        kp_l, cov_l = self.ssm(z, probs=False, variance=True)  # kp:[B*Np,n_kp,3], cov:[B*Np,n_kp,3,3]
+        with timed_section("DLPPrior/ssm"):
+            kp_l, cov_l = self.ssm(z, probs=False, variance=True)  # kp:[B*Np,n_kp,3], cov:[B*Np,n_kp,3,3]
 
         # reshape back to [B, Np, n_kp, ...]
         Np = self.num_patches
@@ -5293,8 +5303,9 @@ class ParticleEncoder(nn.Module):
         batch_size, ch, d, h, w = x.shape
 
         # prior now returns (x,y,z) and full covariance
-        kp_p, cov_kp = self.encode_prior(x)  # kp_p: [B, n_kp_prior, 3], cov_kp: [B, n_kp_prior, 3, 3]
-        
+        with timed_section("ParticleEnc/prior_encoder"):
+            kp_p, cov_kp = self.encode_prior(x)  # kp_p: [B, n_kp_prior, 3], cov_kp: [B, n_kp_prior, 3, 3]
+
         # kp_init: [B, n_kp_prior, 3] in [-1, 1]
         kp_init = kp_p
 
@@ -5312,9 +5323,10 @@ class ParticleEncoder(nn.Module):
         z_base = mu + 0.0 * logvar  # [B, n_kp_prior, 3]
 
         # 1) posterior offsets and scale
-        particle_stats_dict = self.particle_attribute_enc(
-            x, z_base, timesteps=timesteps, deterministic=deterministic
-        )
+        with timed_section("ParticleEnc/particle_attribute_enc"):
+            particle_stats_dict = self.particle_attribute_enc(
+                x, z_base, timesteps=timesteps, deterministic=deterministic
+            )
 
         mu_offset     = particle_stats_dict['mu']           # [..., 3]
         logvar_offset = particle_stats_dict['logvar']       # [..., 3]
@@ -5480,7 +5492,8 @@ class ParticleEncoder(nn.Module):
         - keeps original keys pointing to RGB branch for back-compat
         - also returns concatenated '*_total' (rgb||depth) when both exist & gaussian
         """
-        obj_enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
+        with timed_section("appearance/particle_features_enc"):
+            obj_enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
         mu_features     = obj_enc_out['mu_features']
         logvar_features = obj_enc_out['logvar_features']
         cropped_objects = obj_enc_out['cropped_objects']
@@ -5504,7 +5517,8 @@ class ParticleEncoder(nn.Module):
 
 
         with torch.no_grad():
-            enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
+            with timed_section("appearance/particle_features_enc_nograd"):
+                enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
             mu_feat = enc_out['mu_features']         # [B, K, F]
             crops   = enc_out['cropped_objects']     # [B, K, 3, ps, ps, ps]
 
