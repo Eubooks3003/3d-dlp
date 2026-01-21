@@ -8,6 +8,7 @@ from pathlib import Path
 import struct
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+from tqdm import tqdm
 
 
 @dataclass
@@ -288,25 +289,25 @@ def process_scene(scene_num: int, data_dir: Path, output_dir: Path,
         label_path = data_dir / f"{scene_num:02d}.label"
 
         if not ply_path.exists():
-            print(f"  Scene {scene_num:02d}: PLY not found, skipping")
+            tqdm.write(f"  Scene {scene_num:02d}: PLY not found, skipping")
             return False
 
         pc = load_ply_binary(ply_path)
         labels = load_labels(label_path)
 
         if verbose:
-            print(f"  Loaded {len(pc):,} points")
+            tqdm.write(f"  Scene {scene_num:02d}: Loaded {len(pc):,} points")
 
         # Auto-detect table and background
         table_label = find_table_label(pc, labels)
         if table_label is None:
-            print(f"  Scene {scene_num:02d}: No table found, skipping")
+            tqdm.write(f"  Scene {scene_num:02d}: No table found, skipping")
             return False
 
         background_labels = find_background_labels(pc, labels, table_label)
 
         if verbose:
-            print(f"  Table label: {table_label}, Background labels: {background_labels}")
+            tqdm.write(f"  Scene {scene_num:02d}: Table label: {table_label}, Background: {background_labels}")
 
         # Extract table
         table_mask = labels == table_label
@@ -329,11 +330,11 @@ def process_scene(scene_num: int, data_dir: Path, output_dir: Path,
             objects.extend(components)
 
         if not objects:
-            print(f"  Scene {scene_num:02d}: No objects found, skipping")
+            tqdm.write(f"  Scene {scene_num:02d}: No objects found, skipping")
             return False
 
         if verbose:
-            print(f"  Found {len(objects)} objects")
+            tqdm.write(f"  Scene {scene_num:02d}: Found {len(objects)} objects")
 
         # Orient normal toward objects
         obj_centroids = np.array([obj.xyz.mean(axis=0) for obj in objects])
@@ -354,7 +355,7 @@ def process_scene(scene_num: int, data_dir: Path, output_dir: Path,
         uv_max = np.percentile(table_uv, 98, axis=0)
 
         # Generate augmentations
-        for aug_idx in range(num_augmentations):
+        for aug_idx in tqdm(range(num_augmentations), desc=f"  Scene {scene_num:02d}", leave=False):
             placed_objects: List[PointCloud] = []
             margin = 0.05
 
@@ -394,12 +395,12 @@ def process_scene(scene_num: int, data_dir: Path, output_dir: Path,
             save_ply_ascii(augmented, out_path)
 
             if verbose:
-                print(f"    Saved: {out_path.name} ({len(augmented):,} points)")
+                tqdm.write(f"    Saved: {out_path.name} ({len(augmented):,} points)")
 
         return True
 
     except Exception as e:
-        print(f"  Scene {scene_num:02d}: ERROR - {e}")
+        tqdm.write(f"  Scene {scene_num:02d}: ERROR - {e}")
         return False
 
 
@@ -445,12 +446,10 @@ def main():
     print()
 
     success = 0
-    for scene_num in scenes:
-        print(f"Scene {scene_num:02d}:")
+    for scene_num in tqdm(scenes, desc="Processing scenes"):
         if process_scene(scene_num, args.data_dir, args.output_dir,
                          args.num_augmentations, verbose=not args.quiet):
             success += 1
-        print()
 
     print(f"Done! {success}/{len(scenes)} scenes processed successfully")
     print(f"Total files: {success * args.num_augmentations}")
