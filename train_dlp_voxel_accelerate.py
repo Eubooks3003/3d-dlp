@@ -67,6 +67,7 @@ torch.set_float32_matmul_precision("high")
 
 from collections import defaultdict
 import time
+from utils.timing_utils import enable_timing, disable_timing, print_timing_stats, clear_timing_stats
 
 
 def cuda_sync():
@@ -416,12 +417,25 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         )
 
     # Training loop
+    PROFILE_ITERS = 10  # Number of iterations to profile at start of first epoch
     for epoch in range(start_epoch, num_epochs):
         model.train()
         epoch_avg = EpochAverager()
 
+        # Enable detailed timing for first N iterations of first epoch
+        if epoch == start_epoch and accelerator.is_main_process:
+            enable_timing(sync_cuda=True)
+            clear_timing_stats()
+
         pbar = tqdm(iterable=dataloader, disable=not accelerator.is_local_main_process)
         for it, batch in enumerate(pbar):
+            # Disable timing after PROFILE_ITERS
+            if epoch == start_epoch and it == PROFILE_ITERS and accelerator.is_main_process:
+                disable_timing()
+                print("\n" + "=" * 80)
+                print("DETAILED TIMING BREAKDOWN (first 10 iterations)")
+                print_timing_stats(sort_by='total')
+
             t0 = time.time()
 
             # Get batch (already on CPU from dataloader)

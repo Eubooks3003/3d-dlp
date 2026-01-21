@@ -10,6 +10,7 @@ from torch.nn import functional as F
 from torch.distributions import Beta
 from utils.util_func import reparameterize, spatial_transform, create_masks_fast, create_masks_with_scale, \
     modulate
+from utils.timing_utils import timed_section
 # modules
 from modules.vision_modules import Encoder, Decoder
 
@@ -5553,9 +5554,10 @@ class ParticleEncoder(nn.Module):
         x = x.view(bs * timestep_horizon, ch, D, H, W)  # [B*T, C, D, H, W]
 
         # ---- stage 1: positions & scales (DHW throughout) ----
-        stage1_dict = self.encode_pos_scale_with_prior(
-            x, deterministic=deterministic, warmup=warmup, timesteps=timestep_horizon
-        )
+        with timed_section("ParticleEnc/stage1_pos_scale"):
+            stage1_dict = self.encode_pos_scale_with_prior(
+                x, deterministic=deterministic, warmup=warmup, timesteps=timestep_horizon
+            )
 
         # --- unpack ---
         kp_p         = stage1_dict['kp_p']
@@ -5599,10 +5601,11 @@ class ParticleEncoder(nn.Module):
             z_app       = z[batch_ind, embed_ind].contiguous()          # [B, n_kp_dec, 3]
             z_scale_app = z_scale[batch_ind, embed_ind].contiguous()    # [B, n_kp_dec, 3]
 
-            stage2_dict = self.encode_appearance(
-                x, z_app, z_scale_app, deterministic=deterministic,
-                timesteps=timestep_horizon, obj_on=None
-            )
+            with timed_section("ParticleEnc/stage2_appearance"):
+                stage2_dict = self.encode_appearance(
+                    x, z_app, z_scale_app, deterministic=deterministic,
+                    timesteps=timestep_horizon, obj_on=None
+                )
 
             # unpack
             cropped_objects     = stage2_dict['cropped_objects']
@@ -5623,9 +5626,10 @@ class ParticleEncoder(nn.Module):
             z_depth_features = mu_features_depth
 
         else:
-            stage2_dict = self.encode_appearance(
-                x, z, z_scale, deterministic=deterministic, timesteps=timestep_horizon, obj_on=None
-            )
+            with timed_section("ParticleEnc/stage2_appearance"):
+                stage2_dict = self.encode_appearance(
+                    x, z, z_scale, deterministic=deterministic, timesteps=timestep_horizon, obj_on=None
+                )
             # unpack
             cropped_objects       = stage2_dict['cropped_objects']
             mu_features           = stage2_dict['mu_features']
@@ -6147,7 +6151,8 @@ class DLPEncoder(nn.Module):
             x = torch.cat([x, x_goal], dim=1)  # [bs, T+1, ...]
 
         # encode particles +++++++
-        particle_dict = self.particle_enc(x, deterministic, warmup)
+        with timed_section("DLPEncoder/particle_enc"):
+            particle_dict = self.particle_enc(x, deterministic, warmup)
 
         kp_p              = particle_dict['kp_p']
         cov_kp            = particle_dict['cov_kp']        # full [bs,T,n_kp,3,3]
@@ -6213,14 +6218,15 @@ class DLPEncoder(nn.Module):
             if self.n_kp_dec != self.n_kp_enc:
                 z_obj_on_v = z_obj_on_v[batch_ind, embed_ind]  # [bs*T, n_kp_dec]
 
-        if self.mask_bg_in_enc:
-            bg_enc_mask = self.get_bg_mask_from_particle_glimpses(
-                    z_v, z_obj_on_v, mask_size=(x.shape[-3], x.shape[-2], x.shape[-1])
-                )
-            bg_dict = self.bg_encoder(x, bg_enc_mask, deterministic, timestep_horizon)
-        else:
-            bg_enc_mask = None
-            bg_dict = self.bg_encoder(x, None, deterministic, timestep_horizon)  # unmasked bg
+        with timed_section("DLPEncoder/bg_encoder"):
+            if self.mask_bg_in_enc:
+                bg_enc_mask = self.get_bg_mask_from_particle_glimpses(
+                        z_v, z_obj_on_v, mask_size=(x.shape[-3], x.shape[-2], x.shape[-1])
+                    )
+                bg_dict = self.bg_encoder(x, bg_enc_mask, deterministic, timestep_horizon)
+            else:
+                bg_enc_mask = None
+                bg_dict = self.bg_encoder(x, None, deterministic, timestep_horizon)  # unmasked bg
         mu_bg_features = bg_dict['mu_bg']
         mu_bg_features = mu_bg_features.view(bs, -1, mu_bg_features.shape[-1])
         logvar_bg_features = bg_dict['logvar_bg']
@@ -6233,9 +6239,10 @@ class DLPEncoder(nn.Module):
 
         if self.use_particle_inter_enc:
             z_in_inter = z_base + z_offset  # so we can detach z_base (ssm) if more stable
-            inter_dict = self.particle_inter_enc(x, z_in_inter, z_scale, z_obj_on, z_depth, z_features, z_bg_features,
-                                                 z_base_var, z_score, patch_id_embed,
-                                                 deterministic=deterministic, warmup=warmup)
+            with timed_section("DLPEncoder/particle_inter_enc"):
+                inter_dict = self.particle_inter_enc(x, z_in_inter, z_scale, z_obj_on, z_depth, z_features, z_bg_features,
+                                                     z_base_var, z_score, patch_id_embed,
+                                                     deterministic=deterministic, warmup=warmup)
             if self.interaction_features:
                 mu_features = inter_dict['mu_features']
                 logvar_features = inter_dict['logvar_features']
@@ -6813,11 +6820,13 @@ class DLPDecoder(nn.Module):
             obj_on = obj_on.squeeze(-1)
 
         if getattr(self, "occupancy_mode", False):
-            occ_out = self.decode_objects(z, z_features, obj_on, z_scale=z_scale, z_ctx=z_ctx)
+            with timed_section("DLPDecoder/decode_objects_occ"):
+                occ_out = self.decode_objects(z, z_features, obj_on, z_scale=z_scale, z_ctx=z_ctx)
             p_obj   = occ_out["occ_prob_composite"]                 # [B*,1,D,H,W]
 
             # BG prior as occupancy logits in channel 0
-            bg_raw    = self.bg_dec(z_bg_features, z_ctx)           # [B*, C_bg, D,H,W]
+            with timed_section("DLPDecoder/bg_dec_occ"):
+                bg_raw    = self.bg_dec(z_bg_features, z_ctx)           # [B*, C_bg, D,H,W]
             bg_logits = bg_raw[:, :1, ...]                          # [B*,1,D,H,W]
             p_bg      = torch.sigmoid(bg_logits)
 
@@ -6851,10 +6860,11 @@ class DLPDecoder(nn.Module):
         # =========================
         # RGB / RGBD PATH (unchanged)
         # =========================
-        (dec_objects, dec_objects_trans, alpha_masks, bg_mask,
-        dec_depth_trans, dec_depth_patches, rgb_obj) = self.decode_objects(
-            z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale, z_ctx=z_ctx
-        )
+        with timed_section("DLPDecoder/decode_objects_rgb"):
+            (dec_objects, dec_objects_trans, alpha_masks, bg_mask,
+            dec_depth_trans, dec_depth_patches, rgb_obj) = self.decode_objects(
+                z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale, z_ctx=z_ctx
+            )
 
         if z_bg_features is None:
             # spatial shape should match dec_objects_trans, e.g. [B,3,D,H,W] or [B,3,H,W]
@@ -6865,7 +6875,8 @@ class DLPDecoder(nn.Module):
             C_bg = 4 if dec_depth_trans is not None else 3
             bg_rec = dec_objects_trans.new_zeros((B, C_bg, *spatial))
         else:
-            bg_rec = self.bg_dec(z_bg_features, z_ctx)
+            with timed_section("DLPDecoder/bg_dec_rgb"):
+                bg_rec = self.bg_dec(z_bg_features, z_ctx)
 
 
         C_bg   = bg_rec.shape[1]
