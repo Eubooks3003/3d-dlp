@@ -8,6 +8,7 @@ from typing import Dict, Optional, List, Tuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
 class MimicGenVoxelDataset(Dataset):
@@ -150,6 +151,8 @@ class MimicGenVoxelDataset(Dataset):
         if len(self.items) == 0:
             raise RuntimeError(f"No files assigned to split '{split}' (N_demos={N_demos})")
 
+        print(f"[MimicGenVoxelDataset] {split}: {len(self.items)} frames from {len(chosen_demos)} demos")
+
     def _discover_frames(self) -> List[Tuple[int, int, str, str, str]]:
         """
         Discover all cached voxel frames.
@@ -162,7 +165,8 @@ class MimicGenVoxelDataset(Dataset):
             key=lambda x: int(os.path.basename(x).split("_")[1])
         )
 
-        for demo_dir in demo_dirs:
+        print(f"[MimicGenVoxelDataset] Scanning {len(demo_dirs)} demos...")
+        for demo_dir in tqdm(demo_dirs, desc="Discovering demos", leave=False):
             demo_idx = int(os.path.basename(demo_dir).split("_")[1])
 
             # Find all voxel files in this demo
@@ -176,14 +180,13 @@ class MimicGenVoxelDataset(Dataset):
                 except (ValueError, IndexError):
                     continue
 
-                # Build paths for meta and extras
+                # Build paths for meta and extras (don't check existence - assume they exist)
                 meta_path = os.path.join(demo_dir, f"frame{frame_idx}_meta.pt")
                 extras_path = os.path.join(demo_dir, f"frame{frame_idx}_extras.pt")
 
-                # Only include if voxels file exists (meta/extras are optional)
-                if os.path.exists(vox_path):
-                    frames.append((demo_idx, frame_idx, vox_path, meta_path, extras_path))
+                frames.append((demo_idx, frame_idx, vox_path, meta_path, extras_path))
 
+        print(f"[MimicGenVoxelDataset] Found {len(frames)} frames across {len(demo_dirs)} demos")
         return frames
 
     def __len__(self) -> int:
