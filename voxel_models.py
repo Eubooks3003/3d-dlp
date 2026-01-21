@@ -1142,7 +1142,11 @@ class DLP(nn.Module):
 
         # encode particles
         enc_dict = self.encode_all(x, deterministic, warmup=warmup, actions=actions, actions_mask=actions_mask,
+<<<<<<< HEAD
                                     lang_embed=lang_embed, x_goal=x_goal)
+=======
+                                   lang_embed=lang_embed, x_goal=x_goal)
+>>>>>>> 0e9b43f3e524d68b73fb76b8d44959b547103e24
 
         # unpack encoder output: [bs, T, ...]
         kp_p = enc_dict['kp_p']
@@ -1211,7 +1215,11 @@ class DLP(nn.Module):
         filter_key = z_base_var.sum(-1) if (
                 self.filter_particles_in_decoder and self.n_kp_enc != self.n_kp_dec) else None
         dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features, z_context,
+<<<<<<< HEAD
                                     warmup, filter_key=filter_key)
+=======
+                                   warmup, filter_key=filter_key)
+>>>>>>> 0e9b43f3e524d68b73fb76b8d44959b547103e24
 
         bg_mask = dec_dict['bg_mask']
         dec_objects = dec_dict['dec_objects']
@@ -1369,11 +1377,19 @@ class DLP(nn.Module):
             if num_static is None:
                 num_static = self.n_static_frames
             loss_dict = self.calc_elbo(x, output_dict, warmup=warmup, beta_kl=beta_kl,
+<<<<<<< HEAD
                                         beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
                                         dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
                                         recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
                                         num_static=num_static, beta_obj=beta_obj, done_mask=done_mask,
                                         lambda_color=lambda_color)
+=======
+                                       beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
+                                       dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
+                                       recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
+                                       num_static=num_static, beta_obj=beta_obj, done_mask=done_mask,
+                                       lambda_color=lambda_color)
+>>>>>>> 0e9b43f3e524d68b73fb76b8d44959b547103e24
             output_dict['loss_dict'] = loss_dict
         else:
             output_dict['loss_dict'] = None
