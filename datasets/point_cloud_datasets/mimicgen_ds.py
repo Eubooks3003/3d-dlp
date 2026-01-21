@@ -14,17 +14,20 @@ class MimicGenVoxelDataset(Dataset):
     """
     MimicGen voxel dataset that reads from precomputed voxel cache.
 
-    Expects cache structure created by preprocess_mimicgen_voxels.py:
-        <root>/{task}_d0/core/voxel_cache/
+    Cache structure (created by preprocess_mimicgen_voxels.py):
+        voxel_cache/
           manifest.json
           demo_0/
             frame0_voxels.pt
             frame0_meta.pt
             frame0_extras.pt
-            frame1_voxels.pt
             ...
           demo_1/
             ...
+
+    Two ways to specify the cache location:
+        1. root + task: cache at {root}/{task}_d0/core/voxel_cache/
+        2. root only (task=None): root is the direct path to voxel_cache/
 
     Train/val/test are done *internally* via index splitting on demos.
     Use max_demos to limit the number of demos (complete trajectories) used.
@@ -45,7 +48,7 @@ class MimicGenVoxelDataset(Dataset):
     def __init__(
         self,
         root: str,
-        task: str,
+        task: Optional[str] = None,       # task name, or None to use root as direct cache path
         split: str = "train",             # "train" | "val" | "test"
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
@@ -62,8 +65,13 @@ class MimicGenVoxelDataset(Dataset):
         self.device = device
 
         # Build cache directory path
-        cache_name = f"voxel_cache{cache_suffix}"
-        self.cache_dir = os.path.join(self.root, f"{task}_d0", "core", cache_name)
+        # If task is provided: {root}/{task}_d0/core/voxel_cache{suffix}/
+        # If task is None: treat root as direct path to voxel cache
+        if task is not None:
+            cache_name = f"voxel_cache{cache_suffix}"
+            self.cache_dir = os.path.join(self.root, f"{task}_d0", "core", cache_name)
+        else:
+            self.cache_dir = self.root
 
         if not os.path.isdir(self.cache_dir):
             raise FileNotFoundError(f"Voxel cache not found: {self.cache_dir}")
@@ -187,17 +195,13 @@ class MimicGenVoxelDataset(Dataset):
         # Load voxels
         vox = torch.load(vox_path)  # [C, D, H, W]
 
-        # Load meta if available
-        if os.path.exists(meta_path):
+        # Load meta (skip existence check for speed - assume it exists)
+        try:
             meta = torch.load(meta_path)
-        else:
+        except FileNotFoundError:
             meta = {}
 
-        # Load extras if available
-        if os.path.exists(extras_path):
-            extras = torch.load(extras_path)
-        else:
-            extras = {}
+        # Skip loading extras - contains raw points (~100KB), not needed for training
 
         # Move to device if specified
         if self.device is not None:
@@ -214,15 +218,15 @@ class MimicGenVoxelDataset(Dataset):
         else:
             fg_mask = None
 
+        task_str = self.task if self.task else "mimicgen"
         sample = {
             "voxels": vox,                          # [C, D, H, W]
             "meta": meta,                           # dict with pmin, pmax, voxel_size, etc.
             "fg_mask": fg_mask,                     # [D, H, W] bool
-            "id": f"{self.task}_demo{demo_idx}_frame{frame_idx}",
+            "id": f"{task_str}_demo{demo_idx}_frame{frame_idx}",
             "task": self.task,
             "demo": demo_idx,
             "frame": frame_idx,
-            "path": extras.get("path", vox_path),   # Original PLY path if available
             "voxels_path": vox_path,
         }
         return sample

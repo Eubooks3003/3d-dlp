@@ -42,8 +42,9 @@ def get_point_cloud_dataset(
          * if voxelize=True → wraps with VoxelizedDataset, returning BOTH points and voxels
       - ds == "voxel" → precomputed voxel files (*.pt pairs) via VoxelDataset (as before)
       - ds == "mimicgen_voxel" → precomputed MimicGen voxel cache via MimicGenVoxelDataset
-         * Expects: {root}/{task}_d0/core/voxel_cache/ (created by preprocess_mimicgen_voxels.py)
-         * Use task= for single task, max_demos= to limit demos
+         * If task is provided: {root}/{task}_d0/core/voxel_cache/
+         * If task is None: treat root as direct path to voxel_cache folder
+         * Use max_demos= to limit number of demos
       - ds in {"mimicgen", "mimicgen_multitask"} → multi-task MimicGen dataset (point clouds)
          * Expects: {root}/{task}_d0/core/mimicgen_from_depth_pcd/demo_*/frame*.ply
          * if voxelize=True → wraps with VoxelizedDataset
@@ -62,9 +63,8 @@ def get_point_cloud_dataset(
     if ds_key == "mimicgen_voxel":
         from datasets.point_cloud_datasets.mimicgen_ds import MimicGenVoxelDataset
 
-        if task is None:
-            raise ValueError("mimicgen_voxel requires 'task' parameter (e.g., task='coffee')")
-
+        # If task is provided: {root}/{task}_d0/core/voxel_cache/
+        # If task is None: treat root as direct path to voxel cache
         return MimicGenVoxelDataset(
             root=root,
             task=task,
