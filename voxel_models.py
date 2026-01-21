@@ -13,7 +13,6 @@ from modules.modules import DLPEncoder, DLPDecoder, DLPContext
 from modules.modules import DLPDynamics
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
-from utils.timing_utils import timed_section
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \
     ChamferLossKL, bce_logits_weighted
 from modules.vision_modules import rgb_to_minusoneone, minusoneone_to_rgb
@@ -1142,9 +1141,8 @@ class DLP(nn.Module):
             batch_size, timestep_horizon = x.size(0), x.size(1)
 
         # encode particles
-        with timed_section("DLP/encode_all"):
-            enc_dict = self.encode_all(x, deterministic, warmup=warmup, actions=actions, actions_mask=actions_mask,
-                                       lang_embed=lang_embed, x_goal=x_goal)
+        enc_dict = self.encode_all(x, deterministic, warmup=warmup, actions=actions, actions_mask=actions_mask,
+                                    lang_embed=lang_embed, x_goal=x_goal)
 
         # unpack encoder output: [bs, T, ...]
         kp_p = enc_dict['kp_p']
@@ -1212,9 +1210,8 @@ class DLP(nn.Module):
 
         filter_key = z_base_var.sum(-1) if (
                 self.filter_particles_in_decoder and self.n_kp_enc != self.n_kp_dec) else None
-        with timed_section("DLP/decode_all"):
-            dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features, z_context,
-                                       warmup, filter_key=filter_key)
+        dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features, z_context,
+                                    warmup, filter_key=filter_key)
 
         bg_mask = dec_dict['bg_mask']
         dec_objects = dec_dict['dec_objects']
@@ -1371,13 +1368,12 @@ class DLP(nn.Module):
         if with_loss:
             if num_static is None:
                 num_static = self.n_static_frames
-            with timed_section("DLP/calc_elbo"):
-                loss_dict = self.calc_elbo(x, output_dict, warmup=warmup, beta_kl=beta_kl,
-                                           beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
-                                           dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
-                                           recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
-                                           num_static=num_static, beta_obj=beta_obj, done_mask=done_mask,
-                                           lambda_color=lambda_color)
+            loss_dict = self.calc_elbo(x, output_dict, warmup=warmup, beta_kl=beta_kl,
+                                        beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
+                                        dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
+                                        recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
+                                        num_static=num_static, beta_obj=beta_obj, done_mask=done_mask,
+                                        lambda_color=lambda_color)
             output_dict['loss_dict'] = loss_dict
         else:
             output_dict['loss_dict'] = None
