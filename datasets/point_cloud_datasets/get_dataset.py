@@ -27,8 +27,11 @@ def get_point_cloud_dataset(
     force_rebuild: bool = False,
     max_items: Optional[int] = None,     # max items to read from cache (None = no limit)
     device=None,
-    # --- mimicgen multi-task specific ---
-    tasks: Optional[List[str]] = None,   # for mimicgen: list of task names or None for auto-discover
+    # --- mimicgen specific ---
+    task: Optional[str] = None,          # for mimicgen_voxel: single task name
+    tasks: Optional[List[str]] = None,   # for mimicgen multi-task: list of task names or None for auto-discover
+    max_demos: Optional[int] = None,     # for mimicgen_voxel: limit number of demos
+    cache_suffix: str = "",              # for mimicgen_voxel: e.g., "_debug" for voxel_cache_debug
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     seed: int = 42,
@@ -38,9 +41,12 @@ def get_point_cloud_dataset(
       - ds in {"TO", "to", "to-scene"} → loads flat .plys via TODataset
          * if voxelize=True → wraps with VoxelizedDataset, returning BOTH points and voxels
       - ds == "voxel" → precomputed voxel files (*.pt pairs) via VoxelDataset (as before)
-      - ds in {"mimicgen", "mimicgen_multitask"} → multi-task MimicGen dataset
+      - ds == "mimicgen_voxel" → precomputed MimicGen voxel cache via MimicGenVoxelDataset
+         * Expects: {root}/{task}_d0/core/voxel_cache/ (created by preprocess_mimicgen_voxels.py)
+         * Use task= for single task, max_demos= to limit demos
+      - ds in {"mimicgen", "mimicgen_multitask"} → multi-task MimicGen dataset (point clouds)
          * Expects: {root}/{task}_d0/core/mimicgen_from_depth_pcd/demo_*/frame*.ply
-         * Auto-saves voxel cache to: {root}/{task}_d0/core/voxel_cache/
+         * if voxelize=True → wraps with VoxelizedDataset
     """
     ds_key = (ds or "").lower()
 
@@ -50,6 +56,25 @@ def get_point_cloud_dataset(
             root=root,           # folder containing *_voxels.pt / *_meta.pt
             split=mode,          # "train" | "val" | "test"
             sample_length=sample_length,
+        )
+
+    # --- MimicGen precomputed voxel cache (from preprocess_mimicgen_voxels.py) ---
+    if ds_key == "mimicgen_voxel":
+        from datasets.point_cloud_datasets.mimicgen_ds import MimicGenVoxelDataset
+
+        if task is None:
+            raise ValueError("mimicgen_voxel requires 'task' parameter (e.g., task='coffee')")
+
+        return MimicGenVoxelDataset(
+            root=root,
+            task=task,
+            split=mode,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+            max_demos=max_demos,
+            cache_suffix=cache_suffix,
+            device=device,
         )
 
     if ds_key in ("to","to-scene","to_scene"):

@@ -241,23 +241,38 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     voxel_grid_whd = config["voxel_grid_whd"]
     voxel_root = config.get("voxel_root", None)
 
+    # MimicGen specific
+    task = config.get("task", None)  # task name for mimicgen_voxel
+    max_demos = config.get("max_demos", None)  # limit number of demos
+    cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
+
     # Prior mode configuration
     prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
     raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
 
     # Dataset
-    dataset = get_point_cloud_dataset(ds, root, mode="train",
-                             voxelize=True, voxel_grid_whd=voxel_grid_whd,
-                             voxel_mode="occupancy",
-                             cache_dir=voxel_root)
+    dataset = get_point_cloud_dataset(
+        ds, root, mode="train",
+        voxelize=True, voxel_grid_whd=voxel_grid_whd,
+        voxel_mode="occupancy",
+        cache_dir=voxel_root,
+        task=task,
+        max_demos=max_demos,
+        cache_suffix=cache_suffix,
+    )
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
     # Validation dataset
-    val_dataset = get_point_cloud_dataset(ds, root, mode="val",
-                             voxelize=True, voxel_grid_whd=voxel_grid_whd,
-                             voxel_mode="occupancy",
-                             cache_dir=voxel_root)
+    val_dataset = get_point_cloud_dataset(
+        ds, root, mode="val",
+        voxelize=True, voxel_grid_whd=voxel_grid_whd,
+        voxel_mode="occupancy",
+        cache_dir=voxel_root,
+        task=task,
+        max_demos=max_demos,
+        cache_suffix=cache_suffix,
+    )
 
     
     val_dataloader = DataLoader(
