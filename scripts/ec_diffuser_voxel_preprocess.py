@@ -166,26 +166,56 @@ def pack_tokens_k24(out: dict) -> torch.Tensor:
 
 
 # ----------------------------
-# Debug visualization
+# Debug visualization (copied from visualize_mimicgen_tasks.py)
 # ----------------------------
-def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: str = "ec-diffuser-debug"):
+def get_first_voxel_for_debug(cache_dir: str):
+    """Get the first voxel - COPIED from visualize_mimicgen_tasks.py get_first_voxel"""
+    import glob
+
+    if not os.path.isdir(cache_dir):
+        return None, None
+
+    # Find first demo
+    demo_dirs = sorted(
+        glob.glob(os.path.join(cache_dir, "demo_*")),
+        key=lambda x: int(os.path.basename(x).split("_")[1])
+    )
+
+    if not demo_dirs:
+        return None, None
+
+    demo_dir = demo_dirs[0]
+
+    # Find first frame
+    vox_files = sorted(glob.glob(os.path.join(demo_dir, "frame*_voxels.pt")))
+    if not vox_files:
+        return None, None
+
+    vox_path = vox_files[0]
+    vox = torch.load(vox_path)
+
+    return vox, vox_path
+
+
+def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_project: str = "ec-diffuser-debug"):
     """
     Run a single frame through encode->decode and visualize in wandb.
+    Uses exact same loading as visualize_mimicgen_tasks.py
     """
     import wandb
     from eval.eval_vox import log_rgb_voxels
 
+    # Load voxel using EXACT same code as visualize_mimicgen_tasks.py
+    vox, vox_path = get_first_voxel_for_debug(voxel_cache_dir)
+    if vox is None:
+        raise RuntimeError(f"No voxels found in {voxel_cache_dir}")
+
+    print(f"[debug] Voxel: {vox.shape} from {vox_path}")
+
     # Initialize wandb
-    wandb.init(project=wandb_project, name=f"debug_{os.path.basename(voxel_path)}")
+    wandb.init(project=wandb_project, name=f"debug_{os.path.basename(vox_path)}")
 
-    # Load voxel
-    print(f"[debug] Loading voxel: {voxel_path}")
-    vox = torch.load(voxel_path)
-    print(f"[debug] Voxel: {vox.shape}")
-    print(f"[debug] Voxel stats: min={vox.min():.4f}, max={vox.max():.4f}, mean={vox.mean():.4f}")
-    print(f"[debug] Nonzero voxels: {(vox.abs().sum(dim=0) > 0).sum().item()}")
-
-    # === LOG GT VOXEL - copy exact code from visualize_mimicgen_tasks.py lines 138-149 ===
+    # === LOG GT VOXEL - EXACT code from visualize_mimicgen_tasks.py lines 138-149 ===
     log_rgb_voxels(
         name=f"voxel/input",
         rgb_vol=vox,
@@ -212,7 +242,6 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
     vox_rec = vox_rec[0].cpu()
 
     print(f"[debug] Reconstruction: {vox_rec.shape}")
-    print(f"[debug] Rec stats: min={vox_rec.min():.4f}, max={vox_rec.max():.4f}, mean={vox_rec.mean():.4f}")
 
     # Log reconstruction
     log_rgb_voxels(
@@ -360,19 +389,8 @@ def main():
 
     # Debug mode: process one frame and exit
     if args.debug:
-        demo_name = f"demo_{args.debug_demo}"
-        if demo_name not in voxel_map:
-            available = list(voxel_map.keys())[:5]
-            raise RuntimeError(f"Demo '{demo_name}' not found. Available: {available}...")
-
-        if args.debug_frame not in voxel_map[demo_name]:
-            available = sorted(voxel_map[demo_name].keys())[:10]
-            raise RuntimeError(f"Frame {args.debug_frame} not found in {demo_name}. Available: {available}...")
-
-        voxel_path = voxel_map[demo_name][args.debug_frame]
-        print(f"[debug] Running debug mode on: {voxel_path}")
-
-        run_debug_mode(model, voxel_path, device, wandb_project=args.wandb_project)
+        print(f"[debug] Running debug mode on voxel cache: {args.voxel_cache_dir}")
+        run_debug_mode(model, args.voxel_cache_dir, device, wandb_project=args.wandb_project)
         return  # Exit after debug
 
     # Action converter (only for absolute mode)
