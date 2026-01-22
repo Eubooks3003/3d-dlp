@@ -1,0 +1,22 @@
+name: dlp
+channels:
+  - defaults
+dependencies:
+  - pip
+  - imageio
+  - tqdm
+  - requests
+  - python=3.8
+  - torchvision
+  - h5py
+  - scikit-image
+  - pyyaml
+  - matplotlib
+  - ipykernel
+  - numpy
+  - pytorch
+  - scipy
+  - jupyterlab
+  - notebook
+  - psutil
+prefix: /home/ubuntu/miniconda3/envs/dlp
