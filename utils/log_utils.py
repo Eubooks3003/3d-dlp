@@ -47,7 +47,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_metric, extra
     return path
 
 def load_checkpoint(path, model, optimizer=None, scheduler=None, map_location="cpu"):
-    obj = torch.load(path, map_location=map_location)
+    obj = torch.load(path, map_location=map_location, weights_only=False)
     # allow both “full ckpt” and “weights-only”
     if isinstance(obj, dict) and "model" in obj:
         model.load_state_dict(obj["model"], strict=False)
