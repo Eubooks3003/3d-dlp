@@ -1,6 +1,6 @@
 {
   "ds": "mimicgen_voxel",
-  "root": "/home/ubuntu/pathaklab/data/mimicgen/coffee_d0/core/voxel_cache",
+  "root": "/lambda/nfs/ellina/data/mimicgen/coffee_d0/core/voxel_cache",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn", 
   "voxel_mode": "occupancy",
