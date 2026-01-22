@@ -128,25 +128,35 @@ def compute_voxel_stats(voxels: List[torch.Tensor], name: str, max_samples_for_q
     return stats
 
 
+def _to_numpy_safe(tensor):
+    """Convert tensor to numpy, falling back to list if numpy not supported."""
+    try:
+        return tensor.cpu().numpy()
+    except RuntimeError:
+        return np.array(tensor.cpu().tolist())
+
+
 def compute_histogram(voxels: List[torch.Tensor], bins: int = 100,
                       range_min: float = -1.0, range_max: float = 1.0) -> Dict:
-    """Compute histogram of voxel values."""
+    """Compute histogram of voxel values using pure PyTorch."""
     all_vox = torch.stack(voxels, dim=0).float()
     C = all_vox.shape[1]
 
     histograms = {}
-    bin_edges = np.linspace(range_min, range_max, bins + 1)
+    bin_edges = torch.linspace(range_min, range_max, bins + 1)
 
     for c in range(C):
-        flat = all_vox[:, c].reshape(-1).numpy()
-        hist, _ = np.histogram(flat, bins=bin_edges, density=True)
-        histograms[f"ch{c}"] = hist
+        flat = all_vox[:, c].reshape(-1)
+        hist = torch.histogram(flat, bins=bin_edges)[0].float()
+        hist = hist / (hist.sum() + 1e-10)  # normalize to density
+        histograms[f"ch{c}"] = _to_numpy_safe(hist)
 
     # Overall
-    flat_all = all_vox.reshape(-1).numpy()
-    hist_all, _ = np.histogram(flat_all, bins=bin_edges, density=True)
-    histograms["overall"] = hist_all
-    histograms["bin_edges"] = bin_edges
+    flat_all = all_vox.reshape(-1)
+    hist_all = torch.histogram(flat_all, bins=bin_edges)[0].float()
+    hist_all = hist_all / (hist_all.sum() + 1e-10)
+    histograms["overall"] = _to_numpy_safe(hist_all)
+    histograms["bin_edges"] = _to_numpy_safe(bin_edges)
 
     return histograms
 
