@@ -175,7 +175,6 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
     Shows:
     - Ground truth voxel grid (input)
     - Reconstructed voxel grid (from DLP decode)
-    - Keypoint locations overlaid
     """
     import wandb
     from eval.eval_vox import log_rgb_voxels
@@ -183,95 +182,66 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
     # Initialize wandb
     wandb.init(project=wandb_project, name=f"debug_{os.path.basename(voxel_path)}")
 
-    # Load voxel
+    # Load voxel EXACTLY like visualize_mimicgen_tasks.py does
     print(f"[debug] Loading voxel: {voxel_path}")
-    vox_gt = load_voxel(voxel_path, device)  # [C, D, H, W]
-    vox_input = vox_gt.unsqueeze(0)  # [1, C, D, H, W]
+    vox_gt = torch.load(voxel_path)  # Load on CPU first, just like visualize_mimicgen_tasks.py
+    print(f"[debug] GT voxel shape: {vox_gt.shape}, dtype: {vox_gt.dtype}, device: {vox_gt.device}")
 
-    print(f"[debug] Input shape: {vox_input.shape}")
+    # Log GT voxels EXACTLY like visualize_mimicgen_tasks.py
+    print("[debug] Logging GT voxels to wandb...")
+    log_rgb_voxels(
+        name="debug/gt_voxels",
+        rgb_vol=vox_gt,
+        alpha_vol=None,
+        KPx=None,
+        step=0,
+        mode="splat",
+        topk=60000,
+        alpha_thresh=0.05,
+        pad=2.0,
+        show_axes=True,
+    )
 
-    # Run full forward pass with reconstruction
+    # Now run through model for reconstruction
+    vox_input = vox_gt.unsqueeze(0).to(device)  # [1, C, D, H, W]
+    print(f"[debug] Model input shape: {vox_input.shape}")
+
     with torch.no_grad():
         out = model(vox_input, deterministic=True, warmup=False, with_loss=True)
 
     # Get reconstruction
     vox_rec = out.get("rec", out.get("reconstruction", None))
     if vox_rec is None:
-        # Try to decode from latents
         print("[debug] No 'rec' in output, attempting manual decode...")
         vox_rec = model.decode(out)
 
-    vox_rec = vox_rec[0]  # [C, D, H, W]
+    vox_rec = vox_rec[0].cpu()  # [C, D, H, W] - move to CPU like GT
+    print(f"[debug] Rec voxel shape: {vox_rec.shape}, dtype: {vox_rec.dtype}, device: {vox_rec.device}")
 
-    print(f"[debug] GT shape: {vox_gt.shape}, Rec shape: {vox_rec.shape}")
+    # Log reconstructed voxels
+    print("[debug] Logging reconstructed voxels to wandb...")
+    log_rgb_voxels(
+        name="debug/rec_voxels",
+        rgb_vol=vox_rec,
+        alpha_vol=None,
+        KPx=None,
+        step=0,
+        mode="splat",
+        topk=60000,
+        alpha_thresh=0.05,
+        pad=2.0,
+        show_axes=True,
+    )
 
-    # Get keypoint info
-    z = out["z"][0, 0]  # [K, 3] - keypoint positions
-    obj_on = out["obj_on"][0, 0]  # [K] or [K, 1]
+    # Get keypoint info for metrics
+    z = out["z"][0, 0].cpu()  # [K, 3]
+    obj_on = out["obj_on"][0, 0].cpu()  # [K] or [K, 1]
     if obj_on.dim() == 2:
         obj_on = obj_on.squeeze(-1)
 
     K = z.shape[0]
     print(f"[debug] Keypoints: K={K}")
     print(f"[debug] obj_on stats: min={obj_on.min():.3f}, max={obj_on.max():.3f}, mean={obj_on.mean():.3f}")
-
-    # Log 3D voxel visualizations using log_rgb_voxels (same as preprocess_mimicgen_voxels.py)
-    print("[debug] Logging GT voxels to wandb...")
-    log_rgb_voxels(
-        name="debug/gt_voxels",
-        rgb_vol=vox_gt,
-        alpha_vol=None,
-        KPx=z.unsqueeze(0),  # [1, K, 3] - show keypoints on GT
-        step=0,
-        mode="splat",
-        topk=60000,
-        alpha_thresh=0.05,
-        pad=2.0,
-        show_axes=True,
-    )
-
-    print("[debug] Logging reconstructed voxels to wandb...")
-    log_rgb_voxels(
-        name="debug/rec_voxels",
-        rgb_vol=vox_rec,
-        alpha_vol=None,
-        KPx=z.unsqueeze(0),  # [1, K, 3] - show keypoints on reconstruction
-        step=0,
-        mode="splat",
-        topk=60000,
-        alpha_thresh=0.05,
-        pad=2.0,
-        show_axes=True,
-    )
-
-    # Also log side-by-side for easy comparison
-    print("[debug] Logging GT voxels (no keypoints) for comparison...")
-    log_rgb_voxels(
-        name="debug/gt_clean",
-        rgb_vol=vox_gt,
-        alpha_vol=None,
-        KPx=None,
-        step=0,
-        mode="splat",
-        topk=60000,
-        alpha_thresh=0.05,
-        pad=2.0,
-        show_axes=True,
-    )
-
-    print("[debug] Logging reconstructed voxels (no keypoints) for comparison...")
-    log_rgb_voxels(
-        name="debug/rec_clean",
-        rgb_vol=vox_rec,
-        alpha_vol=None,
-        KPx=None,
-        step=0,
-        mode="splat",
-        topk=60000,
-        alpha_thresh=0.05,
-        pad=2.0,
-        show_axes=True,
-    )
 
     # Compute metrics
     C, D, H, W = vox_gt.shape
