@@ -220,11 +220,19 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
     # For voxels, we'll create slice visualizations (middle slices along each axis)
     C, D, H, W = vox_gt.shape
 
-    # Convert to numpy for visualization
-    vox_gt_np = vox_gt.cpu().numpy()
-    vox_rec_np = vox_rec.cpu().numpy()
-    z_np = z.cpu().numpy()
-    obj_on_np = obj_on.cpu().numpy()
+    # Convert to numpy for visualization (workaround for PyTorch without NumPy support)
+    def to_numpy(t):
+        """Convert tensor to numpy, handling PyTorch builds without NumPy support."""
+        try:
+            return t.cpu().numpy()
+        except RuntimeError:
+            # Fallback: convert via Python list
+            return np.array(t.cpu().tolist())
+
+    vox_gt_np = to_numpy(vox_gt)
+    vox_rec_np = to_numpy(vox_rec)
+    z_np = to_numpy(z)
+    obj_on_np = to_numpy(obj_on)
 
     # Create occupancy masks (sum across channels for RGB, or just use channel 0)
     if C == 1:
