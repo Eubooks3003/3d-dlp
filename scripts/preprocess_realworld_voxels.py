@@ -51,8 +51,6 @@ import argparse
 import glob
 import json
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
-from functools import partial
 
 import torch
 import numpy as np
@@ -159,12 +157,52 @@ def get_cache_structure(cache_dir: str, table_type: str):
     return cached
 
 
-def _voxelize_single_file(args_tuple):
-    """Worker function for parallel voxelization."""
-    (scene_id, ply_path, table_cache_dir, table_type,
-     grid_whd, voxel_mode, include_rgb, normalize_to_unit_cube, max_points) = args_tuple
+def voxelize_table_type(
+    root: str,
+    table_type: str,
+    grid_whd=(64, 64, 64),
+    voxel_mode="avg_rgb",
+    include_rgb=True,
+    normalize_to_unit_cube=True,
+    max_points=None,
+    cache_name="voxel_cache",
+    cache_suffix="",
+    max_files=None,
+):
+    """Voxelize all PLY files for a single table type and save to cache."""
+    cache_name = f"{cache_name}{cache_suffix}"
+    cache_dir = os.path.join(root, cache_name)
+    table_cache_dir = os.path.join(cache_dir, table_type)
 
-    try:
+    # Get all files for this table type
+    files = get_table_files(root, table_type)
+    if len(files) == 0:
+        print(f"[{table_type}] No PLY files found, skipping.")
+        return
+
+    # Get already cached files
+    cached = get_cache_structure(cache_dir, table_type)
+
+    # Filter to only uncached files
+    to_process = [(sid, path) for sid, path in files if sid not in cached]
+
+    # Limit files if max_files is set (for debug mode)
+    if max_files is not None and max_files > 0:
+        to_process = to_process[:max_files]
+
+    total_files = len(files)
+    total_cached = len(cached)
+    total_to_process = len(to_process)
+
+    if total_to_process == 0:
+        print(f"[{table_type}] Already complete: {total_cached}/{total_files} files cached.")
+        return
+
+    print(f"\n[{table_type}] Processing {total_to_process} files ({total_cached}/{total_files} already cached)...")
+
+    os.makedirs(table_cache_dir, exist_ok=True)
+
+    for scene_id, ply_path in tqdm(to_process, desc=f"  [{table_type}] Voxelizing"):
         vox_path = os.path.join(table_cache_dir, f"{scene_id}_voxels.pt")
         meta_path = os.path.join(table_cache_dir, f"{scene_id}_meta.pt")
         extras_path = os.path.join(table_cache_dir, f"{scene_id}_extras.pt")
@@ -200,93 +238,7 @@ def _voxelize_single_file(args_tuple):
         }
         torch.save(extras, extras_path)
 
-        return (scene_id, True, None)
-    except Exception as e:
-        return (scene_id, False, str(e))
-
-
-def voxelize_table_type(
-    root: str,
-    table_type: str,
-    grid_whd=(64, 64, 64),
-    voxel_mode="avg_rgb",
-    include_rgb=True,
-    normalize_to_unit_cube=True,
-    max_points=None,
-    cache_name="voxel_cache",
-    cache_suffix="",
-    max_files=None,
-    num_workers=None,
-):
-    """Voxelize all PLY files for a single table type and save to cache."""
-    cache_name = f"{cache_name}{cache_suffix}"
-    cache_dir = os.path.join(root, cache_name)
-    table_cache_dir = os.path.join(cache_dir, table_type)
-
-    # Get all files for this table type
-    files = get_table_files(root, table_type)
-    if len(files) == 0:
-        print(f"[{table_type}] No PLY files found, skipping.")
-        return
-
-    # Get already cached files
-    cached = get_cache_structure(cache_dir, table_type)
-
-    # Filter to only uncached files
-    to_process = [(sid, path) for sid, path in files if sid not in cached]
-
-    # Limit files if max_files is set (for debug mode)
-    if max_files is not None and max_files > 0:
-        to_process = to_process[:max_files]
-
-    total_files = len(files)
-    total_cached = len(cached)
-    total_to_process = len(to_process)
-
-    if total_to_process == 0:
-        print(f"[{table_type}] Already complete: {total_cached}/{total_files} files cached.")
-        return
-
-    print(f"\n[{table_type}] Processing {total_to_process} files ({total_cached}/{total_files} already cached)...")
-
-    os.makedirs(table_cache_dir, exist_ok=True)
-
-    # Prepare arguments for workers
-    worker_args = [
-        (scene_id, ply_path, table_cache_dir, table_type,
-         grid_whd, voxel_mode, include_rgb, normalize_to_unit_cube, max_points)
-        for scene_id, ply_path in to_process
-    ]
-
-    # Use multiprocessing if num_workers > 1
-    if num_workers is None:
-        num_workers = min(cpu_count(), 8)  # Default to min(num_cpus, 8)
-
-    if num_workers > 1 and total_to_process > 1:
-        print(f"  Using {num_workers} workers...")
-        with Pool(num_workers) as pool:
-            results = list(tqdm(
-                pool.imap(_voxelize_single_file, worker_args),
-                total=len(worker_args),
-                desc=f"  [{table_type}] Voxelizing"
-            ))
-    else:
-        # Sequential processing
-        results = []
-        for args in tqdm(worker_args, desc=f"  [{table_type}] Voxelizing"):
-            results.append(_voxelize_single_file(args))
-
-    # Report errors
-    errors = [(sid, err) for sid, success, err in results if not success]
-    if errors:
-        print(f"  [{table_type}] {len(errors)} errors:")
-        for sid, err in errors[:5]:
-            print(f"    {sid}: {err}")
-        if len(errors) > 5:
-            print(f"    ... and {len(errors) - 5} more")
-
-    success_count = sum(1 for _, success, _ in results if success)
-    print(f"  [{table_type}] Done! {success_count}/{total_to_process} voxels saved to {table_cache_dir}")
+    print(f"  [{table_type}] Done! {total_to_process} voxels saved to {table_cache_dir}")
 
 
 def voxelize_augmented(
@@ -299,7 +251,6 @@ def voxelize_augmented(
     cache_name="voxel_cache",
     cache_suffix="",
     max_files=None,
-    num_workers=None,
 ):
     """Voxelize all augmented PLY files."""
     cache_name = f"{cache_name}{cache_suffix}"
@@ -334,39 +285,42 @@ def voxelize_augmented(
 
     os.makedirs(aug_cache_dir, exist_ok=True)
 
-    # Prepare arguments for workers
-    worker_args = [
-        (scene_id, ply_path, aug_cache_dir, "augmented",
-         grid_whd, voxel_mode, include_rgb, normalize_to_unit_cube, max_points)
-        for scene_id, ply_path in to_process
-    ]
+    for scene_id, ply_path in tqdm(to_process, desc="  [augmented] Voxelizing"):
+        vox_path = os.path.join(aug_cache_dir, f"{scene_id}_voxels.pt")
+        meta_path = os.path.join(aug_cache_dir, f"{scene_id}_meta.pt")
+        extras_path = os.path.join(aug_cache_dir, f"{scene_id}_extras.pt")
 
-    # Use multiprocessing if num_workers > 1
-    if num_workers is None:
-        num_workers = min(cpu_count(), 8)
+        # Read and preprocess
+        pts = read_ply(ply_path, include_rgb=include_rgb)
+        if normalize_to_unit_cube:
+            pts = center_scale_unit_cube(pts)
 
-    if num_workers > 1 and total_to_process > 1:
-        print(f"  Using {num_workers} workers...")
-        with Pool(num_workers) as pool:
-            results = list(tqdm(
-                pool.imap(_voxelize_single_file, worker_args),
-                total=len(worker_args),
-                desc="  [augmented] Voxelizing"
-            ))
-    else:
-        results = []
-        for args in tqdm(worker_args, desc="  [augmented] Voxelizing"):
-            results.append(_voxelize_single_file(args))
+        if max_points is not None and pts.shape[0] > max_points:
+            idx_sample = np.random.choice(pts.shape[0], max_points, replace=False)
+            pts = pts[idx_sample]
 
-    # Report errors
-    errors = [(sid, err) for sid, success, err in results if not success]
-    if errors:
-        print(f"  [augmented] {len(errors)} errors:")
-        for sid, err in errors[:5]:
-            print(f"    {sid}: {err}")
+        pts_xyz = safe_tensor(pts[:, :3])
+        colors = safe_tensor(pts[:, 3:6]) if (pts.shape[-1] >= 6 and voxel_mode == "avg_rgb") else None
 
-    success_count = sum(1 for _, success, _ in results if success)
-    print(f"  [augmented] Done! {success_count}/{total_to_process} voxels saved to {aug_cache_dir}")
+        # Voxelize
+        vg = VoxelGridXYZ(pts_xyz, colors, grid_whd=grid_whd, bounds=None, mode=voxel_mode)
+        vox = vg.to_dense().cpu()
+        md = vg.meta_dict()
+        md_cpu = {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in md.items()}
+
+        # Save
+        torch.save(vox, vox_path)
+        torch.save(md_cpu, meta_path)
+
+        extras = {
+            "path": ply_path,
+            "id": scene_id,
+            "table_type": "augmented",
+            "points": pts,
+        }
+        torch.save(extras, extras_path)
+
+    print(f"  [augmented] Done! {total_to_process} voxels saved to {aug_cache_dir}")
 
 
 def debug_visualize(
@@ -533,8 +487,6 @@ def main():
                         help="Number of files to process per table type in debug_dataset mode (default: 10)")
     parser.add_argument("--wandb_project", type=str, default="realworld-voxel-debug",
                         help="Wandb project for debug visualizations")
-    parser.add_argument("--num_workers", "-j", type=int, default=None,
-                        help="Number of parallel workers (default: min(num_cpus, 8))")
 
     args = parser.parse_args()
 
@@ -578,7 +530,6 @@ def main():
                 cache_name=args.cache_name,
                 cache_suffix="_debug",
                 max_files=args.debug_n,
-                num_workers=args.num_workers,
             )
 
         if args.include_augmented:
@@ -592,7 +543,6 @@ def main():
                 cache_name=args.cache_name,
                 cache_suffix="_debug",
                 max_files=args.debug_n,
-                num_workers=args.num_workers,
             )
 
         write_manifest(args.root, table_types, f"{args.cache_name}_debug", tuple(args.grid_whd), args.voxel_mode)
@@ -610,7 +560,6 @@ def main():
             normalize_to_unit_cube=not args.no_normalize,
             max_points=args.max_points,
             cache_name=args.cache_name,
-            num_workers=args.num_workers,
         )
 
     if args.include_augmented:
@@ -622,7 +571,6 @@ def main():
             normalize_to_unit_cube=not args.no_normalize,
             max_points=args.max_points,
             cache_name=args.cache_name,
-            num_workers=args.num_workers,
         )
 
     write_manifest(args.root, table_types, args.cache_name, tuple(args.grid_whd), args.voxel_mode)
