@@ -9,6 +9,8 @@ Reads from voxel cache structure:
   ...
 
 Runs DLP encoder to get tokens, then saves EC-Diffuser compatible pickle.
+
+Debug mode (--debug): Process one frame and visualize GT vs reconstructed in wandb.
 """
 import os
 import re
@@ -164,6 +166,200 @@ def pack_tokens_k24(out: dict) -> torch.Tensor:
 
 
 # ----------------------------
+# Debug visualization
+# ----------------------------
+def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: str = "ec-diffuser-debug"):
+    """
+    Run a single frame through encode->decode and visualize in wandb.
+
+    Shows:
+    - Ground truth voxel grid (input)
+    - Reconstructed voxel grid (from DLP decode)
+    - Keypoint locations
+    """
+    import wandb
+
+    # Initialize wandb
+    wandb.init(project=wandb_project, name=f"debug_{os.path.basename(voxel_path)}")
+
+    # Load voxel
+    print(f"[debug] Loading voxel: {voxel_path}")
+    vox_gt = load_voxel(voxel_path, device)  # [C, D, H, W]
+    vox_input = vox_gt.unsqueeze(0)  # [1, C, D, H, W]
+
+    print(f"[debug] Input shape: {vox_input.shape}")
+
+    # Run full forward pass with reconstruction
+    with torch.no_grad():
+        out = model(vox_input, deterministic=True, warmup=False, with_loss=True)
+
+    # Get reconstruction
+    vox_rec = out.get("rec", out.get("reconstruction", None))
+    if vox_rec is None:
+        # Try to decode from latents
+        print("[debug] No 'rec' in output, attempting manual decode...")
+        vox_rec = model.decode(out)
+
+    vox_rec = vox_rec[0]  # [C, D, H, W]
+    vox_gt = vox_gt  # [C, D, H, W]
+
+    print(f"[debug] GT shape: {vox_gt.shape}, Rec shape: {vox_rec.shape}")
+
+    # Get keypoint info
+    z = out["z"][0, 0]  # [K, 3] - keypoint positions
+    z_scale = out["z_scale"][0, 0]  # [K, 3]
+    obj_on = out["obj_on"][0, 0]  # [K] or [K, 1]
+    if obj_on.dim() == 2:
+        obj_on = obj_on.squeeze(-1)
+
+    K = z.shape[0]
+    print(f"[debug] Keypoints: K={K}")
+    print(f"[debug] obj_on stats: min={obj_on.min():.3f}, max={obj_on.max():.3f}, mean={obj_on.mean():.3f}")
+
+    # Prepare visualizations
+    # For voxels, we'll create slice visualizations (middle slices along each axis)
+    C, D, H, W = vox_gt.shape
+
+    # Convert to numpy for visualization
+    vox_gt_np = vox_gt.cpu().numpy()
+    vox_rec_np = vox_rec.cpu().numpy()
+    z_np = z.cpu().numpy()
+    obj_on_np = obj_on.cpu().numpy()
+
+    # Create occupancy masks (sum across channels for RGB, or just use channel 0)
+    if C == 1:
+        occ_gt = vox_gt_np[0]  # [D, H, W]
+        occ_rec = vox_rec_np[0]
+    else:
+        # For RGB voxels, compute occupancy as any non-zero
+        occ_gt = np.abs(vox_gt_np).sum(axis=0) > 0.01  # [D, H, W]
+        occ_rec = np.abs(vox_rec_np).sum(axis=0) > 0.01
+
+    # Log metrics
+    wandb.log({
+        "input_channels": C,
+        "grid_size": D,
+        "num_keypoints": K,
+        "obj_on_mean": float(obj_on.mean()),
+        "obj_on_max": float(obj_on.max()),
+        "gt_occupancy_ratio": float(occ_gt.sum() / occ_gt.size),
+        "rec_occupancy_ratio": float(occ_rec.sum() / occ_rec.size),
+    })
+
+    # Create slice images (XY, XZ, YZ planes through center)
+    mid_d, mid_h, mid_w = D // 2, H // 2, W // 2
+
+    # XY slice (looking down Z axis)
+    slice_xy_gt = occ_gt[mid_d, :, :]
+    slice_xy_rec = occ_rec[mid_d, :, :]
+
+    # XZ slice (looking down Y axis)
+    slice_xz_gt = occ_gt[:, mid_h, :]
+    slice_xz_rec = occ_rec[:, mid_h, :]
+
+    # YZ slice (looking down X axis)
+    slice_yz_gt = occ_gt[:, :, mid_w]
+    slice_yz_rec = occ_rec[:, :, mid_w]
+
+    # Log slice images
+    wandb.log({
+        "slices/xy_gt": wandb.Image(slice_xy_gt.astype(np.float32), caption="GT XY slice"),
+        "slices/xy_rec": wandb.Image(slice_xy_rec.astype(np.float32), caption="Rec XY slice"),
+        "slices/xz_gt": wandb.Image(slice_xz_gt.astype(np.float32), caption="GT XZ slice"),
+        "slices/xz_rec": wandb.Image(slice_xz_rec.astype(np.float32), caption="Rec XZ slice"),
+        "slices/yz_gt": wandb.Image(slice_yz_gt.astype(np.float32), caption="GT YZ slice"),
+        "slices/yz_rec": wandb.Image(slice_yz_rec.astype(np.float32), caption="Rec YZ slice"),
+    })
+
+    # If RGB voxels, also log RGB slices
+    if C >= 3:
+        # RGB XY slice
+        rgb_xy_gt = vox_gt_np[:3, mid_d, :, :].transpose(1, 2, 0)  # [H, W, 3]
+        rgb_xy_rec = vox_rec_np[:3, mid_d, :, :].transpose(1, 2, 0)
+
+        # Normalize to [0, 1] for visualization
+        rgb_xy_gt = np.clip(rgb_xy_gt, 0, 1)
+        rgb_xy_rec = np.clip(rgb_xy_rec, 0, 1)
+
+        wandb.log({
+            "rgb_slices/xy_gt": wandb.Image(rgb_xy_gt, caption="GT RGB XY slice"),
+            "rgb_slices/xy_rec": wandb.Image(rgb_xy_rec, caption="Rec RGB XY slice"),
+        })
+
+    # Create 3D point cloud visualization of keypoints
+    # Scale keypoints from [-1, 1] to voxel grid coordinates
+    kp_voxel = (z_np + 1) / 2 * np.array([W, H, D])  # [K, 3] in voxel coords
+
+    # Create point cloud for wandb (active keypoints only)
+    active_mask = obj_on_np > 0.5
+    kp_active = kp_voxel[active_mask]
+
+    if len(kp_active) > 0:
+        # Create colored point cloud based on obj_on values
+        colors = np.zeros((len(kp_active), 3))
+        colors[:, 0] = 1.0  # Red for keypoints
+
+        wandb.log({
+            "keypoints/positions": wandb.Table(
+                columns=["x", "y", "z", "obj_on"],
+                data=[[float(z_np[i, 0]), float(z_np[i, 1]), float(z_np[i, 2]), float(obj_on_np[i])]
+                      for i in range(K)]
+            ),
+            "keypoints/num_active": int(active_mask.sum()),
+        })
+
+    # Log voxel grids as 3D objects if possible
+    try:
+        # Get occupied voxel coordinates
+        gt_coords = np.argwhere(occ_gt > 0.5)
+        rec_coords = np.argwhere(occ_rec > 0.5)
+
+        if len(gt_coords) > 0:
+            wandb.log({
+                "point_clouds/gt_voxels": wandb.Object3D(gt_coords.astype(np.float32)),
+            })
+        if len(rec_coords) > 0:
+            wandb.log({
+                "point_clouds/rec_voxels": wandb.Object3D(rec_coords.astype(np.float32)),
+            })
+        if len(kp_active) > 0:
+            wandb.log({
+                "point_clouds/keypoints": wandb.Object3D(kp_active.astype(np.float32)),
+            })
+    except Exception as e:
+        print(f"[debug] Could not log 3D objects: {e}")
+
+    # Compute reconstruction error
+    mse = float(((vox_gt - vox_rec) ** 2).mean())
+    mae = float((vox_gt - vox_rec).abs().mean())
+
+    # IoU for occupancy
+    intersection = ((occ_gt > 0.5) & (occ_rec > 0.5)).sum()
+    union = ((occ_gt > 0.5) | (occ_rec > 0.5)).sum()
+    iou = float(intersection / (union + 1e-8))
+
+    wandb.log({
+        "metrics/mse": mse,
+        "metrics/mae": mae,
+        "metrics/iou": iou,
+    })
+
+    print(f"[debug] Reconstruction metrics:")
+    print(f"  MSE: {mse:.6f}")
+    print(f"  MAE: {mae:.6f}")
+    print(f"  IoU: {iou:.4f}")
+    print(f"  Active keypoints: {int(active_mask.sum())}/{K}")
+
+    # Log tokens
+    toks = pack_tokens_k24(out)
+    print(f"[debug] Token shape: {toks.shape}")
+    wandb.log({"tokens/shape": str(list(toks.shape))})
+
+    wandb.finish()
+    print(f"[debug] Done! Check wandb project '{wandb_project}' for visualizations.")
+
+
+# ----------------------------
 # Voxel cache loading
 # ----------------------------
 def scan_voxel_cache(voxel_cache_dir: str):
@@ -245,6 +441,16 @@ def main():
     ap.add_argument("--out-pkl", required=True,
                     help="Output pickle file path")
 
+    # Debug mode
+    ap.add_argument("--debug", action="store_true",
+                    help="Debug mode: process one frame and visualize GT vs reconstructed in wandb")
+    ap.add_argument("--debug-demo", type=int, default=0,
+                    help="Demo index to use for debug mode (default: 0)")
+    ap.add_argument("--debug-frame", type=int, default=0,
+                    help="Frame index to use for debug mode (default: 0)")
+    ap.add_argument("--wandb-project", type=str, default="ec-diffuser-debug",
+                    help="Wandb project name for debug visualization")
+
     args = ap.parse_args()
 
     device = torch.device(args.device if ("cuda" in args.device and torch.cuda.is_available()) else "cpu")
@@ -272,6 +478,23 @@ def main():
     _ = load_checkpoint(args.dlp_ckpt, model, None, None, map_location=device)
     expected_c = int(cfg.get("ch", 3))
     print(f"[dlp] Loaded model, expected channels: {expected_c}")
+
+    # Debug mode: process one frame and exit
+    if args.debug:
+        demo_name = f"demo_{args.debug_demo}"
+        if demo_name not in voxel_map:
+            available = list(voxel_map.keys())[:5]
+            raise RuntimeError(f"Demo '{demo_name}' not found. Available: {available}...")
+
+        if args.debug_frame not in voxel_map[demo_name]:
+            available = sorted(voxel_map[demo_name].keys())[:10]
+            raise RuntimeError(f"Frame {args.debug_frame} not found in {demo_name}. Available: {available}...")
+
+        voxel_path = voxel_map[demo_name][args.debug_frame]
+        print(f"[debug] Running debug mode on: {voxel_path}")
+
+        run_debug_mode(model, voxel_path, device, wandb_project=args.wandb_project)
+        return  # Exit after debug
 
     # Action converter (only for absolute mode)
     action_converter = None
