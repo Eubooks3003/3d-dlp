@@ -174,6 +174,7 @@ def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
     Returns list of (vox_tensor, vox_path) tuples
     """
     import glob
+    from tqdm import tqdm
 
     if not os.path.isdir(cache_dir):
         return []
@@ -186,18 +187,19 @@ def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
         key=lambda x: int(os.path.basename(x).split("_")[1])
     )
 
+    # Collect all voxel paths first
+    all_vox_paths = []
     for demo_dir in demo_dirs:
-        if len(voxels) >= num_samples:
+        vox_files = sorted(glob.glob(os.path.join(demo_dir, "frame*_voxels.pt")))
+        all_vox_paths.extend(vox_files)
+        if len(all_vox_paths) >= num_samples:
+            all_vox_paths = all_vox_paths[:num_samples]
             break
 
-        # Find voxel files in this demo
-        vox_files = sorted(glob.glob(os.path.join(demo_dir, "frame*_voxels.pt")))
-
-        for vox_path in vox_files:
-            if len(voxels) >= num_samples:
-                break
-            vox = torch.load(vox_path)
-            voxels.append((vox, vox_path))
+    # Load with progress bar
+    for vox_path in tqdm(all_vox_paths, desc="Loading voxels"):
+        vox = torch.load(vox_path, weights_only=False)
+        voxels.append((vox, vox_path))
 
     return voxels
 
