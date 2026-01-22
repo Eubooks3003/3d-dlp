@@ -184,10 +184,14 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
     # Initialize wandb
     wandb.init(project=wandb_project, name=f"debug_{os.path.basename(voxel_path)}")
 
-    # Load voxel
+    # Load voxel (EXACTLY like visualize_mimicgen_tasks.py - no map_location)
     print(f"[debug] Loading voxel: {voxel_path}")
-    vox_gt = torch.load(voxel_path, map_location="cpu")
+    vox_gt = torch.load(voxel_path)
     print(f"[debug] GT voxel shape: {vox_gt.shape}")
+    print(f"[debug] GT voxel dtype: {vox_gt.dtype}")
+    print(f"[debug] GT voxel device: {vox_gt.device}")
+    print(f"[debug] GT voxel min: {vox_gt.min():.6f}, max: {vox_gt.max():.6f}, mean: {vox_gt.mean():.6f}")
+    print(f"[debug] GT voxel nonzero: {(vox_gt.abs() > 0.01).sum().item()} / {vox_gt.numel()}")
 
     # Run through model
     vox_input = vox_gt.unsqueeze(0).to(device)
