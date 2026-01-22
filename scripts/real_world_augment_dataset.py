@@ -9,6 +9,7 @@ import struct
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from tqdm import tqdm
+import open3d as o3d
 
 
 @dataclass
@@ -145,9 +146,10 @@ def make_plane_frame(normal: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 # ========================== I/O ==========================
 
-def load_ply_binary(ply_path: Path) -> PointCloud:
-    """Load a binary big-endian PLY file."""
+def load_ply(ply_path: Path) -> PointCloud:
+    """Load a binary big-endian PLY file (vectorized for speed)."""
     with open(ply_path, 'rb') as f:
+        # Read header
         header_lines = []
         while True:
             line = f.readline().decode('ascii').strip()
@@ -161,15 +163,18 @@ def load_ply_binary(ply_path: Path) -> PointCloud:
                 num_vertices = int(line.split()[-1])
                 break
 
-        xyz = np.zeros((num_vertices, 3), dtype=np.float32)
-        rgb = np.zeros((num_vertices, 3), dtype=np.uint8)
+        # Read all binary data at once (15 bytes per vertex: 3 floats + 3 bytes)
+        data = f.read(num_vertices * 15)
 
-        for i in range(num_vertices):
-            data = f.read(15)
-            x, y, z = struct.unpack('>fff', data[:12])
-            r, g, b = struct.unpack('BBB', data[12:15])
-            xyz[i] = [x, y, z]
-            rgb[i] = [r, g, b]
+    # Parse with numpy - big-endian floats for xyz
+    raw = np.frombuffer(data, dtype=np.uint8).reshape(num_vertices, 15)
+
+    # Extract xyz (bytes 0-11, big-endian float32)
+    xyz_bytes = raw[:, :12].tobytes()
+    xyz = np.frombuffer(xyz_bytes, dtype='>f4').reshape(num_vertices, 3).astype(np.float32)
+
+    # Extract rgb (bytes 12-14, uint8)
+    rgb = raw[:, 12:15].copy()
 
     return PointCloud(xyz, rgb)
 
@@ -181,22 +186,12 @@ def load_labels(label_path: Path) -> np.ndarray:
     return labels
 
 
-def save_ply_ascii(pc: PointCloud, output_path: Path):
-    with open(output_path, 'w') as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {len(pc)}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("property uchar red\n")
-        f.write("property uchar green\n")
-        f.write("property uchar blue\n")
-        f.write("end_header\n")
-        for i in range(len(pc)):
-            x, y, z = pc.xyz[i]
-            r, g, b = pc.rgb[i]
-            f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b}\n")
+def save_ply(pc: PointCloud, output_path: Path):
+    """Save a PLY file using Open3D (binary format for speed)."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pc.xyz.astype(np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(pc.rgb.astype(np.float64) / 255.0)
+    o3d.io.write_point_cloud(str(output_path), pcd, write_ascii=False)
 
 
 def translate(pc: PointCloud, offset: np.ndarray) -> PointCloud:
@@ -292,7 +287,7 @@ def process_scene(scene_num: int, data_dir: Path, output_dir: Path,
             tqdm.write(f"  Scene {scene_num:02d}: PLY not found, skipping")
             return False
 
-        pc = load_ply_binary(ply_path)
+        pc = load_ply(ply_path)
         labels = load_labels(label_path)
 
         if verbose:
@@ -392,7 +387,7 @@ def process_scene(scene_num: int, data_dir: Path, output_dir: Path,
             augmented = PointCloud(np.vstack(all_xyz), np.vstack(all_rgb))
 
             out_path = output_dir / f"scene_{scene_num:02d}_aug_{aug_idx:03d}.ply"
-            save_ply_ascii(augmented, out_path)
+            save_ply(augmented, out_path)
 
             if verbose:
                 tqdm.write(f"    Saved: {out_path.name} ({len(augmented):,} points)")
