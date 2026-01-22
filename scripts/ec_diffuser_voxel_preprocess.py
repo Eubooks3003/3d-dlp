@@ -172,25 +172,44 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
     """
     Run a single frame through encode->decode and visualize in wandb.
 
-    Shows:
-    - Ground truth voxel grid (input)
-    - Reconstructed voxel grid (from DLP decode)
+    Like compare_voxel_datasets.py - shows GT, reconstruction, and difference.
     """
     import wandb
+
+    # Add parent dir to path for imports
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from eval.eval_vox import log_rgb_voxels
 
     # Initialize wandb
     wandb.init(project=wandb_project, name=f"debug_{os.path.basename(voxel_path)}")
 
-    # Load voxel EXACTLY like visualize_mimicgen_tasks.py does
+    # Load voxel
     print(f"[debug] Loading voxel: {voxel_path}")
-    vox_gt = torch.load(voxel_path)  # Load on CPU first, just like visualize_mimicgen_tasks.py
-    print(f"[debug] GT voxel shape: {vox_gt.shape}, dtype: {vox_gt.dtype}, device: {vox_gt.device}")
+    vox_gt = torch.load(voxel_path, map_location="cpu")
+    print(f"[debug] GT voxel shape: {vox_gt.shape}")
 
-    # Log GT voxels EXACTLY like visualize_mimicgen_tasks.py
-    print("[debug] Logging GT voxels to wandb...")
+    # Run through model
+    vox_input = vox_gt.unsqueeze(0).to(device)
+    print(f"[debug] Model input shape: {vox_input.shape}")
+
+    with torch.no_grad():
+        out = model(vox_input, deterministic=True, warmup=False, with_loss=True)
+
+    # Get reconstruction
+    vox_rec = out.get("rec", out.get("reconstruction", None))
+    if vox_rec is None:
+        print("[debug] No 'rec' in output, trying model.decode()...")
+        vox_rec = model.decode(out)
+
+    vox_rec = vox_rec[0].cpu()
+    print(f"[debug] Rec voxel shape: {vox_rec.shape}")
+
+    # === Visualizations (like compare_voxel_datasets.py) ===
+
+    # GT voxel
     log_rgb_voxels(
-        name="debug/gt_voxels",
+        name="samples/gt",
         rgb_vol=vox_gt,
         alpha_vol=None,
         KPx=None,
@@ -201,27 +220,11 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
         pad=2.0,
         show_axes=True,
     )
+    print("[debug] Logged GT")
 
-    # Now run through model for reconstruction
-    vox_input = vox_gt.unsqueeze(0).to(device)  # [1, C, D, H, W]
-    print(f"[debug] Model input shape: {vox_input.shape}")
-
-    with torch.no_grad():
-        out = model(vox_input, deterministic=True, warmup=False, with_loss=True)
-
-    # Get reconstruction
-    vox_rec = out.get("rec", out.get("reconstruction", None))
-    if vox_rec is None:
-        print("[debug] No 'rec' in output, attempting manual decode...")
-        vox_rec = model.decode(out)
-
-    vox_rec = vox_rec[0].cpu()  # [C, D, H, W] - move to CPU like GT
-    print(f"[debug] Rec voxel shape: {vox_rec.shape}, dtype: {vox_rec.dtype}, device: {vox_rec.device}")
-
-    # Log reconstructed voxels
-    print("[debug] Logging reconstructed voxels to wandb...")
+    # Reconstruction
     log_rgb_voxels(
-        name="debug/rec_voxels",
+        name="samples/rec",
         rgb_vol=vox_rec,
         alpha_vol=None,
         KPx=None,
@@ -232,39 +235,54 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
         pad=2.0,
         show_axes=True,
     )
+    print("[debug] Logged reconstruction")
 
-    # Get keypoint info for metrics
-    z = out["z"][0, 0].cpu()  # [K, 3]
-    obj_on = out["obj_on"][0, 0].cpu()  # [K] or [K, 1]
+    # Difference visualization (scaled for visibility, like compare_voxel_datasets.py)
+    diff = (vox_gt - vox_rec).abs()
+    diff_scaled = diff / (diff.max() + 1e-8)
+    log_rgb_voxels(
+        name="samples/diff",
+        rgb_vol=diff_scaled,
+        alpha_vol=None,
+        KPx=None,
+        step=0,
+        mode="splat",
+        topk=60000,
+        alpha_thresh=0.01,  # lower threshold to see small diffs
+        pad=2.0,
+        show_axes=True,
+    )
+    print("[debug] Logged difference")
+
+    # === Metrics ===
+    z = out["z"][0, 0].cpu()
+    obj_on = out["obj_on"][0, 0].cpu()
     if obj_on.dim() == 2:
         obj_on = obj_on.squeeze(-1)
 
     K = z.shape[0]
-    print(f"[debug] Keypoints: K={K}")
-    print(f"[debug] obj_on stats: min={obj_on.min():.3f}, max={obj_on.max():.3f}, mean={obj_on.mean():.3f}")
-
-    # Compute metrics
-    C, D, H, W = vox_gt.shape
-
-    # Compute occupancy for IoU
-    if C == 1:
-        occ_gt = (vox_gt[0] > 0.01).float()
-        occ_rec = (vox_rec[0] > 0.01).float()
-    else:
-        occ_gt = (vox_gt.abs().sum(dim=0) > 0.01).float()
-        occ_rec = (vox_rec.abs().sum(dim=0) > 0.01).float()
-
-    # Reconstruction error
     mse = float(((vox_gt - vox_rec) ** 2).mean())
     mae = float((vox_gt - vox_rec).abs().mean())
 
-    # IoU for occupancy
-    intersection = ((occ_gt > 0.5) & (occ_rec > 0.5)).float().sum()
-    union = ((occ_gt > 0.5) | (occ_rec > 0.5)).float().sum()
+    # Occupancy IoU
+    if vox_gt.shape[0] == 1:
+        occ_gt = (vox_gt[0] > 0.01)
+        occ_rec = (vox_rec[0] > 0.01)
+    else:
+        occ_gt = (vox_gt.abs().sum(dim=0) > 0.01)
+        occ_rec = (vox_rec.abs().sum(dim=0) > 0.01)
+
+    intersection = (occ_gt & occ_rec).float().sum()
+    union = (occ_gt | occ_rec).float().sum()
     iou = float(intersection / (union + 1e-8))
 
-    # Count active keypoints
     active_kp = int((obj_on > 0.5).sum())
+
+    print(f"[debug] Metrics:")
+    print(f"  MSE: {mse:.6f}")
+    print(f"  MAE: {mae:.6f}")
+    print(f"  IoU: {iou:.4f}")
+    print(f"  Active keypoints: {active_kp}/{K}")
 
     wandb.log({
         "metrics/mse": mse,
@@ -272,26 +290,10 @@ def run_debug_mode(model, voxel_path: str, device: torch.device, wandb_project: 
         "metrics/iou": iou,
         "metrics/active_keypoints": active_kp,
         "metrics/total_keypoints": K,
-        "info/input_channels": C,
-        "info/grid_size": D,
-        "info/obj_on_mean": float(obj_on.mean()),
-        "info/obj_on_max": float(obj_on.max()),
-        "info/gt_occupancy_ratio": float(occ_gt.sum() / occ_gt.numel()),
-        "info/rec_occupancy_ratio": float(occ_rec.sum() / occ_rec.numel()),
     })
 
-    print(f"[debug] Reconstruction metrics:")
-    print(f"  MSE: {mse:.6f}")
-    print(f"  MAE: {mae:.6f}")
-    print(f"  IoU: {iou:.4f}")
-    print(f"  Active keypoints: {active_kp}/{K}")
-
-    # Log tokens
-    toks = pack_tokens_k24(out)
-    print(f"[debug] Token shape: {toks.shape}")
-
     wandb.finish()
-    print(f"[debug] Done! Check wandb project '{wandb_project}' for visualizations.")
+    print(f"[debug] Done! Check wandb project '{wandb_project}'")
 
 
 # ----------------------------
