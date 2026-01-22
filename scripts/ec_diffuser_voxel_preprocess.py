@@ -211,6 +211,7 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
     """
     import wandb
     from eval.eval_vox import log_rgb_voxels
+    from tqdm import tqdm
 
     # Load voxels from nested cache structure
     voxels = load_voxels_from_nested_cache(voxel_cache_dir, num_samples=num_samples)
@@ -222,7 +223,7 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
     # Initialize wandb
     wandb.init(project=wandb_project, name=f"debug-dlp-{len(voxels)}-samples")
 
-    for i, (vox, vox_path) in enumerate(voxels):
+    for i, (vox, vox_path) in enumerate(tqdm(voxels, desc="Processing samples")):
         print(f"\n[debug] Sample {i}: {vox.shape} from {os.path.basename(vox_path)}")
 
         # Log GT voxel
