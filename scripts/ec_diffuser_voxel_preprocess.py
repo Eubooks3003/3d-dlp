@@ -166,105 +166,125 @@ def pack_tokens_k24(out: dict) -> torch.Tensor:
 
 
 # ----------------------------
-# Debug visualization (copied from visualize_mimicgen_tasks.py)
+# Debug visualization
 # ----------------------------
-def get_first_voxel_for_debug(cache_dir: str):
-    """Get the first voxel - COPIED from visualize_mimicgen_tasks.py get_first_voxel"""
+def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
+    """
+    Load voxels from nested cache structure: cache_dir/demo_X/frameY_voxels.pt
+    Returns list of (vox_tensor, vox_path) tuples
+    """
     import glob
 
     if not os.path.isdir(cache_dir):
-        return None, None
+        return []
 
-    # Find first demo
+    voxels = []
+
+    # Find all demo directories
     demo_dirs = sorted(
         glob.glob(os.path.join(cache_dir, "demo_*")),
         key=lambda x: int(os.path.basename(x).split("_")[1])
     )
 
-    if not demo_dirs:
-        return None, None
+    for demo_dir in demo_dirs:
+        if len(voxels) >= num_samples:
+            break
 
-    demo_dir = demo_dirs[0]
+        # Find voxel files in this demo
+        vox_files = sorted(glob.glob(os.path.join(demo_dir, "frame*_voxels.pt")))
 
-    # Find first frame
-    vox_files = sorted(glob.glob(os.path.join(demo_dir, "frame*_voxels.pt")))
-    if not vox_files:
-        return None, None
+        for vox_path in vox_files:
+            if len(voxels) >= num_samples:
+                break
+            vox = torch.load(vox_path)
+            voxels.append((vox, vox_path))
 
-    vox_path = vox_files[0]
-    vox = torch.load(vox_path)
-
-    return vox, vox_path
+    return voxels
 
 
-def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_project: str = "ec-diffuser-debug"):
+def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_project: str = "ec-diffuser-debug", num_samples: int = 3):
     """
-    Run a single frame through encode->decode and visualize in wandb.
-    Uses exact same loading as visualize_mimicgen_tasks.py
+    Run samples through encode->decode and visualize in wandb.
+    Shows GT, reconstruction, and difference for each sample.
     """
     import wandb
     from eval.eval_vox import log_rgb_voxels
 
-    # Load voxel using EXACT same code as visualize_mimicgen_tasks.py
-    vox, vox_path = get_first_voxel_for_debug(voxel_cache_dir)
-    if vox is None:
+    # Load voxels from nested cache structure
+    voxels = load_voxels_from_nested_cache(voxel_cache_dir, num_samples=num_samples)
+    if not voxels:
         raise RuntimeError(f"No voxels found in {voxel_cache_dir}")
 
-    print(f"[debug] Voxel: {vox.shape} from {vox_path}")
+    print(f"[debug] Loaded {len(voxels)} voxels")
 
     # Initialize wandb
-    wandb.init(project=wandb_project, name=f"debug_{os.path.basename(vox_path)}")
+    wandb.init(project=wandb_project, name=f"debug-dlp-{len(voxels)}-samples")
 
-    # === LOG GT VOXEL - EXACT code from visualize_mimicgen_tasks.py lines 138-149 ===
-    log_rgb_voxels(
-        name=f"voxel/input",
-        rgb_vol=vox,
-        alpha_vol=None,
-        KPx=None,
-        step=0,
-        mode="splat",
-        topk=60000,
-        alpha_thresh=0.05,
-        pad=2.0,
-        show_axes=True,
-    )
-    print("[debug] Logged input voxel")
+    for i, (vox, vox_path) in enumerate(voxels):
+        print(f"\n[debug] Sample {i}: {vox.shape} from {os.path.basename(vox_path)}")
 
-    # Run through model
-    vox_input = vox.unsqueeze(0).to(device)
-    with torch.no_grad():
-        out = model(vox_input, deterministic=True, warmup=False, with_loss=True)
+        # Log GT voxel
+        log_rgb_voxels(
+            name=f"samples/input_{i}",
+            rgb_vol=vox,
+            alpha_vol=None,
+            KPx=None,
+            step=i,
+            mode="splat",
+            topk=60000,
+            alpha_thresh=0.05,
+            pad=2.0,
+            show_axes=True,
+        )
 
-    # Get reconstruction
-    vox_rec = out.get("rec", out.get("reconstruction", None))
-    if vox_rec is None:
-        vox_rec = model.decode(out)
-    vox_rec = vox_rec[0].cpu()
+        # Run through model
+        vox_input = vox.unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = model(vox_input, deterministic=True, warmup=False, with_loss=True)
 
-    print(f"[debug] Reconstruction: {vox_rec.shape}")
+        # Get reconstruction
+        vox_rec = out.get("rec", out.get("reconstruction", None))
+        if vox_rec is None:
+            vox_rec = model.decode(out)
+        vox_rec = vox_rec[0].cpu()
 
-    # Log reconstruction
-    log_rgb_voxels(
-        name=f"voxel/reconstruction",
-        rgb_vol=vox_rec,
-        alpha_vol=None,
-        KPx=None,
-        step=0,
-        mode="splat",
-        topk=60000,
-        alpha_thresh=0.05,
-        pad=2.0,
-        show_axes=True,
-    )
-    print("[debug] Logged reconstruction")
+        # Log reconstruction
+        log_rgb_voxels(
+            name=f"samples/rec_{i}",
+            rgb_vol=vox_rec,
+            alpha_vol=None,
+            KPx=None,
+            step=i,
+            mode="splat",
+            topk=60000,
+            alpha_thresh=0.05,
+            pad=2.0,
+            show_axes=True,
+        )
 
-    # Metrics
-    mse = float(((vox.cpu() - vox_rec) ** 2).mean())
-    print(f"[debug] MSE: {mse:.6f}")
-    wandb.log({"metrics/mse": mse})
+        # Log difference
+        diff = (vox - vox_rec).abs()
+        diff_scaled = diff / (diff.max() + 1e-8)
+        log_rgb_voxels(
+            name=f"samples/diff_{i}",
+            rgb_vol=diff_scaled,
+            alpha_vol=None,
+            KPx=None,
+            step=i,
+            mode="splat",
+            topk=60000,
+            alpha_thresh=0.01,
+            pad=2.0,
+            show_axes=True,
+        )
+
+        # Metrics
+        mse = float(((vox - vox_rec) ** 2).mean())
+        print(f"[debug] Sample {i} MSE: {mse:.6f}")
+        wandb.log({f"metrics/mse_{i}": mse}, step=i)
 
     wandb.finish()
-    print(f"[debug] Done!")
+    print(f"\n[debug] Done! Check wandb project '{wandb_project}'")
 
 
 # ----------------------------
@@ -351,11 +371,9 @@ def main():
 
     # Debug mode
     ap.add_argument("--debug", action="store_true",
-                    help="Debug mode: process one frame and visualize GT vs reconstructed in wandb")
-    ap.add_argument("--debug-demo", type=int, default=0,
-                    help="Demo index to use for debug mode (default: 0)")
-    ap.add_argument("--debug-frame", type=int, default=0,
-                    help="Frame index to use for debug mode (default: 0)")
+                    help="Debug mode: visualize GT vs reconstructed voxels in wandb")
+    ap.add_argument("--debug-samples", type=int, default=3,
+                    help="Number of samples to visualize in debug mode (default: 3)")
     ap.add_argument("--wandb-project", type=str, default="ec-diffuser-debug",
                     help="Wandb project name for debug visualization")
 
@@ -387,10 +405,10 @@ def main():
     expected_c = int(cfg.get("ch", 3))
     print(f"[dlp] Loaded model, expected channels: {expected_c}")
 
-    # Debug mode: process one frame and exit
+    # Debug mode: process samples and exit
     if args.debug:
         print(f"[debug] Running debug mode on voxel cache: {args.voxel_cache_dir}")
-        run_debug_mode(model, args.voxel_cache_dir, device, wandb_project=args.wandb_project)
+        run_debug_mode(model, args.voxel_cache_dir, device, wandb_project=args.wandb_project, num_samples=args.debug_samples)
         return  # Exit after debug
 
     # Action converter (only for absolute mode)
