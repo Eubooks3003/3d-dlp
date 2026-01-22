@@ -1,7 +1,6 @@
 {
   "ds": "mimicgen_voxel",
-  "root": "/home/ubuntu/pathaklab/data/mimicgen",
-  "task": "stack",
+  "root": "/home/ubuntu/pathaklab/data/mimicgen/hammer_cleanup_d0/core/voxel_cache_new",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn", 
   "voxel_mode": "occupancy",
@@ -101,7 +100,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "mimicgen_rgb_stack",
+  "run_prefix": "mimicgen_rgb_hammer_cleanup",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
