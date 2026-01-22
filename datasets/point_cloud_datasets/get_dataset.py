@@ -77,6 +77,24 @@ def get_point_cloud_dataset(
             device=device,
         )
 
+    # --- Real-world tabletop voxel cache (from preprocess_realworld_voxels.py) ---
+    if ds_key in ("realworld_voxel", "realworld", "tabletop_voxel"):
+        from datasets.point_cloud_datasets.realworld_ds import RealWorldVoxelDataset
+
+        # root should point to the directory containing voxel_cache/
+        # table_types can be specified via 'tasks' parameter
+        return RealWorldVoxelDataset(
+            root=root,
+            table_types=tasks,  # reuse 'tasks' param for table types
+            split=mode,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+            include_augmented=False,  # can be added as param if needed
+            cache_suffix=cache_suffix,
+            device=device,
+        )
+
     if ds_key in ("to","to-scene","to_scene"):
         base = TODataset(
             root=root, split=mode, max_points=max_points,
