@@ -59,9 +59,8 @@ class RealWorldVoxelDataset(Dataset):
         self.device = device
         self.include_augmented = include_augmented
 
-        # Build cache directory path
-        cache_name = f"voxel_cache{cache_suffix}"
-        self.cache_dir = os.path.join(self.root, cache_name)
+        # Use root directly as cache directory
+        self.cache_dir = self.root
 
         if not os.path.isdir(self.cache_dir):
             raise FileNotFoundError(f"Voxel cache not found: {self.cache_dir}")
@@ -140,7 +139,7 @@ class RealWorldVoxelDataset(Dataset):
 
     def _discover_table_types(self) -> List[str]:
         """Auto-discover table type folders in the cache directory."""
-        known_tables = ["round_table", "long_table", "square_table", "office_table"]
+        known_tables = ["round_table", "long_table", "square_table", "office_table", "round_table_augmented"]
         found = []
 
         for table in known_tables:
@@ -149,6 +148,12 @@ class RealWorldVoxelDataset(Dataset):
                 vox_files = glob.glob(os.path.join(table_dir, "*_voxels.pt"))
                 if vox_files:
                     found.append(table)
+
+        # Also check for files directly in the root directory (no subdirectory structure)
+        if not found:
+            vox_files = glob.glob(os.path.join(self.cache_dir, "*_voxels.pt"))
+            if vox_files:
+                found.append(".")  # Use "." to indicate root directory
 
         return found
 
@@ -160,7 +165,12 @@ class RealWorldVoxelDataset(Dataset):
         files = []
 
         for table_type in self.table_types:
-            table_dir = os.path.join(self.cache_dir, table_type)
+            # Handle "." as special case for files directly in root
+            if table_type == ".":
+                table_dir = self.cache_dir
+            else:
+                table_dir = os.path.join(self.cache_dir, table_type)
+
             if not os.path.isdir(table_dir):
                 continue
 
@@ -210,10 +220,6 @@ class RealWorldVoxelDataset(Dataset):
 
         sample = {
             "voxels": vox,                          # [C, D, H, W]
-            "meta": meta,                           # dict with pmin, pmax, voxel_size, etc.
             "fg_mask": fg_mask,                     # [D, H, W] bool
-            "id": f"{table_type}_{scene_id}",
-            "table_type": table_type,
-            "voxels_path": vox_path,
         }
         return sample
