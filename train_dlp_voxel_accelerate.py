@@ -67,9 +67,6 @@ torch.set_float32_matmul_precision("high")
 
 from collections import defaultdict
 import time
-from utils.timing_utils import enable_timing, disable_timing, print_timing_stats, clear_timing_stats
-
-
 def cuda_sync():
     """Synchronize CUDA for accurate timing."""
     if torch.cuda.is_available():
@@ -261,7 +258,9 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         cache_suffix=cache_suffix,
     )
 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=8, pin_memory=True,
+                            persistent_workers=True, prefetch_factor=4)
 
     # Validation dataset
     val_dataset = get_point_cloud_dataset(
@@ -432,25 +431,12 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         )
 
     # Training loop
-    PROFILE_ITERS = 2  # Number of iterations to profile at start of first epoch
     for epoch in range(start_epoch, num_epochs):
         model.train()
         epoch_avg = EpochAverager()
 
-        # Enable detailed timing for first N iterations of first epoch
-        if epoch == start_epoch and accelerator.is_main_process:
-            enable_timing(sync_cuda=True)
-            clear_timing_stats()
-
         pbar = tqdm(iterable=dataloader, disable=not accelerator.is_local_main_process)
         for it, batch in enumerate(pbar):
-            # Print timing after each profiled iteration, then disable after PROFILE_ITERS
-            if epoch == start_epoch and it < PROFILE_ITERS and accelerator.is_main_process:
-                print(f"\n[iter {it}] TIMING BREAKDOWN:")
-                print_timing_stats(sort_by='total')
-            if epoch == start_epoch and it == PROFILE_ITERS and accelerator.is_main_process:
-                disable_timing()
-
             t0 = time.time()
 
             # Get batch (already on CPU from dataloader)
@@ -634,6 +620,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 wandb.log({"loss_curves": wandb.Image(loss_curve_path)}, step=iteration)
 
             model.train()  # Back to training mode
+            torch.cuda.empty_cache()  # Clear memory fragmentation after validation
 
         # TRAIN VISUALS (voxel version) - only main process
         if (epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1) and accelerator.is_main_process:

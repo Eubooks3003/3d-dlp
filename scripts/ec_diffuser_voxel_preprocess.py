@@ -150,19 +150,35 @@ def build_dlp_from_cfg(cfg, device):
     return model
 
 
-def pack_tokens_k24(out: dict) -> torch.Tensor:
-    """Pack DLP output into K=24 tokens."""
-    z       = out["z"][:, 0]          # (B,24,3)
-    z_scale = out["z_scale"][:, 0]    # (B,24,3)
-    z_depth = out["z_depth"][:, 0]    # (B,24,3)
-    obj_on  = out["obj_on"][:, 0]     # (B,24,1) or (B,24)
-    z_feat  = out["z_features"][:, 0] # (B,24,F)
+def pack_tokens_k24(out: dict) -> tuple:
+    """
+    Pack DLP output into K tokens (foreground particles) and separate bg_features.
+
+    Token format per particle: [z(3), z_scale(3), z_depth(1), obj_on(1), z_features(F)]
+    Background features are returned separately.
+
+    Returns:
+        toks: (B, K, Dtok) - foreground particle tokens
+        bg_features: (B, bg_dim) - background features
+    """
+    z       = out["z"][:, 0]          # (B, K, 3)
+    z_scale = out["z_scale"][:, 0]    # (B, K, 3)
+    z_depth = out["z_depth"][:, 0]    # (B, K, 1) or (B, K, 3)
+    obj_on  = out["obj_on"][:, 0]     # (B, K, 1) or (B, K)
+    z_feat  = out["z_features"][:, 0] # (B, K, F)
+    z_bg    = out["z_bg_features"][:, 0]  # (B, bg_dim)
 
     if obj_on.dim() == 2:
         obj_on = obj_on.unsqueeze(-1)
 
+    # Only z_depth's first dim if it has 3 dims (some models output 3, we only need 1)
+    if z_depth.shape[-1] == 3:
+        z_depth = z_depth[..., :1]
+
+    # Pack foreground tokens (do NOT include bg_features - they're separate)
     toks = torch.cat([z, z_scale, z_depth, obj_on, z_feat], dim=-1)
-    return toks
+
+    return toks, z_bg
 
 
 # ----------------------------
@@ -424,7 +440,7 @@ def main():
         print(f"[actions] Using RELATIVE action mode")
 
     # Process demos
-    ep_obs, ep_act, ep_gripper, path_lengths = [], [], [], []
+    ep_obs, ep_act, ep_gripper, ep_bg_features, path_lengths = [], [], [], [], []
     init_states = []
     demo_indices = []
     total_written = 0
@@ -477,6 +493,7 @@ def main():
             obs_steps = []
             act_steps = []
             gripper_steps = []
+            bg_steps = []
 
             t0 = 0
             while t0 < T:
@@ -508,10 +525,12 @@ def main():
                 # Run DLP encoder
                 with torch.no_grad():
                     out = model(vox, deterministic=True, warmup=False, with_loss=False)
-                    toks = pack_tokens_k24(out)
+                    toks, bg_feats = pack_tokens_k24(out)
 
                 toks_np = toks.detach().cpu().numpy().astype(np.float32)
+                bg_np = bg_feats.detach().cpu().numpy().astype(np.float32)
                 obs_steps.append(toks_np)
+                bg_steps.append(bg_np)
                 act_steps.append(actions[valid_ts].astype(np.float32))
                 gripper_steps.append(gripper_state_full[valid_ts].astype(np.float32))
 
@@ -523,11 +542,13 @@ def main():
             obs_ep = np.concatenate(obs_steps, axis=0)
             act_ep = np.concatenate(act_steps, axis=0)
             gripper_ep = np.concatenate(gripper_steps, axis=0)
+            bg_ep = np.concatenate(bg_steps, axis=0)
             L = obs_ep.shape[0]
 
             ep_obs.append(obs_ep)
             ep_act.append(act_ep)
             ep_gripper.append(gripper_ep)
+            ep_bg_features.append(bg_ep)
             path_lengths.append(L)
 
             print(f"[demo] {demo}: {L} frames (total={total_written})")
@@ -542,10 +563,12 @@ def main():
     Dtok = int(ep_obs[0].shape[2])
     A = int(ep_act[0].shape[1])
     G = int(ep_gripper[0].shape[1])
+    BG = int(ep_bg_features[0].shape[1])  # background feature dimension
 
     observations  = np.zeros((E, Tmax, K, Dtok), dtype=np.float32)
     actions       = np.zeros((E, Tmax, A),       dtype=np.float32)
     gripper_state = np.zeros((E, Tmax, G),       dtype=np.float32)
+    bg_features   = np.zeros((E, Tmax, BG),      dtype=np.float32)
     rewards       = np.zeros((E, Tmax, 1),       dtype=np.float32)
     terminals     = np.zeros((E, Tmax, 1),       dtype=np.float32)
     timeouts      = np.zeros((E, Tmax, 1),       dtype=np.float32)
@@ -556,6 +579,7 @@ def main():
         observations[e, :L]  = ep_obs[e]
         actions[e, :L]       = ep_act[e]
         gripper_state[e, :L] = ep_gripper[e]
+        bg_features[e, :L]   = ep_bg_features[e]
 
         g = ep_obs[e][L - 1]
         goals[e, :L] = g[None, :, :]
@@ -567,6 +591,7 @@ def main():
             goals[e, L:]         = goals[e, L - 1:L]
             actions[e, L:]       = 0.0
             gripper_state[e, L:] = gripper_state[e, L - 1:L]
+            bg_features[e, L:]   = bg_features[e, L - 1:L]
             timeouts[e, L:, 0]   = 1.0
 
     path_lengths = np.asarray(path_lengths, dtype=np.int32)
@@ -579,17 +604,20 @@ def main():
             "Dtok": int(Dtok),
             "A": int(A),
             "G": int(G),
+            "BG": int(BG),
             "Tmax": int(Tmax),
             "repr": "DLP_tokens_k24",
             "action_mode": args.action_mode,
             "demo_indices": np.asarray(demo_indices, dtype=np.int32),
             "gripper_state_format": "pos(3)_rot6d(6)_open(1)",
+            "bg_features_format": f"z_bg_features({BG})",
             "source": "voxel_cache",
             "voxel_cache_dir": args.voxel_cache_dir,
         },
         "observations": observations,
         "actions": actions,
         "gripper_state": gripper_state,
+        "bg_features": bg_features,
         "rewards": rewards,
         "terminals": terminals,
         "timeouts": timeouts,
@@ -605,7 +633,7 @@ def main():
         pickle.dump(paths_dict, f)
 
     print(f"\nWrote: {args.out_pkl}")
-    print(f"E={E}, Tmax={Tmax}, K={K}, Dtok={Dtok}, A={A}, G={G}, action_mode={args.action_mode}")
+    print(f"E={E}, Tmax={Tmax}, K={K}, Dtok={Dtok}, A={A}, G={G}, BG={BG}, action_mode={args.action_mode}")
 
 
 if __name__ == "__main__":
