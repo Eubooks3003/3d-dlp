@@ -1,6 +1,6 @@
 {
   "ds": "voxel",
-  "root": "/home/ellina/Desktop/Code/3D-DLP-data/voxel_data/voxel_ds_occupancy",
+  "root": "/home/ubuntu/pathaklab/data/3D-DLP-data/voxel_data/voxel_ds_occupancy",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn", 
   "voxel_mode": "occupancy",

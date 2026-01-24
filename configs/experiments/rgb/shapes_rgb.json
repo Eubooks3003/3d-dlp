@@ -1,6 +1,6 @@
 {
   "ds": "voxel",
-  "root": "/home/ellina/Desktop/Code/3D-DLP-data/voxel_data/voxel_ds_rgb",
+  "root": "/home/ubuntu/pathaklab/data/3D-DLP-data/voxel_data/voxel_ds_rgb",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn", 
   "voxel_mode": "occupancy",
@@ -9,7 +9,7 @@
   "points_bg": 256,
   "points_per_scale": [32, 64],
   "device": "cuda",
-  "batch_size": 4,
+  "batch_size": 32,
   "lr": 0.00008,
   "use_scheduler": false,
   "scheduler_gamma": 0.99,
