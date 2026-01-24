@@ -22,7 +22,11 @@
   "load_model": false,
   "pretrained_path": null,
   "start_epoch": 0,
+<<<<<<< HEAD
+  "num_epochs": 80,
+=======
   "num_epochs": 100,
+>>>>>>> 5897615f5659d8a25416307c1c597bf55d840302
   "eval_epoch_freq": 1,
   "warmup_epoch": 1,
   "patch_size": 8,
@@ -100,7 +104,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "mimicgen_rgb_stack",
+  "run_prefix": "mimicgen_ssm_raw",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
@@ -112,5 +116,9 @@
   "split_loss": false,
   "depth_loss_ratio": 0.25,
   "lambda_color": 500.0,
+<<<<<<< HEAD
+  "prior_mode": "ssm_raw"
+=======
   "prior_mode": "ssm_enc"
+>>>>>>> 5897615f5659d8a25416307c1c597bf55d840302
 }
