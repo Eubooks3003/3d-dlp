@@ -4,6 +4,20 @@ import os, sys, glob, time, json, argparse
 from typing import Optional, Dict, Any, List
 
 import numpy as np
+# Fix for loading checkpoints saved with NumPy 2.0+ on older NumPy
+# Must register in sys.modules before torch.load unpickles
+if 'numpy._core' not in sys.modules:
+    import numpy.core
+    sys.modules['numpy._core'] = numpy.core
+    # Also alias submodules that might be referenced
+    for submod in ['multiarray', 'umath', '_multiarray_umath', 'numeric']:
+        full_old = f'numpy.core.{submod}'
+        full_new = f'numpy._core.{submod}'
+        if full_old in sys.modules and full_new not in sys.modules:
+            sys.modules[full_new] = sys.modules[full_old]
+        elif hasattr(numpy.core, submod) and full_new not in sys.modules:
+            sys.modules[full_new] = getattr(numpy.core, submod)
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -193,6 +207,38 @@ def rgb_distribution_for_plotted_voxels(
         hist=hist,
     )
 
+def kp_norm_to_voxel_idx(kps, D, H, W, order=("x", "y", "z")):
+    """
+    Convert keypoints from normalized [-1, 1] space to voxel index coordinates.
+
+    Args:
+        kps: [K, 3] keypoints in normalized space
+        D, H, W: voxel grid dimensions
+        order: order of components in kps, default is (x, y, z)
+
+    Returns:
+        [K, 3] keypoints in voxel index space (x_idx, y_idx, z_idx) for Plotly
+    """
+    if isinstance(kps, torch.Tensor):
+        kps = kps.detach().cpu().numpy()
+    kps = np.asarray(kps)
+
+    if kps.ndim == 1:
+        kps = kps[None, :]
+
+    # Map from [-1, 1] to [0, N-1]
+    def to_idx(v, n):
+        return np.clip(0.5 * (v + 1.0) * (n - 1), 0, n - 1)
+
+    size = {"x": W, "y": H, "z": D}
+
+    x = to_idx(kps[:, order.index("x")], size["x"])
+    y = to_idx(kps[:, order.index("y")], size["y"])
+    z = to_idx(kps[:, order.index("z")], size["z"])
+
+    return np.stack([x, y, z], axis=-1)  # [K, 3] in (x, y, z) order for Plotly
+
+
 def filter_topk_kps_3d(
     z_base_var,      # [B, *G*, K, C]  (C = 3 or 6)
     mu_tot,          # [B, *G*, K, 3]  (must align to same K as z_base_var)
@@ -363,22 +409,30 @@ def make_iso_sweep() -> List[float]:
 # ------------------------------- main -------------------------------
 
 class VoxelDirDataset(torch.utils.data.Dataset):
-    """Simple dataset that loads voxels from a directory of .pt files."""
+    """Simple dataset that loads voxels from a directory of .pt files.
+
+    Supports both flat directories and nested demo_*/frame*_voxels.pt structure.
+    """
 
     def __init__(self, voxel_dir: str, max_files: int = None):
         self.voxel_dir = voxel_dir
         self.files = []
 
-        # Find all voxel files (multiple patterns)
-        patterns = [
-            os.path.join(voxel_dir, "*_voxels.pt"),
-            os.path.join(voxel_dir, "frame_*_voxels.pt"),
-            os.path.join(voxel_dir, "*voxels*.pt"),
-        ]
-        for pattern in patterns:
-            self.files = sorted(glob.glob(pattern))
-            if self.files:
-                break
+        # Try nested structure first: demo_*/frame*_voxels.pt
+        nested_pattern = os.path.join(voxel_dir, "demo_*", "frame*_voxels.pt")
+        self.files = sorted(glob.glob(nested_pattern))
+
+        # If no nested files, try flat directory patterns
+        if not self.files:
+            patterns = [
+                os.path.join(voxel_dir, "*_voxels.pt"),
+                os.path.join(voxel_dir, "frame_*_voxels.pt"),
+                os.path.join(voxel_dir, "*voxels*.pt"),
+            ]
+            for pattern in patterns:
+                self.files = sorted(glob.glob(pattern))
+                if self.files:
+                    break
 
         if max_files is not None:
             self.files = self.files[:max_files]
@@ -395,8 +449,8 @@ class VoxelDirDataset(torch.utils.data.Dataset):
 
 def main():
     ap = argparse.ArgumentParser("Debug a trained Voxel DLP checkpoint with the same voxel eval as training.")
-    ap.add_argument("--config", "-c", type=str, required=True, help="Path to config JSON (same used for training).")
-    ap.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint file (.pth/.pt/.ckpt).")
+    ap.add_argument("--config", "-c", type=str, required=True, help="Path to config JSON (hparams.json from training).")
+    ap.add_argument("--ckpt", type=str, default=None, help="Path to checkpoint file (.pth/.pt/.ckpt) or directory containing best.pt.")
     ap.add_argument("--run-dir", type=str, default="", help="(Optional) Directory to search for latest checkpoint if --ckpt not given.")
     ap.add_argument("--split", type=str, default="train", choices=["train", "val", "test"], help="Dataset split.")
     ap.add_argument("--batch-size", type=int, default=1, help="Batch size for debug pass.")
@@ -406,7 +460,36 @@ def main():
     ap.add_argument("--name", type=str, default="", help="Optional W&B run name.")
     ap.add_argument("--voxel-dir", type=str, default=None,
                     help="Load voxels from this directory instead of dataset (e.g., saved mimicgen voxels)")
+    ap.add_argument("--save-html", action="store_true", help="Save plotly figures as HTML files instead of logging to W&B.")
+    ap.add_argument("--output-dir", type=str, default="./debug_output", help="Directory to save HTML outputs.")
     args = ap.parse_args()
+
+    # Auto-discover checkpoint if directory given or from config directory
+    if args.ckpt is None:
+        # Try to find checkpoint in same directory as config
+        config_dir = os.path.dirname(args.config)
+        best_pt = os.path.join(config_dir, "best.pt")
+        if os.path.isfile(best_pt):
+            args.ckpt = best_pt
+            print(f"[info] Auto-discovered checkpoint: {args.ckpt}")
+        else:
+            print(f"[error] No --ckpt provided and no best.pt found in {config_dir}")
+            sys.exit(1)
+    elif os.path.isdir(args.ckpt):
+        # If ckpt is a directory, look for best.pt inside
+        best_pt = os.path.join(args.ckpt, "best.pt")
+        if os.path.isfile(best_pt):
+            args.ckpt = best_pt
+            print(f"[info] Found checkpoint in directory: {args.ckpt}")
+        else:
+            # Fallback: find latest checkpoint
+            ckpt_path = find_latest_checkpoint(args.ckpt)
+            if ckpt_path:
+                args.ckpt = ckpt_path
+                print(f"[info] Found latest checkpoint: {args.ckpt}")
+            else:
+                print(f"[error] No checkpoint found in {args.ckpt}")
+                sys.exit(1)
 
     # ----- config + device -----
     cfg = get_config(args.config)
@@ -472,6 +555,11 @@ def main():
     if unexpected:
         print(f"[warn] Unexpected (first 10): {unexpected[:10]}")
 
+    # ----- Output setup -----
+    if args.save_html:
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"[info] Will save HTML figures to: {args.output_dir}")
+
     # ----- W&B -----
     if args.wandb:
         ckpt_basename = os.path.splitext(os.path.basename(ckpt_path))[0]
@@ -479,6 +567,17 @@ def main():
         wandb.init(project=args.project, name=runname,
                    config={"config_path": args.config, "ckpt": ckpt_path, "split": args.split})
         print("[info] W&B logging enabled.")
+
+    def save_or_log_figure(fig, name, step):
+        """Save figure as HTML or log to W&B."""
+        if args.save_html:
+            # Sanitize name for filename
+            safe_name = name.replace("/", "_").replace("\\", "_")
+            html_path = os.path.join(args.output_dir, f"{safe_name}_step{step}.html")
+            fig.write_html(html_path)
+            print(f"  Saved: {html_path}")
+        if args.wandb:
+            wandb.log({name: fig}, step=step)
 
     # ----- loop -----
     step = 0
@@ -498,22 +597,6 @@ def main():
             rec_vol = model_output['rec'][0]
             print_vol_stats("GT", gt_vol)
             print_vol_stats("REC", rec_vol)
-
-            # Log GT voxels
-            log_rgb_voxels(
-                name="gt/rgb_splat",
-                rgb_vol=gt_vol,
-                alpha_vol=None,
-                KPx=None,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-
 
             # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
             kp_xyz = model_output.get('kp_p', None)
@@ -540,140 +623,120 @@ def main():
             z_base_b0 = model_output["z_base"][b0]  # [K, 3]
             mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
 
-            kp_order = ("x","y","z")  # your kp_xyz is in (x,y,z) order
+            print("z_base shape: ", z_base_b0.shape)
 
-            # REC LOGGING
-            log_rgb_voxels(
-                name="rec/rgb_splat_kp",
+            # Voxel grid dimensions
+            D, H, W = voxel_grid_whd[2], voxel_grid_whd[1], voxel_grid_whd[0]
+
+            # NOTE: Keep keypoints in normalized [-1,1] space
+            # log_rgb_voxels now handles conversion internally with space="global"
+            print(f"[KP Debug] mu_tot_b0 range: {mu_tot_b0.min():.3f} to {mu_tot_b0.max():.3f}")
+            print(f"[KP Debug] z_base_b0 range: {z_base_b0.min():.3f} to {z_base_b0.max():.3f}")
+            print(f"[KP Debug] Voxel grid (D,H,W): ({D}, {H}, {W})")
+
+            # Extract components for visualization
+            rec_rgb = model_output['rec_rgb'][0]           # Full composite reconstruction
+            fg_only = model_output['dec_objects'][0]       # Foreground only
+            bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[0]  # Background only
+
+            print("fg only shape: ", fg_only.shape)
+            print("bg only shape: ", bg_only.shape)
+            print("rec_rgb shape: ", rec_rgb.shape)
+
+            # ============ MAIN VISUALIZATIONS ============
+            # These are the key views the user requested: rec, fg, bg with KPs
+
+            # 1. Full Reconstruction with KPs (pass normalized coords, conversion done internally)
+            fig = log_rgb_voxels(
+                name="rec_with_kp",
                 rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=mu_tot_b0,
-                step=step,
+                alpha_vol=None,
+                KPx=mu_tot_b0,  # Pass normalized [-1,1] keypoints
+                step=None,
                 mode="splat",
                 topk=60000,
                 alpha_thresh=0.05,
                 pad=2.0,
                 show_axes=True,
             )
+            save_or_log_figure(fig, "rec_with_kp", step)
 
-            log_rgb_voxels(
-                name="rec/rgb_splat",
-                rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="rec/rgb_splat_no_offset",
-                rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=z_base_b0,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-
-            rec_rgb = model_output['rec_rgb'][0]                  # composite you use now
-            fg_only = model_output['dec_objects'][0]        # dec_rgb_comp
-            bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[0]
-
-            print("fg only: ", fg_only.shape)
-            log_rgb_voxels(
-                name="debug/rec_rgb",
-                rgb_vol=rec_rgb,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=None,
-                step=step,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="debug/fg_only",
+            # 2. Foreground only with KPs
+            fig = log_rgb_voxels(
+                name="fg_with_kp",
                 rgb_vol=fg_only,
-                alpha_vol=None,          # None if you don’t have GT α
-                KPx=None,
-                step=step,
+                alpha_vol=None,
+                KPx=mu_tot_b0,  # Pass normalized [-1,1] keypoints
+                step=None,
                 mode="splat",
                 topk=60000,
                 alpha_thresh=0.05,
                 pad=2.0,
                 show_axes=True,
             )
+            save_or_log_figure(fig, "fg_with_kp", step)
 
-            log_rgb_voxels(
-                name="debug/bg_only",
+            # 3. Background only
+            fig = log_rgb_voxels(
+                name="bg_only",
                 rgb_vol=bg_only,
-                alpha_vol=None,          # None if you don’t have GT α
+                alpha_vol=None,
                 KPx=None,
-                step=step,
+                step=None,
                 mode="splat",
                 topk=60000,
                 alpha_thresh=0.05,
                 pad=2.0,
                 show_axes=True,
             )
+            save_or_log_figure(fig, "bg_only", step)
 
-            # Decode all
-
-            z = model_output['z']
-            z_scale = model_output['z_scale']
-            z_depth = model_output['z_depth']
-            obj_on = model_output['obj_on']
-            z_feat = model_output['z_features']
-
-            print("z shape: ", z.shape)
-            print("z_scale shape: ", z_scale.shape)
-            print("z_depth shape: ", z_depth.shape)
-            print("obj_on shape: ", obj_on.shape)
-            print("z_feat shape: ", z_feat.shape)
-
-            z_bg = None
-            dec = model.decode_all(z, z_scale, z_feat, obj_on, z_depth, z_bg, None, warmup=False)
-
-            rec_rgb_dec = dec['rec_rgb'][0]
-            fg_only_dec = dec['dec_objects_trans'][0]
-
-            print("fg only dec: ", fg_only_dec.shape)
-
-
-            log_rgb_voxels(
-                name="debug/rec_rgb_dec",
-                rgb_vol=rec_rgb_dec,
-                alpha_vol=None,          # None if you don’t have GT α
+            # 4. Foreground only (no KPs for comparison)
+            fig = log_rgb_voxels(
+                name="fg_only",
+                rgb_vol=fg_only,
+                alpha_vol=None,
                 KPx=None,
-                step=step,
+                step=None,
                 mode="splat",
                 topk=60000,
                 alpha_thresh=0.05,
                 pad=2.0,
                 show_axes=True,
             )
+            save_or_log_figure(fig, "fg_only", step)
 
-            log_rgb_voxels(
-                name="debug/fg_only_dec",
-                rgb_vol=fg_only_dec,
-                alpha_vol=None,          # None if you don’t have GT α
+            # 5. Full rec (no KPs for comparison)
+            fig = log_rgb_voxels(
+                name="rec_only",
+                rgb_vol=rec_vol,
+                alpha_vol=None,
                 KPx=None,
-                step=step,
+                step=None,
                 mode="splat",
                 topk=60000,
                 alpha_thresh=0.05,
                 pad=2.0,
                 show_axes=True,
             )
+            save_or_log_figure(fig, "rec_only", step)
+
+            # 6. GT voxels
+            fig = log_rgb_voxels(
+                name="gt",
+                rgb_vol=gt_vol,
+                alpha_vol=None,
+                KPx=None,
+                step=None,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+            save_or_log_figure(fig, "gt", step)
+
+            print(f"\n[Step {step}] Visualizations saved/logged successfully.")
             step += 1
             if step >= max_batches:
                 break

@@ -103,6 +103,7 @@ def extract_gripper_state(h5, demo: str) -> np.ndarray:
 # DLP model building
 # ----------------------------
 def build_dlp_from_cfg(cfg, device):
+    print("n enc kp: ", cfg["n_kp_enc"])
     model = DLP(
         cdim=cfg["ch"],
         image_size=cfg["voxel_grid_whd"][0],
@@ -525,9 +526,19 @@ def main():
                 # Run DLP encoder
                 with torch.no_grad():
                     out = model(vox, deterministic=True, warmup=False, with_loss=False)
+                    print(f"[DEBUG PREPROC] DLP output shapes:")
+                    print(f"  z base: {out['z_base'].shape}")
+                    print(f"  z: {out['z'].shape}")
+                    print(f"  z_scale: {out['z_scale'].shape}")
+                    print(f"  z_depth: {out['z_depth'].shape}")
+                    print(f"  obj_on: {out['obj_on'].shape}")
+                    print(f"  z_features: {out['z_features'].shape}")
+                    print(f"  z_bg_features: {out['z_bg_features'].shape}")
                     toks, bg_feats = pack_tokens_k24(out)
+                    print(f"[DEBUG PREPROC] packed toks shape: {toks.shape}, bg_feats shape: {bg_feats.shape}")
 
                 toks_np = toks.detach().cpu().numpy().astype(np.float32)
+                print(f"[DEBUG PREPROC] toks_np shape: {toks_np.shape}")
                 bg_np = bg_feats.detach().cpu().numpy().astype(np.float32)
                 obs_steps.append(toks_np)
                 bg_steps.append(bg_np)

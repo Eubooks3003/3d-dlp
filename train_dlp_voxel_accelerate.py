@@ -359,6 +359,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         print(backup_info)
 
     ckpt_best = os.path.join(save_dir, "best.pt")
+    ckpt_last = os.path.join(save_dir, "last.pt")
 
     # Get the range of the keypoints
     kp_range = model.kp_range
@@ -544,15 +545,22 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
             accelerator.print(f"[warn] monitored metric {mon_key} is non-finite ({monitored}); skipping model selection this epoch.")
             monitored = None
 
-        # Save "best" if improved (only main process)
-        if monitored is not None and accelerator.is_main_process:
-            improved = (monitored < best_val) if mode == "min" else (monitored > best_val)
-            if improved:
-                best_val = monitored
-                unwrapped_model = accelerator.unwrap_model(model)
-                save_checkpoint(ckpt_best, unwrapped_model, optimizer, scheduler, epoch, best_val,
-                                extra={"monitored": monitored, "best_update": True})
-                print(f"[ckpt] New best ({mon_key}={monitored:.6f}) at epoch {epoch:04d} -> saved best.pt")
+        # Save checkpoints (only main process)
+        if accelerator.is_main_process:
+            unwrapped_model = accelerator.unwrap_model(model)
+
+            # Always save last.pt for crash recovery / resume
+            save_checkpoint(ckpt_last, unwrapped_model, optimizer, scheduler, epoch, best_val,
+                            extra={"monitored": monitored})
+
+            # Save best.pt if improved
+            if monitored is not None:
+                improved = (monitored < best_val) if mode == "min" else (monitored > best_val)
+                if improved:
+                    best_val = monitored
+                    save_checkpoint(ckpt_best, unwrapped_model, optimizer, scheduler, epoch, best_val,
+                                    extra={"monitored": monitored, "best_update": True})
+                    print(f"[ckpt] New best ({mon_key}={monitored:.6f}) at epoch {epoch:04d} -> saved best.pt")
 
         # Synchronize before eval
         accelerator.wait_for_everyone()
@@ -652,6 +660,11 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
             z_base_b0 = model_output["z_base"][b0]
             mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]
 
+            # Convert keypoints from normalized [-1, 1] to voxel grid coords [0, grid_size]
+            grid_size = gt_vol.shape[1]  # D dimension (assuming D=H=W)
+            z_base_b0_vox = (z_base_b0 + 1) * 0.5 * grid_size
+            mu_tot_b0_vox = (mu_tot_b0 + 1) * 0.5 * grid_size
+
             print("mu tot: ", mu_tot_b0.shape)
             print("GT VOL: ", gt_vol.shape)
 
@@ -660,7 +673,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 name="gt/rgb_splat_kp",
                 rgb_vol=gt_vol,
                 alpha_vol=None,
-                KPx=mu_tot_b0,
+                KPx=mu_tot_b0_vox,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -673,7 +686,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 name="gt/rgb_splat_no_offset",
                 rgb_vol=gt_vol,
                 alpha_vol=None,
-                KPx=z_base_b0,
+                KPx=z_base_b0_vox,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -700,7 +713,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 name="rec/rgb_splat_kp",
                 rgb_vol=rec_vol,
                 alpha_vol=None,
-                KPx=mu_tot_b0,
+                KPx=mu_tot_b0_vox,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -725,7 +738,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 name="rec/rgb_splat_no_offset",
                 rgb_vol=rec_vol,
                 alpha_vol=None,
-                KPx=z_base_b0,
+                KPx=z_base_b0_vox,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -756,7 +769,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                     name="rec/fg_splat_kp",
                     rgb_vol=fg_vol_b0,
                     alpha_vol=None,
-                    KPx=mu_tot_b0,
+                    KPx=mu_tot_b0_vox,
                     step=iteration,
                     mode="splat",
                     topk=60000,

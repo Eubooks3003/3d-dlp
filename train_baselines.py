@@ -39,7 +39,7 @@ from utils.util_func import (
     LinearWithWarmupScheduler, save_code_backup,
 )
 from utils.log_utils import save_checkpoint
-from eval.eval_vox import log_rgb_voxels
+from eval.eval_vox import log_rgb_voxels, plot_loss_curves
 
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
@@ -341,6 +341,24 @@ def train_baseline(config_path, mode, kl_weight=0.001):
 
     dataloader = DataLoader(base_ds, batch_size=batch_size, shuffle=True, num_workers=4)
 
+    # Validation dataset
+    try:
+        val_ds = get_point_cloud_dataset(
+            ds,
+            root,
+            mode="val",
+            max_points=4096,
+            include_rgb=is_rgb,
+        )
+        val_dataloader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4) if len(val_ds) > 0 else None
+        val_ds_len = len(val_ds) if val_ds else 0
+    except Exception as e:
+        print(f"[Warning] Could not load validation dataset: {e}")
+        val_ds = None
+        val_dataloader = None
+        val_ds_len = 0
+    print(f"Train dataset: {len(base_ds)} samples, Val dataset: {val_ds_len} samples")
+
     # Model
     base_ch = config.get("base_ch", 32)
     latent_dim = config.get("latent_dim", 256)
@@ -375,6 +393,14 @@ def train_baseline(config_path, mode, kl_weight=0.001):
     )
 
     iteration = 0
+
+    # Loss tracking for curves
+    losses = []
+    losses_rec = []
+    losses_kl = []
+    val_losses = []
+    val_losses_rec = []
+    val_losses_kl = []
 
     # Training loop
     for epoch in range(start_epoch, num_epochs):
@@ -447,6 +473,11 @@ def train_baseline(config_path, mode, kl_weight=0.001):
         wandb.log({f"epoch/{k}": v for k, v in means.items()}, step=iteration)
         wandb.log({"epoch_idx": epoch}, step=iteration)
 
+        # Store epoch losses for loss curves
+        losses.append(means.get('loss', 0.0))
+        losses_rec.append(means.get('loss_rec', 0.0))
+        losses_kl.append(means.get('loss_kl', 0.0))
+
         # Monitor for best checkpoint
         monitor_map = {"loss": "loss", "rec": "loss_rec", "psnr": "psnr"}
         mon_key = monitor_map.get(monitor, "loss")
@@ -470,6 +501,90 @@ def train_baseline(config_path, mode, kl_weight=0.001):
                     extra={"monitored": monitored, "best_update": True, "mode": mode},
                 )
                 print(f"[ckpt] New best ({mon_key}={monitored:.6f}) at epoch {epoch:04d} -> saved best.pt")
+
+        # ------- VALIDATION -------
+        if (epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1) and val_dataloader is not None:
+            print(f"\n[Validation] Running validation at epoch {epoch}...")
+            model.eval()
+
+            val_epoch_losses = []
+            val_epoch_losses_rec = []
+            val_epoch_losses_kl = []
+            val_psnrs = []
+
+            with torch.no_grad():
+                for val_batch in val_dataloader:
+                    vox = val_batch["voxels"].to(device).float()
+
+                    if is_rgb:
+                        x_val = vox[:, :3, ...]
+                    else:
+                        if vox.shape[1] >= 3:
+                            mag = vox[:, :3, ...].abs().mean(dim=1, keepdim=True)
+                            x_val = (mag > occ_thresh).float()
+                        else:
+                            x_val = vox[:, :1, ...]
+
+                    if is_vae:
+                        rec_val, mu_val, logvar_val = model(x_val)
+                        loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type)
+                        loss_kl_val = kl_divergence(mu_val, logvar_val)
+                        loss_val = loss_rec_val + kl_weight * loss_kl_val
+
+                        val_epoch_losses.append(float(loss_val.item()))
+                        val_epoch_losses_rec.append(float(loss_rec_val.item()))
+                        val_epoch_losses_kl.append(float(loss_kl_val.item()))
+                        val_psnrs.append(float(psnr_val.item()))
+                    else:
+                        rec_val, z_val = model(x_val)
+                        loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type)
+                        loss_val = loss_rec_val
+
+                        val_epoch_losses.append(float(loss_val.item()))
+                        val_epoch_losses_rec.append(float(loss_rec_val.item()))
+                        val_psnrs.append(float(psnr_val.item()))
+
+            # Compute mean validation metrics
+            val_loss_mean = float(np.mean(val_epoch_losses))
+            val_loss_rec_mean = float(np.mean(val_epoch_losses_rec))
+            val_psnr_mean = float(np.mean(val_psnrs))
+
+            val_losses.append(val_loss_mean)
+            val_losses_rec.append(val_loss_rec_mean)
+
+            # Log validation results
+            val_log_str = f"[Val] epoch {epoch:04d} | loss: {val_loss_mean:.4f} | rec: {val_loss_rec_mean:.4f} | psnr: {val_psnr_mean:.2f} dB"
+            if is_vae and val_epoch_losses_kl:
+                val_loss_kl_mean = float(np.mean(val_epoch_losses_kl))
+                val_losses_kl.append(val_loss_kl_mean)
+                val_log_str += f" | kl: {val_loss_kl_mean:.4f}"
+            print(val_log_str)
+            log_line(log_dir, val_log_str)
+
+            # Log to wandb
+            wandb.log({
+                "val/loss": val_loss_mean,
+                "val/loss_rec": val_loss_rec_mean,
+                "val/psnr": val_psnr_mean,
+            }, step=iteration)
+            if is_vae and val_epoch_losses_kl:
+                wandb.log({"val/loss_kl": val_loss_kl_mean}, step=iteration)
+
+            # Plot and save loss curves
+            loss_curve_path = os.path.join(fig_dir, f"loss_curves_epoch{epoch:04d}.png")
+            plot_loss_curves(
+                train_losses=losses,
+                val_losses=val_losses,
+                train_losses_rec=losses_rec,
+                val_losses_rec=val_losses_rec,
+                train_losses_kl=losses_kl if is_vae else None,
+                val_losses_kl=val_losses_kl if is_vae else None,
+                save_path=loss_curve_path,
+                title=f"Training Progress - {mode} - Epoch {epoch}",
+            )
+            wandb.log({"loss_curves": wandb.Image(loss_curve_path)}, step=iteration)
+
+            model.train()
 
         # Visualization
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:

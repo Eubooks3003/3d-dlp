@@ -329,6 +329,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
     os.makedirs(save_dir, exist_ok=True)
     ckpt_best = os.path.join(save_dir, "best.pt")
+    ckpt_last = os.path.join(save_dir, "last.pt")
 
     # ---- Optional resume / preload ----
     start_epoch = int(config.get('start_epoch', 0))
@@ -533,7 +534,11 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             monitored = None
 
 
-        # ---- Save "best" if improved ----
+        # Always save last.pt for crash recovery / resume
+        save_checkpoint(ckpt_last, model, optimizer, scheduler, epoch, best_val,
+                        extra={"monitored": monitored})
+
+        # Save best.pt if improved
         if monitored is not None:
             improved = (monitored < best_val) if mode == "min" else (monitored > best_val)
             if improved:
@@ -642,16 +647,18 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             print("z base: ", model_output["z_base"].shape)
             z_base_b0 = model_output["z_base"][b0]  # [K, 3]
             mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
-            kp_order = ("x","y","z")  # your kp_xyz is in (x,y,z) order
 
-            print("mu tot: ", mu_tot_b0.shape)
+            # NOTE: Keep keypoints in normalized [-1,1] space
+            # log_rgb_voxels handles conversion internally with space="global"
+            print(f"[KP Debug] mu_tot_b0 range: {mu_tot_b0.min():.3f} to {mu_tot_b0.max():.3f}")
+            print(f"[KP Debug] z_base_b0 range: {z_base_b0.min():.3f} to {z_base_b0.max():.3f}")
             print("GT VOL: ", gt_vol.shape)
 
             # GT LOGGING
             log_rgb_voxels(
                 name="gt/rgb_splat_kp",
                 rgb_vol=gt_vol,
-                alpha_vol=None,          # None if you don’t have GT α
+                alpha_vol=None,          # None if you don't have GT α
                 KPx=mu_tot_b0,
                 step=iteration,
                 mode="splat",
@@ -664,7 +671,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             log_rgb_voxels(
                 name="gt/rgb_splat_no_offset",
                 rgb_vol=gt_vol,
-                alpha_vol=None,          # None if you don’t have GT α
+                alpha_vol=None,          # None if you don't have GT α
                 KPx=z_base_b0,
                 step=iteration,
                 mode="splat",
@@ -677,7 +684,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             log_rgb_voxels(
                 name="gt/rgb_splat",
                 rgb_vol=gt_vol,
-                alpha_vol=None,          # None if you don’t have GT α
+                alpha_vol=None,          # None if you don't have GT α
                 KPx=None,
                 step=iteration,
                 mode="splat",
@@ -690,7 +697,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             log_rgb_voxels(
                 name="rec/rgb_splat_kp",
                 rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
+                alpha_vol=None,          # None if you don't have GT α
                 KPx=mu_tot_b0,
                 step=iteration,
                 mode="splat",
@@ -703,7 +710,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             log_rgb_voxels(
                 name="rec/rgb_splat",
                 rgb_vol=rec_vol,
-                alpha_vol=None,          # None if you don’t have GT α
+                alpha_vol=None,          # None if you don't have GT α
                 step=iteration,
                 mode="splat",
                 topk=60000,

@@ -148,7 +148,15 @@ def setup_render_settings(engine="CYCLES", device="GPU", samples=256, res=(1920,
         # Denoiser
         if use_denoiser:
             scene.cycles.use_denoising = True
-            scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+            # Try to set denoiser, but handle missing denoisers gracefully
+            try:
+                scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+            except TypeError:
+                try:
+                    scene.cycles.denoiser = 'NLM'  # Fallback to NLM
+                except TypeError:
+                    print("Warning: No denoiser available, disabling denoising")
+                    scene.cycles.use_denoising = False
     else:
         scene.render.engine = 'BLENDER_EEVEE'
         scene.eevee.taa_render_samples = samples
@@ -202,7 +210,10 @@ def create_floor_plane(size=10, color=(0.85, 0.85, 0.85, 1.0), z_offset=-0.01):
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.inputs['Base Color'].default_value = color
     bsdf.inputs['Roughness'].default_value = 0.8
-    bsdf.inputs['Specular IOR Level'].default_value = 0.1
+    if 'Specular IOR Level' in bsdf.inputs:
+        bsdf.inputs['Specular IOR Level'].default_value = 0.1
+    elif 'Specular' in bsdf.inputs:
+        bsdf.inputs['Specular'].default_value = 0.1
 
     # Output
     output = nodes.new('ShaderNodeOutputMaterial')
@@ -321,7 +332,13 @@ def import_ply(filepath, name="Mesh"):
         print(f"[WARNING] PLY file not found: {filepath}")
         return None
 
-    bpy.ops.wm.ply_import(filepath=filepath)
+    # Handle different Blender versions
+    try:
+        # Blender 3.4+
+        bpy.ops.wm.ply_import(filepath=filepath)
+    except AttributeError:
+        # Blender 3.0 - 3.3
+        bpy.ops.import_mesh.ply(filepath=filepath)
     obj = bpy.context.active_object
     if obj:
         obj.name = name
@@ -390,7 +407,10 @@ def create_clay_material(color=(0.75, 0.75, 0.75, 1.0), roughness=0.5, name="Cla
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.inputs['Base Color'].default_value = color
     bsdf.inputs['Roughness'].default_value = roughness
-    bsdf.inputs['Specular IOR Level'].default_value = 0.3
+    if 'Specular IOR Level' in bsdf.inputs:
+        bsdf.inputs['Specular IOR Level'].default_value = 0.3
+    elif 'Specular' in bsdf.inputs:
+        bsdf.inputs['Specular'].default_value = 0.3
 
     output = nodes.new('ShaderNodeOutputMaterial')
     mat.node_tree.links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
@@ -413,7 +433,11 @@ def create_vertex_color_material(roughness=0.4, name="VertexColorMaterial"):
     # Principled BSDF
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.inputs['Roughness'].default_value = roughness
-    bsdf.inputs['Specular IOR Level'].default_value = 0.3
+    # Handle different Blender versions
+    if 'Specular IOR Level' in bsdf.inputs:
+        bsdf.inputs['Specular IOR Level'].default_value = 0.3
+    elif 'Specular' in bsdf.inputs:
+        bsdf.inputs['Specular'].default_value = 0.3
 
     links.new(vc_node.outputs['Color'], bsdf.inputs['Base Color'])
 
@@ -463,8 +487,14 @@ def create_keypoint_spheres(keypoints, radius=0.02, color=(1.0, 0.2, 0.2, 1.0)):
         bsdf.inputs['Base Color'].default_value = color
         bsdf.inputs['Roughness'].default_value = 0.3
         # Make slightly emissive for visibility
-        bsdf.inputs['Emission Color'].default_value = color
-        bsdf.inputs['Emission Strength'].default_value = 0.5
+        # Handle different Blender versions
+        if 'Emission Color' in bsdf.inputs:
+            # Blender 4.0+
+            bsdf.inputs['Emission Color'].default_value = color
+            bsdf.inputs['Emission Strength'].default_value = 0.5
+        elif 'Emission' in bsdf.inputs:
+            # Blender 3.x
+            bsdf.inputs['Emission'].default_value = color
 
     spheres = []
     for i, kp in enumerate(keypoints):

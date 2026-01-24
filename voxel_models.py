@@ -253,7 +253,7 @@ class DLP(nn.Module):
         self.normalize_rgb = normalize_rgb  # normalize to [-1, 1] or keep [0, 1]
         self.n_views = n_views  # number of input views (e.g., multiple cameras)
         self.dropout = dropout
-        self.num_patches = int((image_size // patch_size) ** 2)
+        self.num_patches = int((image_size // patch_size) ** 3)
         self.filter_particles_in_decoder = (timestep_horizon > 1)
         # self.filter_particles_in_decoder = False
         self.n_kp_per_patch = n_kp_per_patch

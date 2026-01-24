@@ -862,7 +862,13 @@ def log_rgb_voxels(
         # Avoids Tensor.numpy(); converts via Python lists.
         return np.asarray(t.detach().cpu().tolist(), dtype=np.float32)
 
-    def _add_kp_crosses(fig, kpx_any, half=2.0):
+    def _add_kp_crosses(fig, kpx_any, D, H, W, half=2.0, space="global", kp_range=(-1, 1)):
+        """
+        Draw KP crosses on the figure.
+        - space="global": expects KPx in kp_range (usually [-1,1]) with order (x,y,z)
+                          maps to voxel indices (x in [0,W-1], y in [0,H-1], z in [0,D-1])
+        - space="voxel":  expects KPx already in voxel indices (x,y,z)
+        """
         if kpx_any is None:
             return
         if torch.is_tensor(kpx_any):
@@ -877,6 +883,16 @@ def log_rgb_voxels(
         kpx = kpx.reshape(-1, 3)
         if kpx.size == 0:
             return
+
+        # Convert from global (normalized) to voxel indices if needed
+        if space == "global":
+            r0, r1 = kp_range
+            span = (r1 - r0)
+            # (x,y,z) in kp_range -> voxel indices
+            x_vox = (kpx[:, 0] - r0) / span * (W - 1)
+            y_vox = (kpx[:, 1] - r0) / span * (H - 1)
+            z_vox = (kpx[:, 2] - r0) / span * (D - 1)
+            kpx = np.stack([x_vox, y_vox, z_vox], axis=1)
 
         xs, ys, zs = [], [], []
         for x, y, z in kpx:
@@ -977,7 +993,7 @@ def log_rgb_voxels(
     )
 
     if KPx is not None:
-        _add_kp_crosses(fig, KPx, half=2.0)
+        _add_kp_crosses(fig, KPx, D, H, W, half=2.0, space="global")
 
     if show_axes:
         fig.update_scenes(
