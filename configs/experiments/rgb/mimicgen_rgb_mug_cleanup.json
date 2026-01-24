@@ -25,7 +25,7 @@
   "num_epochs": 500,
   "eval_epoch_freq": 1,
   "warmup_epoch": 1,
-  "patch_size": 16,
+  "patch_size": 8,
   "n_kp_per_patch": 1,
   "n_kp_enc": 24,
   "n_kp_prior": 64,
