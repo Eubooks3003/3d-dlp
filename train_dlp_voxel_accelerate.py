@@ -734,6 +734,52 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
+            # Log foreground and background separately
+            fg_vol = model_output.get('rgb_obj')
+            bg_vol = model_output.get('bg_rgb')
+
+            if fg_vol is not None:
+                fg_vol_b0 = fg_vol[b0]
+                log_rgb_voxels(
+                    name="rec/fg_splat",
+                    rgb_vol=fg_vol_b0,
+                    alpha_vol=None,
+                    KPx=None,
+                    step=iteration,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+                log_rgb_voxels(
+                    name="rec/fg_splat_kp",
+                    rgb_vol=fg_vol_b0,
+                    alpha_vol=None,
+                    KPx=mu_tot_b0,
+                    step=iteration,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+
+            if bg_vol is not None:
+                bg_vol_b0 = bg_vol[b0]
+                log_rgb_voxels(
+                    name="rec/bg_splat",
+                    rgb_vol=bg_vol_b0,
+                    alpha_vol=None,
+                    KPx=None,
+                    step=iteration,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+
         accelerator.wait_for_everyone()
 
     # Finish wandb
