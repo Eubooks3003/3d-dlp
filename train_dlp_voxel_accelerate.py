@@ -748,6 +748,34 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
+            # 8. Rec with non-offset KPs (z_base only)
+            log_rgb_voxels(
+                name="train/rec_with_kp_no_offset",
+                rgb_vol=rec_vol,
+                alpha_vol=None,
+                KPx=z_base_b0,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            # 9. GT with non-offset KPs (z_base only)
+            log_rgb_voxels(
+                name="train/gt_with_kp_no_offset",
+                rgb_vol=gt_vol,
+                alpha_vol=None,
+                KPx=z_base_b0,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
         accelerator.wait_for_everyone()
 
     # Finish wandb

@@ -397,6 +397,12 @@ def main():
     ap.add_argument("--wandb-project", type=str, default="ec-diffuser-debug",
                     help="Wandb project name for debug visualization")
 
+    # Distributed processing
+    ap.add_argument("--rank", type=int, default=0,
+                    help="Process rank for distributed processing (0-indexed)")
+    ap.add_argument("--world-size", type=int, default=1,
+                    help="Total number of processes for distributed processing")
+
     args = ap.parse_args()
 
     device = torch.device(args.device if ("cuda" in args.device and torch.cuda.is_available()) else "cpu")
@@ -412,7 +418,13 @@ def main():
     if len(demos) == 0:
         raise RuntimeError(f"No demos found in voxel cache: {args.voxel_cache_dir}")
 
-    print(f"[voxel] Found {len(demos)} demos")
+    # Distributed processing: split demos across ranks
+    if args.world_size > 1:
+        all_demos = demos
+        demos = [d for i, d in enumerate(all_demos) if i % args.world_size == args.rank]
+        print(f"[dist] Rank {args.rank}/{args.world_size}: processing {len(demos)}/{len(all_demos)} demos")
+    else:
+        print(f"[voxel] Found {len(demos)} demos")
     if demos:
         sample_demo = demos[0]
         sample_frames = sorted(voxel_map[sample_demo].keys())
@@ -639,12 +651,20 @@ def main():
         "init_states": np.asarray(init_states, dtype=np.float64),
     }
 
-    os.makedirs(os.path.dirname(args.out_pkl) or ".", exist_ok=True)
-    with open(args.out_pkl, "wb") as f:
+    # For distributed mode, add rank suffix to output filename
+    out_pkl = args.out_pkl
+    if args.world_size > 1:
+        base, ext = os.path.splitext(args.out_pkl)
+        out_pkl = f"{base}_rank{args.rank}{ext}"
+
+    os.makedirs(os.path.dirname(out_pkl) or ".", exist_ok=True)
+    with open(out_pkl, "wb") as f:
         pickle.dump(paths_dict, f)
 
-    print(f"\nWrote: {args.out_pkl}")
+    print(f"\nWrote: {out_pkl}")
     print(f"E={E}, Tmax={Tmax}, K={K}, Dtok={Dtok}, A={A}, G={G}, BG={BG}, action_mode={args.action_mode}")
+    if args.world_size > 1:
+        print(f"[dist] Rank {args.rank} complete. Merge all rank files with merge_preprocess_shards.py")
 
 
 if __name__ == "__main__":
