@@ -590,8 +590,27 @@ def main():
             batch = to_device(batch, device)
             # training fed: vox = batch["voxels"]
             vox  = batch["voxels"]  # [B, C, D, H, W] or [B, D, H, W] depending on your wrapper
-            # forward (no loss)
-            model_output = model(vox, warmup=False, with_loss=False)
+            # forward (with loss to get obj_on_l1)
+            model_output = model(vox, warmup=False, with_loss=True)
+
+            # Print obj_on stats
+            obj_on = model_output.get('obj_on', None)
+            if obj_on is not None:
+                obj_on_l1 = obj_on.abs().mean().item()
+                obj_on_mean = obj_on.mean().item()
+                obj_on_min = obj_on.min().item()
+                obj_on_max = obj_on.max().item()
+                print(f"[obj_on] L1={obj_on_l1:.6f}  mean={obj_on_mean:.6f}  min={obj_on_min:.6f}  max={obj_on_max:.6f}")
+
+            # Print loss components if available
+            if 'obj_on_l1' in model_output:
+                print(f"[loss] obj_on_l1 = {model_output['obj_on_l1'].item():.6f}")
+            if 'loss' in model_output:
+                print(f"[loss] total = {model_output['loss'].item():.4f}")
+            if 'rec_loss' in model_output:
+                print(f"[loss] rec = {model_output['rec_loss'].item():.4f}")
+            if 'kl_loss' in model_output:
+                print(f"[loss] kl = {model_output['kl_loss'].item():.4f}")
 
             gt_vol = model_output['x'][0]
             rec_vol = model_output['rec'][0]

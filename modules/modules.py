@@ -5358,9 +5358,19 @@ class ParticleEncoder(nn.Module):
         z_base_var = var_kp.detach()
         z_base_cov = cov_kp.detach()
 
-
         # optional confidence feature (same shape as logvar_offset)
         confidence_score = particle_stats_dict['logvar'].detach()  # [B, n_kp_prior, 3]
+
+        # DEBUG: Check magnitudes to ensure z_base_var (from k-means) doesn't overshadow logvar
+
+        # print(f"[DEBUG z_base_var vs logvar]")
+        # print(f"  var_kp (prior cov diag) - min: {var_kp.min().item():.6f}, max: {var_kp.max().item():.6f}, mean: {var_kp.mean().item():.6f}, std: {var_kp.std().item():.6f}")
+        # print(f"  confidence_score (logvar) - min: {confidence_score.min().item():.6f}, max: {confidence_score.max().item():.6f}, mean: {confidence_score.mean().item():.6f}, std: {confidence_score.std().item():.6f}")
+        # # Convert logvar to variance for fair comparison: var = exp(logvar)
+        # posterior_var = torch.exp(confidence_score)
+        # print(f"  posterior_var (exp(logvar)) - min: {posterior_var.min().item():.6f}, max: {posterior_var.max().item():.6f}, mean: {posterior_var.mean().item():.6f}")
+        # print(f"  ratio var_kp/posterior_var mean: {(var_kp / (posterior_var + 1e-8)).mean().item():.4f}")
+
         # concat for a small feature vector per kp (length 6): [prior_var_xyz | posterior_logvar_xyz]
         z_base_var = torch.cat([z_base_var, confidence_score], dim=-1)  # [B, n_kp_prior, 6]
 
@@ -6711,7 +6721,6 @@ class DLPDecoder(nn.Module):
         return patches, a_obj, rgb_obj, None
 
         
-        return patches, a_obj, rgb_obj, None                    # d_obj=None
 
     def composite_rgb(self, a_obj, rgb_obj, obj_on, eps=1e-6):
         # a_obj: [B,N,1,D,H,W] in [0,1], rgb_obj: [B,N,3,D,H,W]

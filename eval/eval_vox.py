@@ -1049,6 +1049,7 @@ def filter_topk_kps_3d(
     topk: int,
     obj_on=None,
     use_posterior_in_score: bool = False,
+    use_posterior_only: bool = False,  # NEW: use only learned logvar, ignore prior
     eps: float = 1e-6,
 ):
     B = z_base_var.shape[0]
@@ -1060,7 +1061,11 @@ def filter_topk_kps_3d(
     K = zvar.size(1)
 
     prior_var = zvar[..., :3]
-    if use_posterior_in_score and C == 6:
+    if use_posterior_only and C == 6:
+        # Use ONLY posterior variance (learned confidence), ignore prior
+        post_var = zvar[..., 3:6].exp().clamp_min(eps)
+        unc = post_var.sum(-1)
+    elif use_posterior_in_score and C == 6:
         post_var = zvar[..., 3:6].exp().clamp_min(eps)
         unc = prior_var.sum(-1) + post_var.sum(-1)
     else:

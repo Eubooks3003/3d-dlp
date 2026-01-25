@@ -2732,7 +2732,8 @@ class DLP(nn.Module):
         with torch.no_grad():
             mse_val = F.mse_loss(pred_rgb, x_flat)
             psnr = -10.0 * torch.log10(mse_val + 1e-12)
-            obj_on_l1 = torch.abs(obj_on.squeeze(-1) if obj_on.dim() == 3 else obj_on).sum(-1).mean()
+            # Average number of particles on per batch: reshape to [B, N_kp], sum over particles, mean over batch
+            obj_on_l1 = obj_on.view(obj_on.shape[0], -1).sum(-1).mean()
 
         return {
             'loss': loss,
@@ -2743,6 +2744,7 @@ class DLP(nn.Module):
             'alpha_entropy': alpha_entropy,
             'alpha_overlap': overlap_pen,
             'kl': loss_kl_static,
+            'obj_on_l1': obj_on_l1,
             'kl_dyn': torch.tensor(0.0, device=x.device),
             'loss_kl_kp': loss_kl_kp,
             'loss_kl_feat': loss_kl_feat,

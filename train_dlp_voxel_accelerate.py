@@ -503,6 +503,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 loss=pick('loss'),
                 rec=pick('loss_rec'),
                 KL=pick('kl'),
+                obj_l1=pick('obj_on_l1'),
             )
 
             iteration += 1

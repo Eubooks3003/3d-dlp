@@ -1,6 +1,6 @@
 {
   "ds": "voxel",
-  "root": "/home/ubuntu/pathaklab/data/3D-DLP-data/voxel_data/voxel_ds_rgb",
+  "root": "/home/ubuntu/ellina/data/3D-DLP-data/voxel_data/voxel_shapenet_rgb",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn", 
   "voxel_mode": "occupancy",
@@ -100,7 +100,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "mimcigen_no_chroma_loss",
+  "run_prefix": "_mimicgen",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
