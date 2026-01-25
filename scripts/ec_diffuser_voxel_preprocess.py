@@ -419,10 +419,12 @@ def main():
         raise RuntimeError(f"No demos found in voxel cache: {args.voxel_cache_dir}")
 
     # Distributed processing: split demos across ranks
+    print(f"[DEBUG] rank={args.rank}, world_size={args.world_size}, total_demos={len(demos)}")
     if args.world_size > 1:
         all_demos = demos
         demos = [d for i, d in enumerate(all_demos) if i % args.world_size == args.rank]
         print(f"[dist] Rank {args.rank}/{args.world_size}: processing {len(demos)}/{len(all_demos)} demos")
+        print(f"[dist] Demos for this rank: {demos[:5]}..." if len(demos) > 5 else f"[dist] Demos: {demos}")
     else:
         print(f"[voxel] Found {len(demos)} demos")
     if demos:
@@ -458,8 +460,10 @@ def main():
     demo_indices = []
     total_written = 0
 
+    from tqdm import tqdm
     with h5py.File(args.h5, "r") as h5:
-        for demo in demos:
+        pbar = tqdm(demos, desc=f"Rank {args.rank}", unit="demo")
+        for demo in pbar:
             act_key = f"data/{demo}/actions"
             if act_key not in h5:
                 print(f"[warn] {demo}: missing actions in H5, skipping")
@@ -574,7 +578,7 @@ def main():
             ep_bg_features.append(bg_ep)
             path_lengths.append(L)
 
-            print(f"[demo] {demo}: {L} frames (total={total_written})")
+            pbar.set_postfix(frames=L, total=total_written)
 
             if args.max_frames is not None and total_written >= args.max_frames:
                 break
