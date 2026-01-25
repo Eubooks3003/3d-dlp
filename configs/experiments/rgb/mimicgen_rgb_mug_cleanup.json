@@ -1,6 +1,6 @@
 {
   "ds": "mimicgen_voxel",
-  "root": "/home/ubuntu/pathaklab/data/mimicgen/mug_cleanup_d0/core/voxel_cache",
+  "root": "/home/ubuntu/ellina/data/mimicgen/mug_cleanup_d0/core/voxel_cache",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn", 
   "voxel_mode": "occupancy",
@@ -9,7 +9,7 @@
   "points_bg": 256,
   "points_per_scale": [32, 64],
   "device": "cuda",
-  "batch_size": 32,
+  "batch_size": 16,
   "lr": 0.00008,
   "use_scheduler": false,
   "scheduler_gamma": 0.99,
@@ -27,17 +27,17 @@
   "warmup_epoch": 1,
   "patch_size": 8,
   "n_kp_per_patch": 1,
-  "n_kp_enc": 24,
-  "n_kp_prior": 64,
+  "n_kp_enc": 50,
+  "n_kp_prior": 256,
   "topk": 10,
   "anchor_s": 0.25,
   "scale_std": 0.3,
-  "offset_std": 0.1,
+  "offset_std": 0.05,
   "obj_on_alpha": 0.01,
   "obj_on_beta": 0.01,
   "recon_loss_type": "hybrid",
   "normalize_rgb": false,
-  "beta_kl": 0.02,
+  "beta_kl": 0.04,
   "beta_rec": 1.0,
   "kl_balance": 0.005,
   "beta_obj": 0.02,
@@ -45,7 +45,7 @@
   "ch": 3,
   "features_dist": "gauss",
   "learned_feature_dim": 4,
-  "learned_bg_feature_dim": 2,
+  "learned_bg_feature_dim": 1,
   "n_fg_categories": 8,
   "n_fg_classes": 4,
   "n_bg_categories": 4,
@@ -67,7 +67,7 @@
     4
   ],
   "obj_ch_mult": [
-    1,
+    2,
     2,
 	4
   ],
@@ -112,5 +112,5 @@
   "split_loss": false,
   "depth_loss_ratio": 0.25,
   "lambda_color": 500.0,
-  "max_demos": 200
+  "max_demos": 50
 }
