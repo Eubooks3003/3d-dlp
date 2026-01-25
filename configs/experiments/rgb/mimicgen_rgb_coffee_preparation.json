@@ -1,6 +1,6 @@
 {
   "ds": "mimicgen_voxel",
-  "root": "/lambda/nfs/ellina/data/mimicgen/kitchen_d0/core/voxel_cache",
+  "root": "/home/ubuntu/ellina/data/mimicgen/coffee_preparation_d0/core/voxel_cache",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn", 
   "voxel_mode": "occupancy",
@@ -100,7 +100,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "mimicgen_rgb_kitchen",
+  "run_prefix": "mimicgen_rgb_coffee_preparation",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
