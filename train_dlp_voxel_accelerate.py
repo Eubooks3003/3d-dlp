@@ -130,8 +130,8 @@ def build_epoch_log(epoch, means):
 
 def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     # Initialize accelerator
-    # find_unused_parameters=False is more efficient but may cause issues if model has unused params
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    # find_unused_parameters=True needed because warmup phase uses different model parts
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
     # load config
@@ -630,50 +630,31 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
             model.train()  # Back to training mode
             torch.cuda.empty_cache()  # Clear memory fragmentation after validation
 
-        # TRAIN VISUALS (voxel version) - only main process
+        # ------- TRAIN VISUALS (same as debug_dlp_voxel.py) - only main process -------
         if (epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1) and accelerator.is_main_process:
             b0 = 0
 
             gt_vol = model_output['x'][b0]
             rec_vol = model_output['rec'][b0]
 
-            print("gt vol: ", gt_vol.shape)
+            # Extract keypoints (keep in normalized [-1,1] space)
+            z_base_b0 = model_output["z_base"][b0]  # [K, 3]
+            mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
 
-            with torch.no_grad():
-                out = filter_topk_kps_3d(
-                    z_base_var=model_output["z_base_var"],
-                    mu_tot=model_output["z_base"] + model_output["mu_offset"],
-                    topk=config['topk'],
-                    obj_on=model_output.get("obj_on", None),
-                    use_posterior_in_score=False
-                )
-                indices = out["indices"]
-                topk_kp = out["topk_kp"]
-                bb_scores = out["bb_scores"]
+            # Extract fg/bg (same as debug_dlp_voxel.py)
+            fg_only = model_output['dec_objects'][b0]
+            bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b0]
 
-            topk_kp_b0 = topk_kp[b0]
-            cov_b0 = model_output["cov_kp"][b0]
-            kp_xyz = model_output["kp_p"]
-            z_base_cov_b0 = model_output["z_base_cov"][b0]
+            print(f"[Train Vis] gt_vol: {gt_vol.shape}, rec_vol: {rec_vol.shape}")
+            print(f"[Train Vis] fg_only: {fg_only.shape}, bg_only: {bg_only.shape}")
+            print(f"[Train Vis] mu_tot_b0 range: {mu_tot_b0.min():.3f} to {mu_tot_b0.max():.3f}")
 
-            print("z base: ", model_output["z_base"].shape)
-            z_base_b0 = model_output["z_base"][b0]
-            mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]
-
-            # Convert keypoints from normalized [-1, 1] to voxel grid coords [0, grid_size]
-            grid_size = gt_vol.shape[1]  # D dimension (assuming D=H=W)
-            z_base_b0_vox = (z_base_b0 + 1) * 0.5 * grid_size
-            mu_tot_b0_vox = (mu_tot_b0 + 1) * 0.5 * grid_size
-
-            print("mu tot: ", mu_tot_b0.shape)
-            print("GT VOL: ", gt_vol.shape)
-
-            # GT LOGGING
+            # 1. Full Reconstruction with KPs
             log_rgb_voxels(
-                name="gt/rgb_splat_kp",
-                rgb_vol=gt_vol,
+                name="train/rec_with_kp",
+                rgb_vol=rec_vol,
                 alpha_vol=None,
-                KPx=mu_tot_b0_vox,
+                KPx=mu_tot_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -682,11 +663,12 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
+            # 2. Foreground only with KPs
             log_rgb_voxels(
-                name="gt/rgb_splat_no_offset",
-                rgb_vol=gt_vol,
+                name="train/fg_with_kp",
+                rgb_vol=fg_only,
                 alpha_vol=None,
-                KPx=z_base_b0_vox,
+                KPx=mu_tot_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -695,8 +677,51 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
+            # 3. Background only
             log_rgb_voxels(
-                name="gt/rgb_splat",
+                name="train/bg_only",
+                rgb_vol=bg_only,
+                alpha_vol=None,
+                KPx=None,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            # 4. Foreground only (no KPs)
+            log_rgb_voxels(
+                name="train/fg_only",
+                rgb_vol=fg_only,
+                alpha_vol=None,
+                KPx=None,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            # 5. Full rec (no KPs)
+            log_rgb_voxels(
+                name="train/rec_only",
+                rgb_vol=rec_vol,
+                alpha_vol=None,
+                KPx=None,
+                step=iteration,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            # 6. GT voxels
+            log_rgb_voxels(
+                name="train/gt",
                 rgb_vol=gt_vol,
                 alpha_vol=None,
                 KPx=None,
@@ -708,12 +733,12 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
-            # REC LOGGING
+            # 7. GT voxels with KPs
             log_rgb_voxels(
-                name="rec/rgb_splat_kp",
-                rgb_vol=rec_vol,
+                name="train/gt_with_kp",
+                rgb_vol=gt_vol,
                 alpha_vol=None,
-                KPx=mu_tot_b0_vox,
+                KPx=mu_tot_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -721,77 +746,6 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 pad=2.0,
                 show_axes=True,
             )
-
-            log_rgb_voxels(
-                name="rec/rgb_splat",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            log_rgb_voxels(
-                name="rec/rgb_splat_no_offset",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                KPx=z_base_b0_vox,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-
-            # Log foreground and background separately
-            fg_vol = model_output.get('rgb_obj')
-            bg_vol = model_output.get('bg_rgb')
-
-            if fg_vol is not None:
-                fg_vol_b0 = fg_vol[b0]
-                log_rgb_voxels(
-                    name="rec/fg_splat",
-                    rgb_vol=fg_vol_b0,
-                    alpha_vol=None,
-                    KPx=None,
-                    step=iteration,
-                    mode="splat",
-                    topk=60000,
-                    alpha_thresh=0.05,
-                    pad=2.0,
-                    show_axes=True,
-                )
-                log_rgb_voxels(
-                    name="rec/fg_splat_kp",
-                    rgb_vol=fg_vol_b0,
-                    alpha_vol=None,
-                    KPx=mu_tot_b0_vox,
-                    step=iteration,
-                    mode="splat",
-                    topk=60000,
-                    alpha_thresh=0.05,
-                    pad=2.0,
-                    show_axes=True,
-                )
-
-            if bg_vol is not None:
-                bg_vol_b0 = bg_vol[b0]
-                log_rgb_voxels(
-                    name="rec/bg_splat",
-                    rgb_vol=bg_vol_b0,
-                    alpha_vol=None,
-                    KPx=None,
-                    step=iteration,
-                    mode="splat",
-                    topk=60000,
-                    alpha_thresh=0.05,
-                    pad=2.0,
-                    show_axes=True,
-                )
 
         accelerator.wait_for_everyone()
 
