@@ -27,7 +27,7 @@
 
   "patch_size": 8,
   "n_kp_per_patch": 1,
-  "n_kp_enc": 30,
+  "n_kp_enc": 63,
   "n_kp_prior": 64,
   "topk": 10,
   "anchor_s": 0.25,
@@ -100,7 +100,7 @@
   "pint_dyn_heads": 8,
   "pint_dim": 512,
 
-  "run_prefix": "three_piece_fixed_z",
+  "run_prefix": "all_encode",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,

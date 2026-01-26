@@ -28,7 +28,7 @@
   "weight_decay": 0.0,
 
   "load_model": true,
-  "pretrained_path": "/home/ubuntu/ellina/lpwm-dev/logs/260126_172457_mimicgen_multitask/saves/last.pt",
+  "pretrained_path": "/home/ubuntu/ellina/lpwm-dev/logs/260126_181220_mimicgen_multitask/saves/best.pt",
   "start_epoch": 0,
   "num_epochs": 500,
   "eval_epoch_freq": 1,
@@ -36,7 +36,7 @@
 
   "patch_size": 8,
   "n_kp_per_patch": 1,
-  "n_kp_enc": 30,
+  "n_kp_enc": 40,
   "n_kp_prior": 64,
   "topk": 10,
   "anchor_s": 0.25,

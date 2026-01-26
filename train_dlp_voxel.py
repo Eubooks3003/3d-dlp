@@ -495,8 +495,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         losses_rec.append(means.get('loss_rec', 0.0))
         losses_kl.append(means.get('kl', 0.0))
 
-        wandb.log({**{f"epoch/{k}": v for k, v in means.items()},
-            "epoch_idx": epoch}, step=iteration)
+        # Collect all epoch-end logs into a single dict to avoid multiple wandb.log at same step
+        epoch_log_dict = {**{f"epoch/{k}": v for k, v in means.items()}, "epoch_idx": epoch}
 
         # choose monitored metric robustly
         monitor_map = {
@@ -587,8 +587,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             print(val_log_str)
             log_line(log_dir, val_log_str)
 
-            # Log to wandb
-            wandb.log({f"val/{k}": v for k, v in val_results.items()}, step=iteration)
+            # Add validation metrics to epoch log dict (don't log separately)
+            epoch_log_dict.update({f"val/{k}": v for k, v in val_results.items()})
 
             # Plot and save loss curves
             loss_curve_path = os.path.join(fig_dir, f"loss_curves_epoch{epoch:04d}.png")
@@ -603,10 +603,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 title=f"Training Progress - Epoch {epoch}",
             )
 
-            # Also save to wandb
-            wandb.log({"loss_curves": wandb.Image(loss_curve_path)}, step=iteration)
+            # Add loss curves image to epoch log dict
+            epoch_log_dict["loss_curves"] = wandb.Image(loss_curve_path)
 
             model.train()  # Back to training mode
+
+        # Log all epoch metrics in a single call (avoids issues with multiple logs at same step)
+        wandb.log(epoch_log_dict, step=iteration)
 
         # ------- TRAIN VISUALS (same as debug_dlp_voxel.py) -------
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
