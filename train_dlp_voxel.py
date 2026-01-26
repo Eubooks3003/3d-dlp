@@ -211,8 +211,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
 
     # Prior mode configuration
-    prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
-    raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
 
     dataset = get_point_cloud_dataset(
         ds, root, mode="train",
@@ -304,10 +302,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         depth_feature_dim=depth_feature_dim,
         split_loss=split_loss,
         depth_loss_ratio=depth_loss_ratio,
-
-        # Prior mode configuration
-        prior_mode=prior_mode,
-        raw_heatmap_mode=raw_heatmap_mode,
 
         ).to(device)
         
@@ -454,7 +448,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
-                                 beta_obj=beta_obj, lambda_color=lambda_color)
+                                 beta_obj=beta_obj)
 
             # Compute & backprop
             all_losses = model_output['loss_dict']
@@ -484,7 +478,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             )
 
             iteration += 1
-            break
            
 
         pbar.close()

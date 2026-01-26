@@ -180,18 +180,25 @@ class MimicGenMultiTaskDataset(Dataset):
         for t, c in sorted(task_counts.items()):
             print(f"  - {t}: {c} frames")
 
-    def get_cache_dir_for_task(self, task: str) -> str:
+    def get_cache_dir_for_task(self, task: str, cache_suffix: str = "") -> str:
         """
         Returns the cache directory path for a given task.
-        Cache is stored under: {root}/{task}_d0/core/voxel_cache/
-        """
-        return os.path.join(self.root, f"{task}_d0", "core", "voxel_cache")
+        Cache is stored under: {root}/{task}_d0/core/voxel_cache{cache_suffix}/
 
-    def get_all_cache_dirs(self) -> Dict[str, str]:
+        Args:
+            task: Task name (e.g., "coffee")
+            cache_suffix: Optional suffix (e.g., "_new" -> "voxel_cache_new")
+        """
+        return os.path.join(self.root, f"{task}_d0", "core", f"voxel_cache{cache_suffix}")
+
+    def get_all_cache_dirs(self, cache_suffix: str = "") -> Dict[str, str]:
         """
         Returns a dict mapping task name -> cache directory path.
+
+        Args:
+            cache_suffix: Optional suffix (e.g., "_new" -> "voxel_cache_new")
         """
-        return {task: self.get_cache_dir_for_task(task) for task in self.tasks}
+        return {task: self.get_cache_dir_for_task(task, cache_suffix) for task in self.tasks}
 
     # ------------- helpers -------------
 

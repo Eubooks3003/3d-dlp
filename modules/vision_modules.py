@@ -134,17 +134,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---- helpers ----
-def _norm3d(C):
-    # GroupNorm works for any spatial rank; safer than BatchNorm2d for 3D.
-    groups = 32 if C >= 32 else max(1, C // 4)
-    return nn.GroupNorm(groups, C)
+def _norm3d(C, num_groups=4, eps=1e-5):
 
-# Reuse your existing 'nonlinearity' if defined; otherwise:
-try:
-    nonlinearity
-except NameError:
-    def nonlinearity(x):  # SiLU as in many UNets
-        return F.silu(x, inplace=True)
+    return nn.GroupNorm(num_groups=num_groups, num_channels=C, eps=eps, affine=True)
+
 
 # ============================ 3D VERSIONS ============================
 
@@ -155,7 +148,7 @@ class Upsample(nn.Module):
         self.mode = mode  # 'nearest' or 'trilinear'
         if self.with_conv:
             self.conv = nn.Conv3d(in_channels, in_channels, kernel_size=3, stride=1, padding=1,
-                                  padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+                                  padding_mode=padding_mode)
 
     def forward(self, x):
         if self.mode == 'trilinear':
@@ -173,11 +166,11 @@ class Downsample(nn.Module):
         self.with_conv = with_conv
         self.use_conv_block = use_conv_block
         # F.pad for 5D supports 'constant' reliably; map others to 'constant'
-        self.padding_mode = 'constant'
+        self.padding_mode = 'constant' if padding_mode == 'zeros' else padding_mode
         if self.with_conv:
             if self.use_conv_block:
                 self.conv = ConvBlock(in_channels=in_channels, out_channels=in_channels,
-                                      dropout=0.0, padding=0, stride=2, kernel_size=3, padding_mode='zeros')
+                                      dropout=0.0, padding=0, stride=2, kernel_size=3)
             else:
                 self.conv = nn.Conv3d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
         else:
@@ -202,7 +195,7 @@ class ConvBlock(nn.Module):
         self.out_channels = out_channels
 
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
-                              padding=padding, padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+                              padding=padding, padding_mode=padding_mode)
         self.temb_proj = nn.Linear(temb_channels, out_channels) if temb_channels > 0 else None
         self.norm = _norm3d(out_channels)
         self.dropout = nn.Dropout(dropout)
@@ -228,17 +221,17 @@ class ResnetBlock(nn.Module):
 
         self.norm1 = _norm3d(in_channels)
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
-                               padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+                               padding_mode=padding_mode)
         self.temb_proj = nn.Linear(temb_channels, out_channels) if temb_channels > 0 else None
         self.norm2 = _norm3d(out_channels)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1,
-                               padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+                               padding_mode=padding_mode)
 
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
-                                               padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+                                               padding_mode=padding_mode)
             else:
                 self.nin_shortcut = nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
@@ -314,7 +307,7 @@ class Encoder(nn.Module):
         first_conv_pad = in_conv_kernel_size // 2
         self.conv_in = nn.Conv3d(in_channels, self.ch, kernel_size=in_conv_kernel_size, stride=1,
                                  padding=first_conv_pad,
-                                 padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+                                 padding_mode=self.padding_mode)
 
         curr_res = resolution
         in_ch_mult = (1,) + tuple(ch_mult)
@@ -357,7 +350,7 @@ class Encoder(nn.Module):
         self.norm_out = _norm3d(block_in) if self.residual else nn.Identity()
         self.conv_out = nn.Conv3d(block_in, 2 * z_channels if double_z else z_channels,
                                   kernel_size=3, stride=1, padding=1,
-                                  padding_mode='zeros' if padding_mode == 'zeros' else 'zeros')
+                                  padding_mode=self.padding_mode)
         self.conv_output_size = self.calc_conv_output_size()
 
     def calc_conv_output_size(self):

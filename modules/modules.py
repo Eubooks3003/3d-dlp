@@ -124,7 +124,6 @@ class FeatureKMeansRGB(nn.Module):
         self.feat_mode = feat_mode
         self.append_xyz = append_xyz
         self.saliency = saliency
-        print("KEEP TOP: ", keep_top)
         self.keep_top = int(keep_top)
         self.sample_m = int(sample_m)
         self.iters = int(iters)
@@ -2495,25 +2494,6 @@ class ObjectDecoderCNN(nn.Module):
         # force spatial size to (patch_size)^3
         if y.shape[2:] != (D, H, W):
             y = F.interpolate(y, size=(D, H, W), mode="trilinear", align_corners=False)
-        # ---- DEBUG: per-patch decoder stats ----
-        with torch.no_grad():
-            Btot, Cdec, Dz, Hy, Wx = y.shape
-            y_flat = y.view(Btot, Cdec, -1)
-
-            print("[ObjectDecoderCNN] y stats: "
-                f"min={y_flat.min().item():.4f} "
-                f"max={y_flat.max().item():.4f} "
-                f"mean={y_flat.mean().item():.4f} "
-                f"std={y_flat.std().item():.4f}")
-
-            # If this is RGBA-style output (alpha + RGB), look at first 4 chans
-            max_ch_to_print = min(4, Cdec)
-            for c in range(max_ch_to_print):
-                ch = y_flat[:, c]
-                print(f"  ch{c}: min={ch.min().item():.4f} "
-                    f"max={ch.max().item():.4f} "
-                    f"mean={ch.mean().item():.4f} "
-                    f"std={ch.std().item():.4f}")
 
         return y
 
@@ -2903,10 +2883,8 @@ class BgDecoder(nn.Module):
                  init_zero_bias=True, init_conv_layers=True, init_conv_bg_std=0.005):
         super().__init__()
 
-        print("IMAGE SIZE: ", image_size)
         self.image_size = image_size
         self.feature_map_edge = int(image_size // (2 ** (len(bg_ch_mult) - 1)))  # seed edge
-        print("FEATURE MAP EDGE: ", self.feature_map_edge)
         self.dropout = dropout
         self.learned_bg_feature_dim = learned_bg_feature_dim
         self.context_dim = context_dim
@@ -2963,7 +2941,6 @@ class BgDecoder(nn.Module):
                 in_z_ch = 2 * self.latent_to_feat_map.n_ch
 
         # ------- 3D decoder -------
-        print("RESOLUTION: ", self.image_size)
         self.cnn = Decoder(
             ch=decoder_base_ch, out_ch=self.cdim, ch_mult=bg_ch_mult, num_res_blocks=num_res_blocks,
             attn_resolutions=attn_res, dropout=0.0, resamp_with_conv=True,
@@ -3143,7 +3120,6 @@ class BgEncoder(nn.Module):
             cnn_features = feat.view(B, *cnn_features.shape[1:])
 
         z_feat = self.to_latent(cnn_features)  # [B, out_ch(or C'), D', H', W']
-        print("Z FEAT SHAPE: ", z_feat.shape)
 
         if self.projection_mode == 'fc':
             flat = z_feat.view(z_feat.shape[0], -1)  # [B, C'*D'*H'*W']
@@ -3408,7 +3384,7 @@ class ParticleAttributeEncoder(nn.Module):
         else:
             mu_depth = logvar_depth = None
 
-        print("MU 0: ", mu[0,0])
+        # print("MU 0: ", mu[0,0])
 
         spatial_out = {'mu': mu, 'logvar': logvar, 'mu_scale': mu_scale, 'logvar_scale': logvar_scale,
                        'lobj_on_a': lobj_on_a, 'lobj_on_b': lobj_on_b, 'obj_on': obj_on,
@@ -3531,9 +3507,7 @@ class ParticleFeaturesEncoder(nn.Module):
         """
         B, C, D, H, W = x.shape
 
-        print("ParticleFeatEnc x shape:", x.shape, "min/max per channel:",
-            [ (x[:,c].min().item(), x[:,c].max().item()) for c in range(x.shape[1]) ])
-
+     
         assert x.shape[1] == self.ch, f"Expected {self.ch} channels, got {x.shape[1]}"
         K = kp.shape[1]
 
@@ -3699,7 +3673,6 @@ class DLPPrior(nn.Module):
         rgbk_iters=30
         rgbk_tol=1e-4
         rgbk_ridge=1e-4
-        print("keep top: ", rgbk_keep_top)
         self.rgb_km = FeatureKMeansRGB(
                 K=self.n_kp_prior,
                 feat_mode=rgbk_feat_mode,
@@ -3878,7 +3851,6 @@ class DLPPrior(nn.Module):
         return self.patcher.patches_to_vox(x)
 
     def zyx_to_xyz(self, v):  # [...,3]
-        print("++++++++FLIPPING ZYX TO XYZ++++++++")
         return torch.stack([v[..., 2], v[..., 1], v[..., 0]], dim=-1)
 
     def encode_prior(self, x, filtering_heuristic='none', k=None):
@@ -3897,16 +3869,12 @@ class DLPPrior(nn.Module):
         # if self.kp_mode == "kmeans":
         if True:
             kp, cov, meta = self.rgb_km(x, centers_init_global=self.get_patch_centers().to(x))
-            print("KP: ", kp.shape)
-            print("cov: ", cov.shape)
             return kp, cov
 
 
         # encode
         patches_bn = patches.view(-1, C, pd, ph, pw)              # [B*N, C, pd, ph, pw]
-        print("PATCHES BN: ", patches_bn.shape)
         enc_out = self.enc(patches_bn)                            # -> [B*N, K, pd, ph, pw]
-        print("ENCODER OUT: ", enc_out.shape)
         z = enc_out[1] if isinstance(enc_out, tuple) else enc_out
         assert z.dim() == 5 and z.shape[1] == self.n_kp, f"expected [B*, {self.n_kp}, Dp, Hp, Wp], got {z.shape}"
 
@@ -3917,7 +3885,6 @@ class DLPPrior(nn.Module):
         kp_global = self.get_global_kp(kp_local)                       # [B,N,K,3]  (x,y,z) in global kp_range
         cov_global = cov_local                                         # (optionally rescale to global units)
         kp_global_xyz = self.zyx_to_xyz(kp_global)                     # convert to (z,y,x) for output
-        print("FILTERING HEURISTIC: ", filtering_heuristic)
         # ---- filtering ----
         if filtering_heuristic == 'distance':
             scores = self.get_distance_from_patch_centers(kp_global)       # [B,N,K]
@@ -4012,6 +3979,7 @@ class ParticleInteractionEncoder(nn.Module):
 
         if particle_anchors is None:
             self.register_buffer('particles_anchor', torch.zeros(1, self.n_kp_enc, 3))
+            print(" SETTING ")
             self.use_z_orig = False
         else:
             self.register_buffer('particles_anchor', particle_anchors)
@@ -4034,7 +4002,6 @@ class ParticleInteractionEncoder(nn.Module):
                                        mid_blocks=cnn_mid_blocks)
             self.cnn_out_shape = self.get_cnn_shape()
 
-            print("cnn_out_shape:", self.cnn_out_shape)
 
             # Detect 3D context encoder from output shape (C,D,H,W) vs (C,H,W)
             self.is_3d_ctx = (len(self.cnn_out_shape) == 4)
@@ -4221,6 +4188,7 @@ class ParticleInteractionEncoder(nn.Module):
         z_base_var_v = z_base_var.detach() if z_base_var is not None else z_base_var
         z_score_v = z_score.detach() if z_score is not None else z_score
         if self.use_z_orig:
+            print("USE Z ORIGIN")
             z_orig_v = self.particles_anchor.unsqueeze(0).repeat(z_v.shape[0], z_v.shape[1], 1, 1)
         else:
             z_orig_v = None
@@ -4882,7 +4850,6 @@ class ParticleEncoder(nn.Module):
         self.separate_depth_features = separate_depth_features
         self.depth_feature_dim = depth_feature_dim
 
-        print("Creating DLP Prior with cdim: ", cdim)
         self.prior_encoder = DLPPrior(cdim=cdim, volume_size=image_size, n_kp=self.n_kp_per_patch,
                                       patch_size=patch_size, kp_range=kp_range, pad_mode=pad_mode,
                                       n_kp_prior=n_kp_prior,
@@ -4918,7 +4885,6 @@ class ParticleEncoder(nn.Module):
         # appearance encoder - visual features encoder (z_f)
         output_logvar = (not self.interaction_features and self.features_dist != 'categorical')
         
-        print("Output logvar for feature encoder: ", output_logvar)
         # Split RGB and Depth Feature Encoder when RGBD
 
         self.particle_features_enc = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
@@ -5045,7 +5011,8 @@ class ParticleEncoder(nn.Module):
             z_offset = reparameterize(mu_offset, logvar_offset)
             z_scale  = reparameterize(mu_scale, logvar_scale) if logvar_scale is not None else mu_scale
 
-        z = z_base + z_offset  # [B, n_kp_prior, 3]
+        # z = z_base + z_offset  # [B, n_kp_prior, 3]
+        z = z_base
 
         # --- NEW: use covariance properly ---
         # per-axis variance from the prior covariance (diag)
@@ -5075,7 +5042,6 @@ class ParticleEncoder(nn.Module):
         total_var = var_kp.sum(-1)  # [B, n_kp_prior]
 
         if self.n_kp_enc < self.n_kp_prior:
-            print("FILTERING!!!!!!!!!!!!")
             n_filter = self.n_kp_enc if not warmup else min(self.n_kp_enc, int(self.warmup_n_kp_ratio * self.n_kp_prior))
             _, embed_ind = torch.topk(total_var, k=n_filter, dim=-1, largest=False)
             batch_ind = torch.arange(batch_size, device=x.device)[:, None]
@@ -5198,28 +5164,6 @@ class ParticleEncoder(nn.Module):
             z_features = mu_features
 
 
-        with torch.no_grad():
-            enc_out = self.particle_features_enc(x, z, z_scale=z_scale, timesteps=timesteps)
-            mu_feat = enc_out['mu_features']         # [B, K, F]
-            crops   = enc_out['cropped_objects']     # [B, K, 3, ps, ps, ps]
-
-            B, K, F = mu_feat.shape
-
-            # per-kp GT color: mean RGB of its crop
-            rgb_gt_kp = crops.mean(dim=(3,4,5))      # [B, K, 3]
-
-            feat_flat = mu_feat.view(B*K, F)         # [B*K, F]
-            rgb_flat  = rgb_gt_kp.view(B*K, 3)       # [B*K, 3]
-
-            # standardize
-            feat_flat = (feat_flat - feat_flat.mean(0, keepdim=True)) / (feat_flat.std(0, keepdim=True) + 1e-6)
-            rgb_flat  = (rgb_flat  - rgb_flat.mean(0, keepdim=True)) / (rgb_flat.std(0, keepdim=True)  + 1e-6)
-
-            # correlation matrix F x 3
-            corr = (feat_flat.transpose(0,1) @ rgb_flat) / (feat_flat.shape[0] - 1)  # [F,3]
-
-            max_abs_corr, idx = corr.abs().max(dim=0)  # per color channel
-            print("max |corr(feature, R/G/B)| =", max_abs_corr.tolist())
 
         return {
             'mu_features':           mu_features,
@@ -5707,7 +5651,11 @@ class DLPEncoder(nn.Module):
             .reshape(1, -1, 3)                                # [1, N*n_kp_per_patch, 3]
         )
 
+        print("z origin: ", use_z_orig)
+        print("particle anchors: ", particle_anchors.shape)
+
         if self.use_particle_inter_enc:
+            print("USING INTERACTION ENCODER")
             self.particle_inter_enc = ParticleInteractionEncoder(n_kp_enc=n_kp_enc, dropout=0.0,
                                                                  learned_feature_dim=learned_feature_dim,
                                                                  learned_bg_feature_dim=learned_bg_feature_dim,
@@ -6357,51 +6305,6 @@ class DLPDecoder(nn.Module):
         else:
             rgb_obj = torch.sigmoid(rgb_raw)                   # [0,1]
 
-
-        # ---- DEBUG: per-object voxel RGB/alpha stats ----
-        with torch.no_grad():
-            B, N, C, D, H, W = patches_t.shape
-            print("[decode_rgb_unified] patches_t shape:", patches_t.shape)
-
-            # alpha logits and alpha probs
-            a_logits_flat = a_logits.view(B * N, -1)
-            a_obj_flat    = a_obj.view(B * N, -1)
-            print("  alpha_logits: min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
-                a_logits_flat.min().item(),
-                a_logits_flat.max().item(),
-                a_logits_flat.mean().item(),
-                a_logits_flat.std().item()))
-            print("  alpha_prob:   min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
-                a_obj_flat.min().item(),
-                a_obj_flat.max().item(),
-                a_obj_flat.mean().item(),
-                a_obj_flat.std().item()))
-
-            rgb_flat = rgb_obj.view(B * N, self.cdim, -1)      # [B*N,3,D*H*W]
-            for c, name in enumerate(["R", "G", "B"][:self.cdim]):
-                ch = rgb_flat[:, c]
-                print(f"  voxel {name}: min={ch.min().item():.4f} "
-                      f"max={ch.max().item():.4f} "
-                      f"mean={ch.mean().item():.4f} "
-                      f"std={ch.std().item():.4f}")
-
-            # correlations across channels at voxel level
-            if self.cdim == 3:
-                r = rgb_flat[:, 0].reshape(-1)
-                g = rgb_flat[:, 1].reshape(-1)
-                b = rgb_flat[:, 2].reshape(-1)
-
-                def corr(a, b):
-                    a = (a - a.mean()) / (a.std() + 1e-6)
-                    b = (b - b.mean()) / (b.std() + 1e-6)
-                    return (a * b).mean().item()
-
-                print("  voxel corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
-                    corr(r, g), corr(r, b), corr(g, b)
-                ))
-
-        return patches, a_obj, rgb_obj, None
-
         
         return patches, a_obj, rgb_obj, None                    # d_obj=None
 
@@ -6443,37 +6346,6 @@ class DLPDecoder(nn.Module):
             z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx, translation=translation
         )
 
-        with torch.no_grad():
-            # rgb_obj: [B, N, 3, D, H, W]
-            B, N, C, D, H, W = rgb_obj.shape
-            rgb_flat = rgb_obj.view(B*N, C, -1)                    # [B*N, 3, D*H*W]
-
-            # restrict to voxels with reasonably large alpha for that obj
-            # (otherwise you’re averaging a ton of near-zero background)
-            a_flat = a_obj.view(B*N, 1, -1)                        # [B*N, 1, D*H*W]
-            mask = (a_flat > 0.2).float()                          # keep “on” voxels
-            num = (rgb_flat * mask).sum(-1)                        # [B*N, 3]
-            den = mask.sum(-1).clamp_min(1.0)                      # [B*N, 1]
-            rgb_obj_mean = num / den                               # [B*N, 3]
-
-            print("rgb_obj_mean stats per channel:")
-            for c, name in enumerate(["R","G","B"]):
-                ch = rgb_obj_mean[:, c]
-                print(name, "min", ch.min().item(), 
-                        "max", ch.max().item(), 
-                        "mean", ch.mean().item(), 
-                        "std", ch.std().item())
-            
-            # correlation between channels for per-object color
-            r = rgb_obj_mean[:,0]; g = rgb_obj_mean[:,1]; b = rgb_obj_mean[:,2]
-            def corr(a,b):
-                a = (a - a.mean()) / (a.std() + 1e-6)
-                b = (b - b.mean()) / (b.std() + 1e-6)
-                return (a*b).mean().item()
-            print("corr_obj(R,G)=", corr(r,g),
-                "corr_obj(R,B)=", corr(r,b),
-                "corr_obj(G,B)=", corr(g,b))
-
         dec_depth_patches = None  # unified depth is not per-patch separate object unless you want to expose it
 
         # Composite (always uses z_depth for ordering)
@@ -6512,7 +6384,6 @@ class DLPDecoder(nn.Module):
             bg_logits = bg_raw[:, :1, ...]                          # [B*,1,D,H,W]
             p_bg      = torch.sigmoid(bg_logits)
 
-            print("P BG SHAPE: ", p_bg.shape)
 
             # Ensure same spatial shape/order; resample bg if needed
             if p_bg.shape[-3:] != p_obj.shape[-3:]:
@@ -6553,7 +6424,6 @@ class DLPDecoder(nn.Module):
 
 
         if C_bg >= 3:
-            print("triggering bg composite")
             rec_rgb = bg_mask * bg_rec[:, :3, ...] + dec_objects_trans
         else:
             rec_rgb = dec_objects_trans
@@ -6571,55 +6441,6 @@ class DLPDecoder(nn.Module):
             else:
                 rec_depth = bg_mask * bg_depth + dec_depth_trans
         
-        print("REC DEPTH is none: ", rec_depth is None)
-        print("rec rgb: ", rec_rgb.shape)
-        print("dec objects trans: ", dec_objects_trans.shape)
-        print("bg only: ", (bg_mask * bg_rec[:, :3, ...]).shape)
-
-        # ---- DEBUG: final RGB stats + correlations ----
-        with torch.no_grad():
-            def tensor_stats(name, t):
-                t_flat = t.view(t.shape[0], t.shape[1], -1)
-                print(f"[{name}] shape={t.shape} "
-                      f"global min={t_flat.min().item():.4f} "
-                      f"max={t_flat.max().item():.4f} "
-                      f"mean={t_flat.mean().item():.4f} "
-                      f"std={t_flat.std().item():.4f}")
-                # per-channel
-                C = t.shape[1]
-                max_ch = min(3, C)
-                for c in range(max_ch):
-                    ch = t_flat[:, c]
-                    print(f"  ch{c}: min={ch.min().item():.4f} "
-                          f"max={ch.max().item():.4f} "
-                          f"mean={ch.mean().item():.4f} "
-                          f"std={ch.std().item():.4f}")
-
-            tensor_stats("OBJ_RGB (dec_objects_trans)", dec_objects_trans)
-
-            if C_bg >= 3:
-                tensor_stats("BG_RGB (bg_rec[:,:3])", bg_rec[:, :3, ...])
-                tensor_stats("BG_MASK", bg_mask)
-
-            tensor_stats("REC_RGB (final)", rec_rgb)
-
-            # channel correlations on final reconstruction
-            Bf, Cf, Df, Hf, Wf = rec_rgb.shape
-            if Cf >= 3:
-                rec_flat = rec_rgb.view(Bf, Cf, -1)
-                r = rec_flat[:, 0].reshape(-1)
-                g = rec_flat[:, 1].reshape(-1)
-                b = rec_flat[:, 2].reshape(-1)
-
-                def corr(a, b):
-                    a = (a - a.mean()) / (a.std() + 1e-6)
-                    b = (b - b.mean()) / (b.std() + 1e-6)
-                    return (a * b).mean().item()
-
-                print("[REC_RGB] corr(R,G)={:.4f} corr(R,B)={:.4f} corr(G,B)={:.4f}".format(
-                    corr(r, g), corr(r, b), corr(g, b)
-                ))
-
         rec = torch.cat([rec_rgb, rec_depth], dim=1) if rec_depth is not None else rec_rgb
 
         return {

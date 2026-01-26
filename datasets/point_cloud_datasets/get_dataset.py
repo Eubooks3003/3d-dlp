@@ -32,6 +32,7 @@ def get_point_cloud_dataset(
     tasks: Optional[List[str]] = None,   # for mimicgen multi-task: list of task names or None for auto-discover
     max_demos: Optional[int] = None,     # for mimicgen_voxel: limit number of demos
     cache_suffix: str = "",              # for mimicgen_voxel: e.g., "_debug" for voxel_cache_debug
+    task_cache_suffixes: Optional[Dict[str, str]] = None,  # for mimicgen_multitask_voxel: per-task cache suffixes
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     seed: int = 42,
@@ -74,6 +75,25 @@ def get_point_cloud_dataset(
             seed=seed,
             max_demos=max_demos,
             cache_suffix=cache_suffix,
+            device=device,
+        )
+
+    # --- MimicGen MULTI-TASK precomputed voxel cache ---
+    if ds_key in ("mimicgen_multitask_voxel", "mimicgen_multi_voxel"):
+        from datasets.point_cloud_datasets.mimicgen_ds import MimicGenMultiTaskVoxelDataset
+
+        # Reads precomputed voxels from per-task cache directories
+        # Supports different cache folder names per task via task_cache_suffixes
+        return MimicGenMultiTaskVoxelDataset(
+            root=root,
+            tasks=tasks,
+            task_cache_suffixes=task_cache_suffixes,
+            default_cache_suffix=cache_suffix,
+            split=mode,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+            max_demos_per_task=max_demos,
             device=device,
         )
 
@@ -137,11 +157,12 @@ def get_point_cloud_dataset(
             # or use per-task caching if only one task
             if cache_dir is None:
                 if len(base.tasks) == 1:
-                    # Single task: use task-specific cache
-                    cache_dir = base.get_cache_dir_for_task(base.tasks[0])
+                    # Single task: use task-specific cache (with optional suffix)
+                    cache_dir = base.get_cache_dir_for_task(base.tasks[0], cache_suffix)
                 else:
                     # Multiple tasks: use combined cache at root level
-                    cache_dir = os.path.join(root, "voxel_cache_combined")
+                    suffix = cache_suffix if cache_suffix else ""
+                    cache_dir = os.path.join(root, f"voxel_cache_combined{suffix}")
                 print(f"[get_point_cloud_dataset] Auto-set cache_dir: {cache_dir}")
 
             return VoxelizedDataset(
