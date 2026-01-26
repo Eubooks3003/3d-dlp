@@ -39,7 +39,10 @@ from utils.util_func import (
     LinearWithWarmupScheduler, save_code_backup,
 )
 from utils.log_utils import save_checkpoint
-from eval.eval_vox import log_rgb_voxels, plot_loss_curves
+from eval.eval_vox import (
+    log_rgb_voxels, plot_loss_curves,
+    compute_occupancy_iou, compute_masked_color_psnr,
+)
 
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
@@ -330,18 +333,21 @@ def train_baseline(config_path, mode, kl_weight=0.001):
     log_line(log_dir, backup_info)
     print(backup_info)
 
-    # Dataset
+    # Dataset - wrap with VoxelizedDataset to get voxels
     base_ds = get_point_cloud_dataset(
         ds,
         root,
         mode="train",
         max_points=4096,
         include_rgb=is_rgb,
+        voxelize=True,
+        voxel_grid_whd=tuple(voxel_grid_whd),
+        voxel_mode=voxel_mode,
     )
 
     dataloader = DataLoader(base_ds, batch_size=batch_size, shuffle=True, num_workers=4)
 
-    # Validation dataset
+    # Validation dataset - wrap with VoxelizedDataset to get voxels
     try:
         val_ds = get_point_cloud_dataset(
             ds,
@@ -349,6 +355,9 @@ def train_baseline(config_path, mode, kl_weight=0.001):
             mode="val",
             max_points=4096,
             include_rgb=is_rgb,
+            voxelize=True,
+            voxel_grid_whd=tuple(voxel_grid_whd),
+            voxel_mode=voxel_mode,
         )
         val_dataloader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4) if len(val_ds) > 0 else None
         val_ds_len = len(val_ds) if val_ds else 0
@@ -512,6 +521,10 @@ def train_baseline(config_path, mode, kl_weight=0.001):
             val_epoch_losses_kl = []
             val_psnrs = []
 
+            # Main comparison metrics (same as train_dlp_voxel.py)
+            occ_ious = []
+            masked_psnrs = []
+
             with torch.no_grad():
                 for val_batch in val_dataloader:
                     vox = val_batch["voxels"].to(device).float()
@@ -544,6 +557,17 @@ def train_baseline(config_path, mode, kl_weight=0.001):
                         val_epoch_losses_rec.append(float(loss_rec_val.item()))
                         val_psnrs.append(float(psnr_val.item()))
 
+                    # Compute main comparison metrics: Occ IoU + Masked Color PSNR
+                    # (same metrics as train_dlp_voxel.py for fair comparison)
+                    if is_rgb:
+                        B = x_val.shape[0]
+                        for b in range(B):
+                            iou = compute_occupancy_iou(x_val[b], rec_val[b], occ_thresh=occ_thresh)
+                            masked_psnr = compute_masked_color_psnr(x_val[b], rec_val[b], occ_thresh=occ_thresh)
+                            occ_ious.append(iou)
+                            if np.isfinite(masked_psnr):
+                                masked_psnrs.append(masked_psnr)
+
             # Compute mean validation metrics
             val_loss_mean = float(np.mean(val_epoch_losses))
             val_loss_rec_mean = float(np.mean(val_epoch_losses_rec))
@@ -552,8 +576,17 @@ def train_baseline(config_path, mode, kl_weight=0.001):
             val_losses.append(val_loss_mean)
             val_losses_rec.append(val_loss_rec_mean)
 
-            # Log validation results
-            val_log_str = f"[Val] epoch {epoch:04d} | loss: {val_loss_mean:.4f} | rec: {val_loss_rec_mean:.4f} | psnr: {val_psnr_mean:.2f} dB"
+            # Compute main comparison metrics
+            occ_iou_mean = float(np.mean(occ_ious)) if occ_ious else None
+            masked_psnr_mean = float(np.mean(masked_psnrs)) if masked_psnrs else None
+
+            # Log validation results - main metrics first (Occ IoU + Masked PSNR)
+            val_log_str = f"[Val] epoch {epoch:04d}"
+            if occ_iou_mean is not None:
+                val_log_str += f" | Occ IoU: {occ_iou_mean:.4f}"
+            if masked_psnr_mean is not None:
+                val_log_str += f" | Masked PSNR: {masked_psnr_mean:.2f} dB"
+            val_log_str += f" | loss: {val_loss_mean:.4f} | rec: {val_loss_rec_mean:.4f} | psnr: {val_psnr_mean:.2f} dB"
             if is_vae and val_epoch_losses_kl:
                 val_loss_kl_mean = float(np.mean(val_epoch_losses_kl))
                 val_losses_kl.append(val_loss_kl_mean)
@@ -562,11 +595,17 @@ def train_baseline(config_path, mode, kl_weight=0.001):
             log_line(log_dir, val_log_str)
 
             # Log to wandb
-            wandb.log({
+            val_wandb_dict = {
                 "val/loss": val_loss_mean,
                 "val/loss_rec": val_loss_rec_mean,
                 "val/psnr": val_psnr_mean,
-            }, step=iteration)
+            }
+            # Main comparison metrics
+            if occ_iou_mean is not None:
+                val_wandb_dict["val/occ_iou"] = occ_iou_mean
+            if masked_psnr_mean is not None:
+                val_wandb_dict["val/masked_color_psnr"] = masked_psnr_mean
+            wandb.log(val_wandb_dict, step=iteration)
             if is_vae and val_epoch_losses_kl:
                 wandb.log({"val/loss_kl": val_loss_kl_mean}, step=iteration)
 

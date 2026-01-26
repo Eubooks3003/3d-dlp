@@ -130,8 +130,8 @@ def build_epoch_log(epoch, means):
 
 def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     # Initialize accelerator
-    # find_unused_parameters=False is more efficient but may cause issues if model has unused params
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    # find_unused_parameters=True needed because warmup phase uses different model parts
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
     # load config
@@ -239,13 +239,15 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     voxel_root = config.get("voxel_root", None)
 
     # MimicGen specific
-    task = config.get("task", None)  # task name for mimicgen_voxel
+    task = config.get("task", None)  # task name for mimicgen_voxel (single task)
+    tasks = config.get("tasks", None)  # task names for mimicgen_multitask (list of tasks, None=auto-discover)
     max_demos = config.get("max_demos", None)  # limit number of demos
     cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
+    task_cache_suffixes = config.get("task_cache_suffixes", None)  # per-task cache suffixes, e.g., {"coffee": "", "stack": "_new"}
 
     # Prior mode configuration
-    prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
-    raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
+    # prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
+    # raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
 
     # Dataset
     dataset = get_point_cloud_dataset(
@@ -254,8 +256,10 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         voxel_mode="occupancy",
         cache_dir=voxel_root,
         task=task,
+        tasks=tasks,
         max_demos=max_demos,
         cache_suffix=cache_suffix,
+        task_cache_suffixes=task_cache_suffixes,
     )
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
@@ -269,8 +273,10 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         voxel_mode="occupancy",
         cache_dir=voxel_root,
         task=task,
+        tasks=tasks,
         max_demos=max_demos,
         cache_suffix=cache_suffix,
+        task_cache_suffixes=task_cache_suffixes,
     )
 
     
@@ -329,8 +335,6 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         split_loss=split_loss,
         depth_loss_ratio=depth_loss_ratio,
         # Prior mode configuration
-        prior_mode=prior_mode,
-        raw_heatmap_mode=raw_heatmap_mode,
     )
 
 
@@ -459,7 +463,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
-                                 beta_obj=beta_obj, lambda_color=lambda_color)
+                                 beta_obj=beta_obj)
             loss = model_output['loss_dict']['loss']
             cuda_sync()
             t3 = time.time()
@@ -503,6 +507,8 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 loss=pick('loss'),
                 rec=pick('loss_rec'),
                 KL=pick('kl'),
+                obj_l1=pick('obj_on_l1'),
+                offset=pick('avg_offset'),
             )
 
             iteration += 1
@@ -582,7 +588,6 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 beta_rec=beta_rec,
                 beta_obj=beta_obj,
                 kl_balance=kl_balance,
-                lambda_color=lambda_color,
                 recon_loss_type=recon_loss_type,
                 fig_dir=fig_dir,
                 save_visuals=accelerator.is_main_process,
@@ -630,132 +635,86 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
             model.train()  # Back to training mode
             torch.cuda.empty_cache()  # Clear memory fragmentation after validation
 
-        # TRAIN VISUALS (voxel version) - only main process
+        # ------- TRAIN VISUALS (same as debug_dlp_voxel.py) - only main process -------
+        # Now logs ALL items in batch for multi-task visibility
         if (epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1) and accelerator.is_main_process:
-            b0 = 0
+            B = model_output['x'].shape[0]
 
-            gt_vol = model_output['x'][b0]
-            rec_vol = model_output['rec'][b0]
+            # Get task names from batch if available (for multi-task datasets)
+            batch_tasks = batch.get("task", None)  # List of task names or None
 
-            print("gt vol: ", gt_vol.shape)
+            for b_idx in range(B):
+                # Determine task name for logging
+                if batch_tasks is not None:
+                    task_name = batch_tasks[b_idx] if isinstance(batch_tasks, (list, tuple)) else str(batch_tasks)
+                else:
+                    task_name = f"sample{b_idx}"
 
-            with torch.no_grad():
-                out = filter_topk_kps_3d(
-                    z_base_var=model_output["z_base_var"],
-                    mu_tot=model_output["z_base"] + model_output["mu_offset"],
-                    topk=config['topk'],
-                    obj_on=model_output.get("obj_on", None),
-                    use_posterior_in_score=False
-                )
-                indices = out["indices"]
-                topk_kp = out["topk_kp"]
-                bb_scores = out["bb_scores"]
+                gt_vol = model_output['x'][b_idx]
+                rec_vol = model_output['rec'][b_idx]
 
-            topk_kp_b0 = topk_kp[b0]
-            cov_b0 = model_output["cov_kp"][b0]
-            kp_xyz = model_output["kp_p"]
-            z_base_cov_b0 = model_output["z_base_cov"][b0]
+                # Extract keypoints (keep in normalized [-1,1] space)
+                z_base_b = model_output["z_base"][b_idx]  # [K, 3]
+                mu_tot_b = z_base_b + model_output["mu_offset"][b_idx]  # [K, 3]
 
-            print("z base: ", model_output["z_base"].shape)
-            z_base_b0 = model_output["z_base"][b0]
-            mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]
+                # Extract obj_on for color-coding keypoints
+                obj_on_b = model_output["obj_on"][b_idx]  # [K] or [K, 1]
+                if obj_on_b.dim() == 2:
+                    obj_on_b = obj_on_b.squeeze(-1)  # [K]
 
-            # Convert keypoints from normalized [-1, 1] to voxel grid coords [0, grid_size]
-            grid_size = gt_vol.shape[1]  # D dimension (assuming D=H=W)
-            z_base_b0_vox = (z_base_b0 + 1) * 0.5 * grid_size
-            mu_tot_b0_vox = (mu_tot_b0 + 1) * 0.5 * grid_size
+                # Extract fg/bg
+                fg_only = model_output['dec_objects'][b_idx]
+                bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b_idx]
 
-            print("mu tot: ", mu_tot_b0.shape)
-            print("GT VOL: ", gt_vol.shape)
+                # Only print detailed diagnostics for first item to avoid log spam
+                if b_idx == 0:
+                    print(f"[Train Vis] Logging {B} batch items...")
+                    print(f"[Train Vis] gt_vol: {gt_vol.shape}, rec_vol: {rec_vol.shape}")
+                    print(f"[Train Vis] fg_only: {fg_only.shape}, bg_only: {bg_only.shape}")
 
-            # GT LOGGING
-            log_rgb_voxels(
-                name="gt/rgb_splat_kp",
-                rgb_vol=gt_vol,
-                alpha_vol=None,
-                KPx=mu_tot_b0_vox,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                    # ============ DIAGNOSTIC LOGGING (first item only) ============
+                    print("\n" + "="*60)
+                    print("DIAGNOSTIC: Alpha coverage & Foreground content (batch item 0)")
+                    print("="*60)
 
-            log_rgb_voxels(
-                name="gt/rgb_splat_no_offset",
-                rgb_vol=gt_vol,
-                alpha_vol=None,
-                KPx=z_base_b0_vox,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                    alpha_masks = model_output.get('alpha_masks')  # [B, N, 1, D, H, W]
+                    bg_mask_all = model_output.get('bg_mask')  # [B, 1, D, H, W]
+                    rgb_obj = model_output.get('rgb_obj')  # [B, N, C, D, H, W]
+                    dec_objects_trans = model_output.get('dec_objects')  # [B, C, D, H, W]
+                    bg_rec = model_output.get('bg')  # [B, C, D, H, W]
 
-            log_rgb_voxels(
-                name="gt/rgb_splat",
-                rgb_vol=gt_vol,
-                alpha_vol=None,
-                KPx=None,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                    if alpha_masks is not None:
+                        am_b = alpha_masks[0]  # [N, 1, D, H, W]
+                        alpha_sum = am_b.sum(dim=0)  # [1, D, H, W]
+                        pct_active = (alpha_sum > 0.1).float().mean() * 100
+                        print(f"[B] alpha_masks mean: {am_b.mean():.4f}, max: {am_b.max():.4f}")
+                        print(f"[B] alpha_sum mean: {alpha_sum.mean():.4f}, max: {alpha_sum.max():.4f}, %voxels>0.1: {pct_active:.1f}%")
 
-            # REC LOGGING
-            log_rgb_voxels(
-                name="rec/rgb_splat_kp",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                KPx=mu_tot_b0_vox,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                    if bg_mask_all is not None:
+                        bg_b = bg_mask_all[0]
+                        print(f"[B] bg_mask mean: {bg_b.mean():.4f}, max: {bg_b.max():.4f}")
 
-            log_rgb_voxels(
-                name="rec/rgb_splat",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                    if rgb_obj is not None:
+                        rgb_b = rgb_obj[0]
+                        print(f"[C] rgb_obj abs mean: {rgb_b.abs().mean():.4f}, max: {rgb_b.abs().max():.4f}")
 
-            log_rgb_voxels(
-                name="rec/rgb_splat_no_offset",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                KPx=z_base_b0_vox,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                    if dec_objects_trans is not None:
+                        dot_b = dec_objects_trans[0]
+                        print(f"[C] dec_objects_trans abs mean: {dot_b.abs().mean():.4f}, max: {dot_b.abs().max():.4f}")
 
-            # Log foreground and background separately
-            fg_vol = model_output.get('rgb_obj')
-            bg_vol = model_output.get('bg_rgb')
+                    if bg_rec is not None:
+                        bg_rgb_b = bg_rec[0, :3]
+                        print(f"[C] bg_rec abs mean: {bg_rgb_b.abs().mean():.4f}, max: {bg_rgb_b.abs().max():.4f}")
 
-            if fg_vol is not None:
-                fg_vol_b0 = fg_vol[b0]
+                    print("="*60 + "\n")
+
+                # Log prefix includes task name and batch index
+                log_prefix = f"train/{task_name}_b{b_idx}"
+
+                # 1. GT + Rec side by side (most important)
                 log_rgb_voxels(
-                    name="rec/fg_splat",
-                    rgb_vol=fg_vol_b0,
+                    name=f"{log_prefix}/gt",
+                    rgb_vol=gt_vol,
                     alpha_vol=None,
                     KPx=None,
                     step=iteration,
@@ -765,11 +724,12 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                     pad=2.0,
                     show_axes=True,
                 )
+
                 log_rgb_voxels(
-                    name="rec/fg_splat_kp",
-                    rgb_vol=fg_vol_b0,
+                    name=f"{log_prefix}/rec",
+                    rgb_vol=rec_vol,
                     alpha_vol=None,
-                    KPx=mu_tot_b0_vox,
+                    KPx=None,
                     step=iteration,
                     mode="splat",
                     topk=60000,
@@ -778,11 +738,53 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                     show_axes=True,
                 )
 
-            if bg_vol is not None:
-                bg_vol_b0 = bg_vol[b0]
+                # 2. Rec with KPs (color-coded by obj_on)
                 log_rgb_voxels(
-                    name="rec/bg_splat",
-                    rgb_vol=bg_vol_b0,
+                    name=f"{log_prefix}/rec_with_kp",
+                    rgb_vol=rec_vol,
+                    alpha_vol=None,
+                    KPx=mu_tot_b,
+                    obj_on=obj_on_b,
+                    step=iteration,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+
+                # 3. GT with KPs
+                log_rgb_voxels(
+                    name=f"{log_prefix}/gt_with_kp",
+                    rgb_vol=gt_vol,
+                    alpha_vol=None,
+                    KPx=mu_tot_b,
+                    obj_on=obj_on_b,
+                    step=iteration,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+
+                # 4. FG/BG decomposition
+                log_rgb_voxels(
+                    name=f"{log_prefix}/fg_only",
+                    rgb_vol=fg_only,
+                    alpha_vol=None,
+                    KPx=None,
+                    step=iteration,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=0.05,
+                    pad=2.0,
+                    show_axes=True,
+                )
+
+                log_rgb_voxels(
+                    name=f"{log_prefix}/bg_only",
+                    rgb_vol=bg_only,
                     alpha_vol=None,
                     KPx=None,
                     step=iteration,

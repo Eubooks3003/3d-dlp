@@ -100,7 +100,7 @@
   "pint_dyn_layers": 6,
   "pint_dyn_heads": 8,
   "pint_dim": 512,
-  "run_prefix": "_",
+  "run_prefix": "_shapenet",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
