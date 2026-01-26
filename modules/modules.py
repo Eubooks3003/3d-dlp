@@ -5011,8 +5011,8 @@ class ParticleEncoder(nn.Module):
             z_offset = reparameterize(mu_offset, logvar_offset)
             z_scale  = reparameterize(mu_scale, logvar_scale) if logvar_scale is not None else mu_scale
 
-        # z = z_base + z_offset  # [B, n_kp_prior, 3]
-        z = z_base
+        z = z_base + z_offset  # [B, n_kp_prior, 3]
+        # z = z_base
 
         # --- NEW: use covariance properly ---
         # per-axis variance from the prior covariance (diag)
