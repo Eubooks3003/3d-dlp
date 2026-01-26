@@ -2734,17 +2734,20 @@ class DLP(nn.Module):
             psnr = -10.0 * torch.log10(mse_val + 1e-12)
             # Average number of particles on per batch: reshape to [B, N_kp], sum over particles, mean over batch
             obj_on_l1 = obj_on.view(obj_on.shape[0], -1).sum(-1).mean()
+            # Average offset magnitude per particle
+            offset_l1 = mu_offset.abs().mean()
 
         return {
             'loss': loss,
             'loss_rec': loss_rec,
-            'loss_color': loss_color,  
+            'loss_color': loss_color,
             'loss_bg_aux': loss_bg_aux,
             'alpha_sparsity': sparsity,
             'alpha_entropy': alpha_entropy,
             'alpha_overlap': overlap_pen,
             'kl': loss_kl_static,
             'obj_on_l1': obj_on_l1,
+            'offset_l1': offset_l1,
             'kl_dyn': torch.tensor(0.0, device=x.device),
             'loss_kl_kp': loss_kl_kp,
             'loss_kl_feat': loss_kl_feat,

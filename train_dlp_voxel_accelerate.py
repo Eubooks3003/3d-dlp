@@ -504,6 +504,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 rec=pick('loss_rec'),
                 KL=pick('kl'),
                 obj_l1=pick('obj_on_l1'),
+                offset=pick('offset_l1'),
             )
 
             iteration += 1
@@ -642,6 +643,11 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
             z_base_b0 = model_output["z_base"][b0]  # [K, 3]
             mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
 
+            # Extract obj_on for color-coding keypoints
+            obj_on_b0 = model_output["obj_on"][b0]  # [K] or [K, 1]
+            if obj_on_b0.dim() == 2:
+                obj_on_b0 = obj_on_b0.squeeze(-1)  # [K]
+
             # Extract fg/bg (same as debug_dlp_voxel.py)
             fg_only = model_output['dec_objects'][b0]
             bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b0]
@@ -649,13 +655,69 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
             print(f"[Train Vis] gt_vol: {gt_vol.shape}, rec_vol: {rec_vol.shape}")
             print(f"[Train Vis] fg_only: {fg_only.shape}, bg_only: {bg_only.shape}")
             print(f"[Train Vis] mu_tot_b0 range: {mu_tot_b0.min():.3f} to {mu_tot_b0.max():.3f}")
+            print(f"[Train Vis] z_base_b0 range: {z_base_b0.min():.3f} to {z_base_b0.max():.3f}")
+            mu_offset_b0 = model_output["mu_offset"][b0]
+            print(f"[Train Vis] mu_offset_b0 range: {mu_offset_b0.min():.3f} to {mu_offset_b0.max():.3f}")
+            print(f"[Train Vis] obj_on_b0 range: {obj_on_b0.min():.3f} to {obj_on_b0.max():.3f}, mean: {obj_on_b0.mean():.3f}")
 
-            # 1. Full Reconstruction with KPs
+            # ============ DIAGNOSTIC LOGGING ============
+            print("\n" + "="*60)
+            print("DIAGNOSTIC: Alpha coverage & Foreground content")
+            print("="*60)
+
+            # Alpha coverage stats
+            alpha_masks = model_output.get('alpha_masks')  # [B, N, 1, D, H, W]
+            bg_mask_all = model_output.get('bg_mask')  # [B, 1, D, H, W]
+            rgb_obj = model_output.get('rgb_obj')  # [B, N, C, D, H, W]
+            dec_objects_trans = model_output.get('dec_objects')  # [B, C, D, H, W]
+            bg_rec = model_output.get('bg')  # [B, C, D, H, W]
+
+            if alpha_masks is not None:
+                am_b0 = alpha_masks[b0]  # [N, 1, D, H, W]
+                alpha_sum = am_b0.sum(dim=0)  # [1, D, H, W]
+                pct_active = (alpha_sum > 0.1).float().mean() * 100
+                print(f"[B] alpha_masks mean: {am_b0.mean():.4f}, max: {am_b0.max():.4f}")
+                print(f"[B] alpha_sum mean: {alpha_sum.mean():.4f}, max: {alpha_sum.max():.4f}, %voxels>0.1: {pct_active:.1f}%")
+
+            if bg_mask_all is not None:
+                bg_b0 = bg_mask_all[b0]
+                print(f"[B] bg_mask mean: {bg_b0.mean():.4f}, max: {bg_b0.max():.4f}")
+
+            if rgb_obj is not None:
+                rgb_b0 = rgb_obj[b0]
+                print(f"[C] rgb_obj abs mean: {rgb_b0.abs().mean():.4f}, max: {rgb_b0.abs().max():.4f}")
+
+            if dec_objects_trans is not None:
+                dot_b0 = dec_objects_trans[b0]
+                print(f"[C] dec_objects_trans abs mean: {dot_b0.abs().mean():.4f}, max: {dot_b0.abs().max():.4f}")
+
+            if bg_rec is not None:
+                bg_rgb_b0 = bg_rec[b0, :3]
+                print(f"[C] bg_rec abs mean: {bg_rgb_b0.abs().mean():.4f}, max: {bg_rgb_b0.abs().max():.4f}")
+
+            # Per-object stats
+            if alpha_masks is not None:
+                am_b0 = alpha_masks[b0]
+                n_obj = am_b0.shape[0]
+                obj_on_flat = obj_on_b0.reshape(-1)
+                n_on = (obj_on_flat > 0.5).sum().item()
+                n_off = (obj_on_flat < 0.1).sum().item()
+                print(f"\n[Per-object] N={n_obj}: {n_on} ON (>0.5), {n_off} OFF (<0.1)")
+                for i in range(n_obj):
+                    a_i = am_b0[i]
+                    on_i = obj_on_flat[i].item() if i < len(obj_on_flat) else float('nan')
+                    flag = " ← OFF" if on_i < 0.1 else ""
+                    print(f"  obj{i:2d}: obj_on={on_i:.3f}, alpha max={a_i.max():.3f}{flag}")
+
+            print("="*60 + "\n")
+
+            # 1. Full Reconstruction with KPs (color-coded by obj_on)
             log_rgb_voxels(
                 name="train/rec_with_kp",
                 rgb_vol=rec_vol,
                 alpha_vol=None,
                 KPx=mu_tot_b0,
+                obj_on=obj_on_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -664,12 +726,13 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
-            # 2. Foreground only with KPs
+            # 2. Foreground only with KPs (color-coded by obj_on)
             log_rgb_voxels(
                 name="train/fg_with_kp",
                 rgb_vol=fg_only,
                 alpha_vol=None,
                 KPx=mu_tot_b0,
+                obj_on=obj_on_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -734,12 +797,13 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
-            # 7. GT voxels with KPs
+            # 7. GT voxels with KPs (color-coded by obj_on)
             log_rgb_voxels(
                 name="train/gt_with_kp",
                 rgb_vol=gt_vol,
                 alpha_vol=None,
                 KPx=mu_tot_b0,
+                obj_on=obj_on_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -748,12 +812,13 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
-            # 8. Rec with non-offset KPs (z_base only)
+            # 8. Rec with non-offset KPs (z_base only, color-coded by obj_on)
             log_rgb_voxels(
                 name="train/rec_with_kp_no_offset",
                 rgb_vol=rec_vol,
                 alpha_vol=None,
                 KPx=z_base_b0,
+                obj_on=obj_on_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,
@@ -762,12 +827,13 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 show_axes=True,
             )
 
-            # 9. GT with non-offset KPs (z_base only)
+            # 9. GT with non-offset KPs (z_base only, color-coded by obj_on)
             log_rgb_voxels(
                 name="train/gt_with_kp_no_offset",
                 rgb_vol=gt_vol,
                 alpha_vol=None,
                 KPx=z_base_b0,
+                obj_on=obj_on_b0,
                 step=iteration,
                 mode="splat",
                 topk=60000,

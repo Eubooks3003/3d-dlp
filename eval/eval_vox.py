@@ -783,6 +783,7 @@ def log_rgb_voxels(
     alpha_vol=None,
     KPx=None,
     *,
+    obj_on=None,         # [K] or [K,1] obj_on values for color-coding keypoints
     step=None,
     mode="splat",
     topk=60000,
@@ -862,12 +863,13 @@ def log_rgb_voxels(
         # Avoids Tensor.numpy(); converts via Python lists.
         return np.asarray(t.detach().cpu().tolist(), dtype=np.float32)
 
-    def _add_kp_crosses(fig, kpx_any, D, H, W, half=2.0, space="global", kp_range=(-1, 1)):
+    def _add_kp_crosses(fig, kpx_any, D, H, W, half=2.0, space="global", kp_range=(-1, 1), obj_on_vals=None):
         """
-        Draw KP crosses on the figure.
+        Draw KP crosses on the figure with optional obj_on color-coding.
         - space="global": expects KPx in kp_range (usually [-1,1]) with order (x,y,z)
                           maps to voxel indices (x in [0,W-1], y in [0,H-1], z in [0,D-1])
         - space="voxel":  expects KPx already in voxel indices (x,y,z)
+        - obj_on_vals: [K] or [K,1] values in [0,1] for color-coding (red=off, green=on)
         """
         if kpx_any is None:
             return
@@ -884,6 +886,17 @@ def log_rgb_voxels(
         if kpx.size == 0:
             return
 
+        # Process obj_on values
+        obj_on_np = None
+        if obj_on_vals is not None:
+            if torch.is_tensor(obj_on_vals):
+                obj_on_np = _to_np_no_torch_numpy(obj_on_vals)
+            else:
+                obj_on_np = np.asarray(obj_on_vals, dtype=np.float32)
+            obj_on_np = obj_on_np.reshape(-1)
+            if len(obj_on_np) != len(kpx):
+                obj_on_np = None
+
         # Convert from global (normalized) to voxel indices if needed
         if space == "global":
             r0, r1 = kp_range
@@ -894,19 +907,39 @@ def log_rgb_voxels(
             z_vox = (kpx[:, 2] - r0) / span * (D - 1)
             kpx = np.stack([x_vox, y_vox, z_vox], axis=1)
 
-        xs, ys, zs = [], [], []
-        for x, y, z in kpx:
-            x0, x1 = x - half, x + half
-            y0, y1 = y - half, y + half
-            z0, z1 = z - half, z + half
-            # X
-            xs += [x0, x1, None]; ys += [y,  y,  None]; zs += [z,  z,  None]
-            # Y
-            xs += [x,  x,  None]; ys += [y0, y1, None]; zs += [z,  z,  None]
-            # Z
-            xs += [x,  x,  None]; ys += [y,  y,  None]; zs += [z0, z1, None]
-
-        fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", name="KPs", line=dict(width=6)))
+        if obj_on_np is None:
+            # Original behavior: all keypoints same color
+            xs, ys, zs = [], [], []
+            for x, y, z in kpx:
+                x0, x1 = x - half, x + half
+                y0, y1 = y - half, y + half
+                z0, z1 = z - half, z + half
+                xs += [x0, x1, None]; ys += [y,  y,  None]; zs += [z,  z,  None]
+                xs += [x,  x,  None]; ys += [y0, y1, None]; zs += [z,  z,  None]
+                xs += [x,  x,  None]; ys += [y,  y,  None]; zs += [z0, z1, None]
+            fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", name="KPs", line=dict(width=6)))
+        else:
+            # Color-coded by obj_on: red (off) -> yellow (mid) -> green (on)
+            for i, (xyz, on_val) in enumerate(zip(kpx, obj_on_np)):
+                x, y, z = xyz
+                on_val = float(np.clip(on_val, 0, 1))
+                # Color gradient: red (0) -> yellow (0.5) -> green (1)
+                if on_val < 0.5:
+                    r, g, b = 255, int(255 * (on_val * 2)), 0
+                else:
+                    r, g, b = int(255 * (1 - (on_val - 0.5) * 2)), 255, 0
+                color = f"rgba({r},{g},{b},0.9)"
+                x0, x1 = x - half, x + half
+                y0, y1 = y - half, y + half
+                z0, z1 = z - half, z + half
+                xs = [x0, x1, None, x,  x,  None, x,  x,  None]
+                ys = [y,  y,  None, y0, y1, None, y,  y,  None]
+                zs = [z,  z,  None, z,  z,  None, z0, z1, None]
+                fig.add_trace(go.Scatter3d(
+                    x=xs, y=ys, z=zs, mode="lines",
+                    line=dict(width=6, color=color),
+                    showlegend=False
+                ))
 
     # ---------- main ----------
     if mode != "splat":
@@ -993,7 +1026,7 @@ def log_rgb_voxels(
     )
 
     if KPx is not None:
-        _add_kp_crosses(fig, KPx, D, H, W, half=2.0, space="global")
+        _add_kp_crosses(fig, KPx, D, H, W, half=2.0, space="global", obj_on_vals=obj_on)
 
     if show_axes:
         fig.update_scenes(
