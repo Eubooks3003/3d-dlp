@@ -133,10 +133,6 @@ class DLP(nn.Module):
                  depth_feature_dim=16,  # depth feature dimension if separate encoding
                  split_loss=False,  # split loss into components for logging
                  depth_loss_ratio=1.0,  # weight of depth loss if split_loss is True
-
-                 # Prior mode configuration
-                 prior_mode="kmeans",  # "kmeans" | "ssm_raw" | "ssm_enc"
-                 raw_heatmap_mode="luma",  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
                  ):
         super(DLP, self).__init__()
         """
@@ -253,7 +249,7 @@ class DLP(nn.Module):
         self.normalize_rgb = normalize_rgb  # normalize to [-1, 1] or keep [0, 1]
         self.n_views = n_views  # number of input views (e.g., multiple cameras)
         self.dropout = dropout
-        self.num_patches = int((image_size // patch_size) ** 3)
+        self.num_patches = int((image_size // patch_size) ** 2)
         self.filter_particles_in_decoder = (timestep_horizon > 1)
         # self.filter_particles_in_decoder = False
         self.n_kp_per_patch = n_kp_per_patch
@@ -289,11 +285,6 @@ class DLP(nn.Module):
         assert filtering_heuristic in ['distance', 'variance',
                                        'random', 'none'], f'unknown filtering heuristic: {filtering_heuristic}'
         self.filtering_heuristic = filtering_heuristic
-
-        # prior mode configuration
-        assert prior_mode in ['kmeans', 'ssm_raw', 'ssm_enc'], f'unknown prior_mode: {prior_mode}'
-        self.prior_mode = prior_mode
-        self.raw_heatmap_mode = raw_heatmap_mode
 
         self.particle_score = particle_score
         # self.use_z_orig = use_z_orig if (self.n_kp_enc == self.n_kp_prior and timestep_horizon > 1) else False
@@ -472,8 +463,6 @@ class DLP(nn.Module):
                                          init_conv_bg_std=init_conv_bg_std,  # std for conv bg normal dist
                                          separate_depth_features=separate_depth_features,
                                          depth_feature_dim=depth_feature_dim,
-                                         prior_mode=prior_mode,
-                                         raw_heatmap_mode=raw_heatmap_mode,
                                          )
 
         # prior
@@ -921,7 +910,6 @@ class DLP(nn.Module):
         dec_dict['dec_objects_trans']       = dec_objects_trans
         dec_dict['dec_objects_original_rgb']= dec_objects_rgb
         dec_dict['rgb_obj'] = rgb_obj
-        dec_dict['rec'] = rec
 
 
         return dec_dict
@@ -1130,7 +1118,7 @@ class DLP(nn.Module):
     def forward(self, x, deterministic=False, warmup=False, with_loss=False, beta_kl=0.1, beta_dyn=0.1,
                 beta_rec=1.0, kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
                 balance=0.5, beta_dyn_rec=1.0, num_static=None, actions=None, actions_mask=None, lang_embed=None,
-                beta_obj=0.0, done_mask=None, x_goal=None, lambda_color=0.0):
+                beta_obj=0.0, done_mask=None, x_goal=None):
         if len(x.shape) == 5:
             # x: [bs, ch, h, w, l]
             batch_size = x.size(0)
@@ -1140,9 +1128,10 @@ class DLP(nn.Module):
             # x: [bs, T + 1, ch, h, w, l]
             batch_size, timestep_horizon = x.size(0), x.size(1)
 
+
         # encode particles
         enc_dict = self.encode_all(x, deterministic, warmup=warmup, actions=actions, actions_mask=actions_mask,
-                                    lang_embed=lang_embed, x_goal=x_goal)
+                                   lang_embed=lang_embed, x_goal=x_goal)
 
         # unpack encoder output: [bs, T, ...]
         kp_p = enc_dict['kp_p']
@@ -1211,7 +1200,7 @@ class DLP(nn.Module):
         filter_key = z_base_var.sum(-1) if (
                 self.filter_particles_in_decoder and self.n_kp_enc != self.n_kp_dec) else None
         dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features, z_context,
-                                    warmup, filter_key=filter_key)
+                                   warmup, filter_key=filter_key)
 
         bg_mask = dec_dict['bg_mask']
         dec_objects = dec_dict['dec_objects']
@@ -1219,7 +1208,7 @@ class DLP(nn.Module):
         alpha_masks = dec_dict['alpha_masks']
         rec = dec_dict['rec']
         bg_rec = dec_dict['bg_rec']
-        # print("REC SHAPE:", rec.shape)
+        print("REC SHAPE:", rec.shape)
 
         rec_rgb = dec_dict['rec_rgb']
         rgb_obj = dec_dict['rgb_obj']
@@ -1369,11 +1358,10 @@ class DLP(nn.Module):
             if num_static is None:
                 num_static = self.n_static_frames
             loss_dict = self.calc_elbo(x, output_dict, warmup=warmup, beta_kl=beta_kl,
-                                        beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
-                                        dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
-                                        recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
-                                        num_static=num_static, beta_obj=beta_obj, done_mask=done_mask,
-                                        lambda_color=lambda_color)
+                                       beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
+                                       dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
+                                       recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
+                                       num_static=num_static, beta_obj=beta_obj, done_mask=done_mask)
             output_dict['loss_dict'] = loss_dict
         else:
             output_dict['loss_dict'] = None
@@ -1383,7 +1371,7 @@ class DLP(nn.Module):
     def calc_elbo(self, x, model_output, warmup=False, beta_kl=0.1, beta_dyn=0.1, beta_rec=1.0,
                   kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None, balance=0.5,
                   beta_dyn_rec=1.0, num_static=1, use_kl_mask=True, apply_mask_on_obj_on=False, beta_obj=0.0,
-                  done_mask=None, lambda_color=0.0):
+                  done_mask=None):
         if self.is_dynamics_model:
             return self.calc_dyn_elbo(x, model_output, warmup, beta_kl, beta_dyn, beta_rec,
                                       kl_balance, dynamic_discount, recon_loss_type,
@@ -1408,7 +1396,6 @@ class DLP(nn.Module):
                 recon_loss_type=recon_loss_type,
                 use_kl_mask=use_kl_mask,
                 apply_mask_on_obj_on=apply_mask_on_obj_on,
-                lambda_color=lambda_color,
             )
 
     def calc_dyn_elbo(self, x, model_output, warmup=False, beta_kl=0.1, beta_dyn=0.1, beta_rec=1.0,
@@ -1936,7 +1923,7 @@ class DLP(nn.Module):
         bg_logits (opt):        [B*T, 1, *spatial*]
         """
 
-        # print(" RECON LOSS TYPE: ", recon_loss_type)
+        print(" RECON LOSS TYPE: ", recon_loss_type)
 
         # --------- helpers ----------
         def bce_logits_weighted(logits, target, pos_weight):
@@ -2097,9 +2084,9 @@ class DLP(nn.Module):
             mu_offset.reshape(-1, mu_offset.shape[-1]),
             logvar_o=logvar_offset_p, reduce='none'
         )
-        # print("shape kl kp offset:", loss_kl_kp_offset.shape)
-        # print("shape mu offset:", mu_offset.shape)
-        # print("shape kl mask:", kl_mask.shape)
+        print("shape kl kp offset:", loss_kl_kp_offset.shape)
+        print("shape mu offset:", mu_offset.shape)
+        print("shape kl mask:", kl_mask.shape)
         loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, mu_offset.shape[2]) * kl_mask).sum(-1)
         loss_kl_kp_offset = (loss_kl_kp_offset * adaptive_beta_kl).mean()
         loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset
@@ -2290,9 +2277,9 @@ class DLP(nn.Module):
         loss_kl_kp_offset = calc_kl(logvar_offset.reshape(-1, logvar_offset.shape[-1]),
                                     mu_offset.reshape(-1, mu_offset.shape[-1]), logvar_o=logvar_offset_p,
                                     reduce='none')
-        # print("shape kl kp offset:", loss_kl_kp_offset.shape)
-        # print("shape mu offset:", mu_offset.shape)
-        # print("shape kl mask:", kl_mask.shape)
+        print("shape kl kp offset:", loss_kl_kp_offset.shape)
+        print("shape mu offset:", mu_offset.shape)
+        print("shape kl mask:", kl_mask.shape)
         loss_kl_kp_offset = (loss_kl_kp_offset.view(-1, mu_offset.shape[2]) * kl_mask).sum(-1)
         loss_kl_kp_offset = (loss_kl_kp_offset * adaptive_beta_kl).mean()
         loss_kl_kp = 0.5 * kl_balance * loss_kl_kp_base + loss_kl_kp_offset
@@ -2503,8 +2490,8 @@ class DLP(nn.Module):
         chroma_spatial_dims = tuple(range(1, chroma_sq.dim()))  # (1,2,3,4)
         loss_color = chroma_sq.sum(dim=chroma_spatial_dims).mean()   # scalar
 
-        # print("loss_color:", float(loss_color))
-        # print("loss_rec_global:", float(loss_rec_global))
+        print("loss_color:", float(loss_color))
+        print("loss_rec_global:", float(loss_rec_global))
 
 
 
@@ -2589,7 +2576,7 @@ class DLP(nn.Module):
                 per_sample_err = diff.sum(dim=(1, 2, 3, 4, 5))       # [B*T]
                 loss_local = per_sample_err.mean()
 
-                # print("Local loss (supervised, enc-detached):", loss_local.item())
+                print("Local loss (supervised, enc-detached):", loss_local.item())
 
                 loss_rec = loss_rec + lambda_local * loss_local
 
@@ -2635,7 +2622,7 @@ class DLP(nn.Module):
                 overlap_pen = pairwise.mean()
                 loss_rec = loss_rec + overlap_weight * overlap_pen
 
-        # print("obj_on: ", obj_on.shape)
+        print("obj_on: ", obj_on.shape)
         # --------- KL masking ----------
         if use_kl_mask:
             kl_mask = obj_on.reshape(obj_on.shape[0], obj_on.shape[2])
@@ -2732,22 +2719,17 @@ class DLP(nn.Module):
         with torch.no_grad():
             mse_val = F.mse_loss(pred_rgb, x_flat)
             psnr = -10.0 * torch.log10(mse_val + 1e-12)
-            # Average number of particles on per batch: reshape to [B, N_kp], sum over particles, mean over batch
-            obj_on_l1 = obj_on.view(obj_on.shape[0], -1).sum(-1).mean()
-            # Average offset magnitude per particle
-            offset_l1 = mu_offset.abs().mean()
+            obj_on_l1 = torch.abs(obj_on.squeeze(-1) if obj_on.dim() == 3 else obj_on).sum(-1).mean()
 
         return {
             'loss': loss,
             'loss_rec': loss_rec,
-            'loss_color': loss_color,
+            'loss_color': loss_color,  
             'loss_bg_aux': loss_bg_aux,
             'alpha_sparsity': sparsity,
             'alpha_entropy': alpha_entropy,
             'alpha_overlap': overlap_pen,
             'kl': loss_kl_static,
-            'obj_on_l1': obj_on_l1,
-            'offset_l1': offset_l1,
             'kl_dyn': torch.tensor(0.0, device=x.device),
             'loss_kl_kp': loss_kl_kp,
             'loss_kl_feat': loss_kl_feat,
@@ -3039,7 +3021,7 @@ if __name__ == '__main__':
         if ep_dones[i] < ep_done_mask.shape[1]:
             ep_done_mask[i, ep_dones[i]:] = 0.0
 
-    # print("--- DLP ---")
+    print("--- DLP ---")
     model = DLP(cdim=ch,  # number of input image channels
                 image_size=image_size,
                 normalize_rgb=False,  # normalize to [-1, 1] or keep [0, 1]
@@ -3116,9 +3098,9 @@ if __name__ == '__main__':
                 language_max_len=max_lang_len,
                 img_goal_condition=img_goal_cond
                 ).to(device)
-    # print(f'model.info():')
-    # print(model.info())
-    # print("----------------------------------")
+    print(f'model.info():')
+    print(model.info())
+    print("----------------------------------")
 
     x_ts = (timestep_horizon + 1) if timestep_horizon > 1 else 1
     x = torch.rand(batch_size * n_im_views, x_ts, ch, image_size, image_size, device=device)

@@ -1283,7 +1283,6 @@ def evaluate_validation_voxel(
             recon_loss_type=recon_loss_type,
             recon_loss_func=recon_loss_func,
             beta_obj=beta_obj,
-            lambda_color=lambda_color,
         )
 
         loss_dict = model_output['loss_dict']

@@ -244,8 +244,8 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
     cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
 
     # Prior mode configuration
-    prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
-    raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
+    # prior_mode = config.get("prior_mode", "kmeans")  # "kmeans" | "ssm_raw" | "ssm_enc"
+    # raw_heatmap_mode = config.get("raw_heatmap_mode", "luma")  # "luma" | "rgb_norm" | "channel0" | "learned_1x1"
 
     # Dataset
     dataset = get_point_cloud_dataset(
@@ -329,8 +329,6 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
         split_loss=split_loss,
         depth_loss_ratio=depth_loss_ratio,
         # Prior mode configuration
-        prior_mode=prior_mode,
-        raw_heatmap_mode=raw_heatmap_mode,
     )
 
 
@@ -459,7 +457,7 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
-                                 beta_obj=beta_obj, lambda_color=lambda_color)
+                                 beta_obj=beta_obj)
             loss = model_output['loss_dict']['loss']
             cuda_sync()
             t3 = time.time()
@@ -584,7 +582,6 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
                 beta_rec=beta_rec,
                 beta_obj=beta_obj,
                 kl_balance=kl_balance,
-                lambda_color=lambda_color,
                 recon_loss_type=recon_loss_type,
                 fig_dir=fig_dir,
                 save_visuals=accelerator.is_main_process,
