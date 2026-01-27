@@ -11,7 +11,7 @@
 
   "device": "cuda",
   "batch_size": 4,
-  "lr": 8e-5,
+  "lr": 2e-5,
   "use_scheduler": false,
   "scheduler_gamma": 0.99,
   "adam_betas": [0.9, 0.999],
@@ -27,7 +27,7 @@
 
   "patch_size": 8,
   "n_kp_per_patch": 1,
-  "n_kp_enc": 63,
+  "n_kp_enc": 30,
   "n_kp_prior": 64,
   "topk": 10,
   "anchor_s": 0.25,

@@ -3,11 +3,11 @@
   "root": "/home/ubuntu/ellina/data/mimicgen",
   "modality": "point_cloud",
 
-  "tasks": ["coffee", "mug_cleanup", "stack_three"],
+  "tasks": ["three_piece_assembly", "square", "threading"],
   "task_cache_suffixes": {
-    "mug_cleanup": "",
-    "kitchen": "",
-    "stack_three": "_new"
+    "three_piece_assembly": "_new",
+    "square": "_new",
+    "threading": "_new"
   },
   "max_demos": 50,
 
@@ -27,7 +27,7 @@
   "adam_eps": 1e-06,
   "weight_decay": 0.0,
 
-  "load_model": true,
+  "load_model": false,
   "pretrained_path": "/home/ubuntu/ellina/lpwm-dev/logs/260126_195047_mimicgen_multitask/saves/last.pt",
   "start_epoch": 0,
   "num_epochs": 500,
@@ -109,7 +109,7 @@
   "pint_dyn_heads": 8,
   "pint_dim": 512,
 
-  "run_prefix": "mimicgen_multitask",
+  "run_prefix": "mimicgen_multitask_three_piece_square_threading",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,

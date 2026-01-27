@@ -3,13 +3,14 @@
   "root": "/home/ubuntu/ellina/data/mimicgen",
   "modality": "point_cloud",
 
-  "tasks": ["coffee", "mug_cleanup", "stack_three"],
+  "tasks": ["pick_place", "kitchen", "coffee_preparation", "nut_assembly"],
   "task_cache_suffixes": {
-    "mug_cleanup": "",
+    "pick_place": "_new",
     "kitchen": "",
-    "stack_three": "_new"
+    "coffee_preparation": "",
+    "nut_assembly": "_new"
   },
-  "max_demos": 50,
+  "max_demos": 60,
 
   "decoder_point_mode": "spawn",
   "voxel_mode": "occupancy",
@@ -19,7 +20,7 @@
   "points_per_scale": [32, 64],
 
   "device": "cuda",
-  "batch_size": 8,
+  "batch_size": 16,
   "lr": 8e-5,
   "use_scheduler": false,
   "scheduler_gamma": 0.99,
@@ -27,7 +28,7 @@
   "adam_eps": 1e-06,
   "weight_decay": 0.0,
 
-  "load_model": true,
+  "load_model": false,
   "pretrained_path": "/home/ubuntu/ellina/lpwm-dev/logs/260126_195047_mimicgen_multitask/saves/last.pt",
   "start_epoch": 0,
   "num_epochs": 500,
@@ -109,7 +110,7 @@
   "pint_dyn_heads": 8,
   "pint_dim": 512,
 
-  "run_prefix": "mimicgen_multitask",
+  "run_prefix": "mimicgen_multitask_nut_kitchen_pick_place_coffee_preparation",
   "animation_horizon": 60,
   "cond_steps": 2,
   "eval_im_metrics": true,
