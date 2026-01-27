@@ -602,17 +602,23 @@ def train_dlp_voxel_accelerate(config_path='./configs/shapes.json'):
             val_losses_rec.append(val_results.get('val_loss_rec', 0.0))
             val_losses_kl.append(val_results.get('val_kl', 0.0))
 
-            # Log validation metrics - main metrics: Occ IoU + Masked Color PSNR
+            # Log validation metrics - main metrics: Occ IoU + Masked Color PSNR (with std)
             val_log_str = f"[Val] epoch {epoch:04d}"
             if 'occ_iou' in val_results:
-                val_log_str += f" | Occ IoU: {val_results['occ_iou']:.4f}"
+                iou_str = f"{val_results['occ_iou']:.4f}"
+                if 'occ_iou_std' in val_results:
+                    iou_str += f" (±{val_results['occ_iou_std']:.4f})"
+                val_log_str += f" | IoU: {iou_str}"
             if 'masked_color_psnr' in val_results:
-                val_log_str += f" | Masked PSNR: {val_results['masked_color_psnr']:.2f} dB"
-            val_log_str += f" | val_loss: {val_results.get('val_loss', 0.0):.4f}"
+                psnr_str = f"{val_results['masked_color_psnr']:.2f}"
+                if 'masked_color_psnr_std' in val_results:
+                    psnr_str += f" (±{val_results['masked_color_psnr_std']:.2f})"
+                val_log_str += f" | PSNR: {psnr_str} dB"
+            val_log_str += f" | loss: {val_results.get('val_loss', 0.0):.4f}"
             if 'val_loss_rec' in val_results:
-                val_log_str += f" | val_rec: {val_results['val_loss_rec']:.4f}"
+                val_log_str += f" | rec: {val_results['val_loss_rec']:.4f}"
             if 'val_kl' in val_results:
-                val_log_str += f" | val_kl: {val_results['val_kl']:.4f}"
+                val_log_str += f" | kl: {val_results['val_kl']:.4f}"
             accelerator.print(val_log_str)
 
             if accelerator.is_main_process:
