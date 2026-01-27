@@ -1317,11 +1317,13 @@ def evaluate_validation_voxel(
         'val_loss': float(np.mean(val_losses)),
     }
 
-    # Main metrics
+    # Main metrics with std
     if occ_ious:
         results['occ_iou'] = float(np.mean(occ_ious))
+        results['occ_iou_std'] = float(np.std(occ_ious))
     if masked_psnrs:
         results['masked_color_psnr'] = float(np.mean(masked_psnrs))
+        results['masked_color_psnr_std'] = float(np.std(masked_psnrs))
 
     if val_losses_rec:
         results['val_loss_rec'] = float(np.mean(val_losses_rec))
