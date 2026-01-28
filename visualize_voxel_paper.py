@@ -1272,26 +1272,42 @@ def main():
             lock_scene(fig_rec, D, H, W)
             save_plotly_json(fig_rec, os.path.join(sample_output_dir, "rec_rgb.plotly.json"))
 
-            # Foreground only (no keypoints)
-            fg_only = model_output['dec_objects'][0]
-            fig_fg = log_rgb_voxels_eval(
-                name="fg",
-                rgb_vol=fg_only,
-                alpha_vol=None,
-                KPx=None,
-                step=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=args.alpha_thresh,
-            )
-            lock_scene(fig_fg, D, H, W)
-            save_plotly_json(fig_fg, os.path.join(sample_output_dir, "fg.plotly.json"))
+            # Foreground/Background from segmentation masks
+            # FG = rec voxels inside segmentation, BG = remaining voxels
+            if alpha_masks is not None:
+                # Combine alpha masks: max over all keypoints
+                # alpha_masks shape: [K, 1, D, H, W] after removing batch dim
+                if alpha_masks.ndim == 5:
+                    combined_alpha = alpha_masks[:, 0].max(dim=0)[0]  # [D, H, W]
+                elif alpha_masks.ndim == 4:
+                    combined_alpha = alpha_masks.max(dim=0)[0]  # [D, H, W]
+                else:
+                    combined_alpha = alpha_masks  # [D, H, W]
 
-            # Background only
-            bg_mask = model_output.get('bg_mask', None)
-            bg = model_output.get('bg', None)
-            if bg_mask is not None and bg is not None:
-                bg_only = (bg_mask * bg[:, :3])[0]
+                # Create FG mask where any keypoint has high alpha
+                fg_mask = (combined_alpha > args.mask_thresh).float()  # [D, H, W]
+                bg_mask_derived = 1.0 - fg_mask
+
+                # FG = rec * fg_mask, BG = rec * bg_mask
+                fg_only = rec_vol * fg_mask.unsqueeze(0)  # [3, D, H, W]
+                bg_only = rec_vol * bg_mask_derived.unsqueeze(0)  # [3, D, H, W]
+
+                print(f"  [FG/BG] fg_mask covers {fg_mask.sum().item():.0f} voxels, "
+                      f"bg_mask covers {bg_mask_derived.sum().item():.0f} voxels")
+
+                fig_fg = log_rgb_voxels_eval(
+                    name="fg",
+                    rgb_vol=fg_only,
+                    alpha_vol=None,
+                    KPx=None,
+                    step=None,
+                    mode="splat",
+                    topk=60000,
+                    alpha_thresh=args.alpha_thresh,
+                )
+                lock_scene(fig_fg, D, H, W)
+                save_plotly_json(fig_fg, os.path.join(sample_output_dir, "fg.plotly.json"))
+
                 fig_bg = log_rgb_voxels_eval(
                     name="bg",
                     rgb_vol=bg_only,
@@ -1304,6 +1320,8 @@ def main():
                 )
                 lock_scene(fig_bg, D, H, W)
                 save_plotly_json(fig_bg, os.path.join(sample_output_dir, "bg.plotly.json"))
+            else:
+                print("  [SKIP] No alpha_masks available for FG/BG separation")
 
             # Generate bboxes and segmentation using our custom functions
             generate_paper_figures(
