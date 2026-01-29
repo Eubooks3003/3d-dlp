@@ -431,23 +431,80 @@ def create_3d_segmentation_volume(
 # Core Visualization Functions
 # ----------------------------------------------------------------------
 
-def lock_scene(fig: go.Figure, D: int, H: int, W: int, camera: Optional[Dict] = None):
-    """Force a shared scene box for consistent zoom/scale across figures."""
+def lock_scene(fig: go.Figure, D: int, H: int, W: int, camera: Optional[Dict] = None,
+               aspect_ratio: Optional[tuple] = None):
+    """Force a shared scene box for consistent zoom/scale across figures.
+
+    Args:
+        fig: Plotly figure to update
+        D, H, W: Voxel grid dimensions (depth, height, width)
+        camera: Camera settings dict
+        aspect_ratio: Optional (x, y, z) tuple for manual aspect ratios.
+                     If None, uses "cube" mode (equal axes).
+                     If provided, uses "manual" mode with the given ratios.
+                     Use (1, 1, z_ratio) where z_ratio < 1 to compress the z-axis
+                     for datasets like ShapeNet where z has smaller range.
+    """
     if camera is None:
         camera = dict(
             eye=dict(x=1.5, y=1.5, z=1.2),
             up=dict(x=0, y=0, z=1),
         )
+
+    scene_dict = dict(
+        xaxis=dict(range=[0, W-1], autorange=False),
+        yaxis=dict(range=[0, H-1], autorange=False),
+        zaxis=dict(range=[0, D-1], autorange=False),
+        camera=camera,
+    )
+
+    if aspect_ratio is not None:
+        scene_dict["aspectmode"] = "manual"
+        scene_dict["aspectratio"] = dict(x=aspect_ratio[0], y=aspect_ratio[1], z=aspect_ratio[2])
+    else:
+        scene_dict["aspectmode"] = "cube"
+
     fig.update_layout(
-        scene=dict(
-            xaxis=dict(range=[0, W-1], autorange=False),
-            yaxis=dict(range=[0, H-1], autorange=False),
-            zaxis=dict(range=[0, D-1], autorange=False),
-            aspectmode="cube",
-            camera=camera,
-        ),
+        scene=scene_dict,
         margin=dict(l=0, r=0, t=0, b=0),
     )
+
+
+def split_fg_bg_by_color(rgb_vol, alpha_thresh: float = 0.05, sat_thresh: float = 0.1):
+    """Split an RGB volume into foreground (colorful) and background (grey) using HSV saturation.
+
+    A voxel is considered 'grey' (background) if its HSV saturation is below sat_thresh.
+    This correctly handles dark colored voxels (low brightness but high saturation).
+
+    Returns:
+        fg_vol: [3, D, H, W] foreground (colorful voxels), zeroed where grey
+        bg_vol: [3, D, H, W] background (grey voxels), zeroed where colorful
+    """
+    if isinstance(rgb_vol, torch.Tensor):
+        rgb_vol = rgb_vol.detach().cpu().numpy()
+    vol = rgb_vol.copy()
+    if vol.min() < 0:
+        vol = (vol + 1) * 0.5
+    vol = np.clip(vol, 0, 1)
+
+    mag = np.sqrt((vol ** 2).sum(axis=0))  # [D, H, W]
+    occupied = mag > alpha_thresh
+
+    # HSV saturation: (max - min) / max per voxel
+    cmax = vol.max(axis=0)   # [D, H, W]
+    cmin = vol.min(axis=0)   # [D, H, W]
+    sat = np.where(cmax > 1e-8, (cmax - cmin) / cmax, 0.0)
+
+    grey_mask = occupied & (sat < sat_thresh)
+    color_mask = occupied & (sat >= sat_thresh)
+
+    fg_vol = vol.copy()
+    fg_vol[:, grey_mask] = 0.0
+
+    bg_vol = vol.copy()
+    bg_vol[:, color_mask] = 0.0
+
+    return fg_vol, bg_vol
 
 
 def create_rgb_voxel_figure(
@@ -650,7 +707,8 @@ def generate_paper_figures(
     mask_thresh: float = 0.3,
     min_mask_voxels: int = 50,
     obj_on_thresh: float = 0.5,
-    output_dir: str = "./paper_figures"
+    output_dir: str = "./paper_figures",
+    aspect_ratio: Optional[tuple] = None
 ) -> Dict[str, str]:
     """
     Generate paper visualization figures and save as Plotly JSON files.
@@ -699,7 +757,7 @@ def generate_paper_figures(
     # 1. RGB only
     # ------------------------------------------------------------------
     fig_rgb = create_rgb_voxel_figure(rgb_vol, alpha_thresh=alpha_thresh)
-    lock_scene(fig_rgb, D, H, W)
+    lock_scene(fig_rgb, D, H, W, aspect_ratio=aspect_ratio)
     fpath = os.path.join(output_dir, f"{name}_rgb.plotly.json")
     save_plotly_json(fig_rgb, fpath)
     saved_files['rgb'] = fpath
@@ -709,7 +767,7 @@ def generate_paper_figures(
     # ------------------------------------------------------------------
     fig_rgb_kp = create_rgb_voxel_figure(rgb_vol, alpha_thresh=alpha_thresh)
     add_keypoints_to_fig(fig_rgb_kp, kp, D, H, W, obj_on=obj_on)
-    lock_scene(fig_rgb_kp, D, H, W)
+    lock_scene(fig_rgb_kp, D, H, W, aspect_ratio=aspect_ratio)
     fpath = os.path.join(output_dir, f"{name}_rgb_kp.plotly.json")
     save_plotly_json(fig_rgb_kp, fpath)
     saved_files['rgb_kp'] = fpath
@@ -742,7 +800,7 @@ def generate_paper_figures(
         name='KP centers'
     ))
 
-    lock_scene(fig_bbox, D, H, W)
+    lock_scene(fig_bbox, D, H, W, aspect_ratio=aspect_ratio)
     fpath = os.path.join(output_dir, f"{name}_bboxes.plotly.json")
     save_plotly_json(fig_bbox, fpath)
     saved_files['bboxes'] = fpath
@@ -850,7 +908,7 @@ def generate_paper_figures(
                 # scores_aligned with bboxes_nms, kp_indices for coloring
                 add_bboxes_to_fig(fig_bbox_masks, bboxes_nms, kept_scores, kept_indices, cmap)
 
-            lock_scene(fig_bbox_masks, D, H, W)
+            lock_scene(fig_bbox_masks, D, H, W, aspect_ratio=aspect_ratio)
             fpath = os.path.join(output_dir, f"{name}_bboxes_masks.plotly.json")
             save_plotly_json(fig_bbox_masks, fpath)
             saved_files['bboxes_masks'] = fpath
@@ -908,7 +966,7 @@ def generate_paper_figures(
 
             add_segmentation_to_fig(fig_seg, seg_vol, instance_vol)
 
-            lock_scene(fig_seg, D, H, W)
+            lock_scene(fig_seg, D, H, W, aspect_ratio=aspect_ratio)
             fpath = os.path.join(output_dir, f"{name}_segmentation.plotly.json")
             save_plotly_json(fig_seg, fpath)
             saved_files['segmentation'] = fpath
@@ -1050,7 +1108,24 @@ def main():
                         help="Minimum voxels above threshold to create a mask-derived bbox")
     parser.add_argument("--obj-on-thresh", type=float, default=0.5,
                         help="obj_on threshold for filtering background keypoints in mask-bboxes")
+    parser.add_argument("--aspect-ratio", type=str, default=None,
+                        help="Aspect ratio as 'x,y,z' (e.g., '1,1,0.5' for compressed z-axis). "
+                             "Use this for datasets like ShapeNet/Shapes where z has smaller range.")
+    parser.add_argument("--color-fg-bg", action="store_true", default=False,
+                        help="Use color-based fg/bg split (grey=bg, colorful=fg) instead of model outputs.")
     args = parser.parse_args()
+
+    # Parse aspect ratio if provided
+    aspect_ratio = None
+    if args.aspect_ratio:
+        try:
+            parts = [float(x.strip()) for x in args.aspect_ratio.split(',')]
+            if len(parts) == 3:
+                aspect_ratio = tuple(parts)
+            else:
+                print(f"[warning] Invalid aspect-ratio format, expected 'x,y,z', got: {args.aspect_ratio}")
+        except ValueError:
+            print(f"[warning] Could not parse aspect-ratio: {args.aspect_ratio}")
 
     # Handle --run-dir: auto-discover config and checkpoint
     if args.run_dir is not None:
@@ -1241,7 +1316,7 @@ def main():
                 topk=60000,
                 alpha_thresh=args.alpha_thresh,
             )
-            lock_scene(fig_gt, D, H, W)
+            lock_scene(fig_gt, D, H, W, aspect_ratio=aspect_ratio)
             save_plotly_json(fig_gt, os.path.join(sample_output_dir, "gt_rgb.plotly.json"))
 
             # Reconstruction with keypoints
@@ -1255,7 +1330,7 @@ def main():
                 topk=60000,
                 alpha_thresh=args.alpha_thresh,
             )
-            lock_scene(fig_rec_kp, D, H, W)
+            lock_scene(fig_rec_kp, D, H, W, aspect_ratio=aspect_ratio)
             save_plotly_json(fig_rec_kp, os.path.join(sample_output_dir, "rec_rgb_kp.plotly.json"))
 
             # Reconstruction without keypoints
@@ -1269,59 +1344,34 @@ def main():
                 topk=60000,
                 alpha_thresh=args.alpha_thresh,
             )
-            lock_scene(fig_rec, D, H, W)
+            lock_scene(fig_rec, D, H, W, aspect_ratio=aspect_ratio)
             save_plotly_json(fig_rec, os.path.join(sample_output_dir, "rec_rgb.plotly.json"))
 
-            # Foreground/Background from segmentation masks
-            # FG = rec voxels inside segmentation, BG = remaining voxels
-            if alpha_masks is not None:
-                # Combine alpha masks: max over all keypoints
-                # alpha_masks shape: [K, 1, D, H, W] after removing batch dim
-                if alpha_masks.ndim == 5:
-                    combined_alpha = alpha_masks[:, 0].max(dim=0)[0]  # [D, H, W]
-                elif alpha_masks.ndim == 4:
-                    combined_alpha = alpha_masks.max(dim=0)[0]  # [D, H, W]
-                else:
-                    combined_alpha = alpha_masks  # [D, H, W]
-
-                # Create FG mask where any keypoint has high alpha
-                fg_mask = (combined_alpha > args.mask_thresh).float()  # [D, H, W]
-                bg_mask_derived = 1.0 - fg_mask
-
-                # FG = rec * fg_mask, BG = rec * bg_mask
-                fg_only = rec_vol * fg_mask.unsqueeze(0)  # [3, D, H, W]
-                bg_only = rec_vol * bg_mask_derived.unsqueeze(0)  # [3, D, H, W]
-
-                print(f"  [FG/BG] fg_mask covers {fg_mask.sum().item():.0f} voxels, "
-                      f"bg_mask covers {bg_mask_derived.sum().item():.0f} voxels")
-
-                fig_fg = log_rgb_voxels_eval(
-                    name="fg",
-                    rgb_vol=fg_only,
-                    alpha_vol=None,
-                    KPx=None,
-                    step=None,
-                    mode="splat",
-                    topk=60000,
-                    alpha_thresh=args.alpha_thresh,
-                )
-                lock_scene(fig_fg, D, H, W)
+            # Foreground / Background split
+            if args.color_fg_bg:
+                # Color-based split: grey voxels are background, colorful are foreground
+                fg_vol, bg_vol = split_fg_bg_by_color(rec_vol, alpha_thresh=args.alpha_thresh)
+                fig_fg = create_rgb_voxel_figure(fg_vol, alpha_thresh=args.alpha_thresh)
+                lock_scene(fig_fg, D, H, W, aspect_ratio=aspect_ratio)
                 save_plotly_json(fig_fg, os.path.join(sample_output_dir, "fg.plotly.json"))
 
-                fig_bg = log_rgb_voxels_eval(
-                    name="bg",
-                    rgb_vol=bg_only,
-                    alpha_vol=None,
-                    KPx=None,
-                    step=None,
-                    mode="splat",
-                    topk=60000,
-                    alpha_thresh=args.alpha_thresh,
-                )
-                lock_scene(fig_bg, D, H, W)
+                fig_bg = create_rgb_voxel_figure(bg_vol, alpha_thresh=args.alpha_thresh)
+                lock_scene(fig_bg, D, H, W, aspect_ratio=aspect_ratio)
                 save_plotly_json(fig_bg, os.path.join(sample_output_dir, "bg.plotly.json"))
             else:
-                print("  [SKIP] No alpha_masks available for FG/BG separation")
+                # Model-based split
+                fg_only = model_output['dec_objects'][0]
+                fig_fg = create_rgb_voxel_figure(fg_only, alpha_thresh=args.alpha_thresh)
+                lock_scene(fig_fg, D, H, W, aspect_ratio=aspect_ratio)
+                save_plotly_json(fig_fg, os.path.join(sample_output_dir, "fg.plotly.json"))
+
+                bg_mask = model_output.get('bg_mask', None)
+                bg = model_output.get('bg', None)
+                if bg_mask is not None and bg is not None:
+                    bg_only = (bg_mask * bg[:, :3])[0]
+                    fig_bg = create_rgb_voxel_figure(bg_only, alpha_thresh=args.alpha_thresh)
+                    lock_scene(fig_bg, D, H, W, aspect_ratio=aspect_ratio)
+                    save_plotly_json(fig_bg, os.path.join(sample_output_dir, "bg.plotly.json"))
 
             # Generate bboxes and segmentation using our custom functions
             generate_paper_figures(
@@ -1339,7 +1389,8 @@ def main():
                 mask_thresh=args.mask_thresh,
                 min_mask_voxels=args.min_mask_voxels,
                 obj_on_thresh=args.obj_on_thresh,
-                output_dir=sample_output_dir
+                output_dir=sample_output_dir,
+                aspect_ratio=aspect_ratio
             )
 
             sample_idx += 1

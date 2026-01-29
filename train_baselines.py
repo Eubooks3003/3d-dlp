@@ -10,9 +10,9 @@ Unified baseline training for voxel autoencoders.
 
 Usage:
   python train_baselines.py --mode rgb_ae -d shapes
-  python train_baselines.py --mode rgb_vae -d shapes --kl_weight 0.001
+  python train_baselines.py --mode rgb_vae -d shapes --kl_weight 1e-5
   python train_baselines.py --mode occ_ae -d shapes
-  python train_baselines.py --mode occ_vae -d shapes --kl_weight 0.001
+  python train_baselines.py --mode occ_vae -d shapes --kl_weight 1e-5
 """
 
 import os
@@ -52,34 +52,68 @@ torch.backends.cudnn.deterministic = True
 # Models
 # ============================================================================
 
+class ResBlock3d(nn.Module):
+    """Residual block for 3D convolutions."""
+    def __init__(self, ch):
+        super().__init__()
+        self.conv1 = nn.Conv3d(ch, ch, 3, padding=1)
+        self.bn1 = nn.BatchNorm3d(ch)
+        self.conv2 = nn.Conv3d(ch, ch, 3, padding=1)
+        self.bn2 = nn.BatchNorm3d(ch)
+
+    def forward(self, x):
+        residual = x
+        x = F.leaky_relu(self.bn1(self.conv1(x)), 0.2)
+        x = self.bn2(self.conv2(x))
+        return F.leaky_relu(x + residual, 0.2)
+
+
 class VoxelEncoder(nn.Module):
     """Encoder for voxel grids. Works for any number of input channels."""
-    def __init__(self, in_ch=3, base_ch=32, latent_dim=256, is_vae=False):
+    def __init__(self, in_ch=3, base_ch=32, latent_dim=512, is_vae=False):
         super().__init__()
         self.is_vae = is_vae
 
-        # [B,in_ch,64,64,64] -> [B,32,32,32,32]
-        self.conv1 = nn.Conv3d(in_ch, base_ch, kernel_size=3, stride=2, padding=1)
-        self.bn1 = nn.BatchNorm3d(base_ch)
+        # [B,in_ch,64,64,64] -> [B,base_ch,32,32,32]
+        self.down1 = nn.Sequential(
+            nn.Conv3d(in_ch, base_ch, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch),
+        )
+        # [B,base_ch,32] -> [B,base_ch*2,16]
+        self.down2 = nn.Sequential(
+            nn.Conv3d(base_ch, base_ch * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 2),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 2),
+        )
+        # [B,base_ch*2,16] -> [B,base_ch*4,8]
+        self.down3 = nn.Sequential(
+            nn.Conv3d(base_ch * 2, base_ch * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 4),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 4),
+        )
+        # [B,base_ch*4,8] -> [B,base_ch*8,4]
+        self.down4 = nn.Sequential(
+            nn.Conv3d(base_ch * 4, base_ch * 8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 8),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 8),
+        )
 
-        # [B,32,32,32,32] -> [B,64,16,16,16]
-        self.conv2 = nn.Conv3d(base_ch, base_ch*2, kernel_size=3, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm3d(base_ch*2)
-
-        # [B,64,16,16,16] -> [B,128,8,8,8]
-        self.conv3 = nn.Conv3d(base_ch*2, base_ch*4, kernel_size=3, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm3d(base_ch*4)
-
-        self.flatten_dim = base_ch*4 * 8 * 8 * 8
+        self.flatten_dim = base_ch * 8 * 4 * 4 * 4
         self.fc_mu = nn.Linear(self.flatten_dim, latent_dim)
 
         if is_vae:
             self.fc_logvar = nn.Linear(self.flatten_dim, latent_dim)
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.down1(x)
+        x = self.down2(x)
+        x = self.down3(x)
+        x = self.down4(x)
         x = x.view(x.size(0), -1)
 
         mu = self.fc_mu(x)
@@ -91,28 +125,43 @@ class VoxelEncoder(nn.Module):
 
 class VoxelDecoder(nn.Module):
     """Decoder for voxel grids. Works for any number of output channels."""
-    def __init__(self, out_ch=3, base_ch=32, latent_dim=256, use_sigmoid=True):
+    def __init__(self, out_ch=3, base_ch=32, latent_dim=512, use_sigmoid=True):
         super().__init__()
         self.use_sigmoid = use_sigmoid
 
-        self.start_D = self.start_H = self.start_W = 8
-        self.start_ch = base_ch * 4
-        self.fc = nn.Linear(latent_dim, self.start_ch * self.start_D * self.start_H * self.start_W)
+        self.start_ch = base_ch * 8
+        self.fc = nn.Linear(latent_dim, self.start_ch * 4 * 4 * 4)
 
-        self.deconv1 = nn.ConvTranspose3d(self.start_ch, base_ch*2, kernel_size=4, stride=2, padding=1)
-        self.bn1 = nn.BatchNorm3d(base_ch*2)
-
-        self.deconv2 = nn.ConvTranspose3d(base_ch*2, base_ch, kernel_size=4, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm3d(base_ch)
-
-        self.deconv3 = nn.ConvTranspose3d(base_ch, out_ch, kernel_size=4, stride=2, padding=1)
+        # [B,base_ch*8,4] -> [B,base_ch*4,8]
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose3d(self.start_ch, base_ch * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 4),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 4),
+        )
+        # [B,base_ch*4,8] -> [B,base_ch*2,16]
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose3d(base_ch * 4, base_ch * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 2),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 2),
+        )
+        # [B,base_ch*2,16] -> [B,base_ch,32]
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose3d(base_ch * 2, base_ch, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch),
+        )
+        # [B,base_ch,32] -> [B,out_ch,64]
+        self.up4 = nn.ConvTranspose3d(base_ch, out_ch, kernel_size=4, stride=2, padding=1)
 
     def forward(self, z):
-        x = self.fc(z)
-        x = x.view(z.size(0), self.start_ch, self.start_D, self.start_H, self.start_W)
-        x = F.relu(self.bn1(self.deconv1(x)))
-        x = F.relu(self.bn2(self.deconv2(x)))
-        x = self.deconv3(x)
+        x = self.fc(z).view(z.size(0), self.start_ch, 4, 4, 4)
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.up3(x)
+        x = self.up4(x)
         if self.use_sigmoid:
             x = torch.sigmoid(x)
         return x
@@ -120,7 +169,7 @@ class VoxelDecoder(nn.Module):
 
 class VoxelAutoencoder(nn.Module):
     """Voxel Autoencoder (deterministic)."""
-    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=256, use_sigmoid=True):
+    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=512, use_sigmoid=True):
         super().__init__()
         self.encoder = VoxelEncoder(in_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim, is_vae=False)
         self.decoder = VoxelDecoder(out_ch=out_ch, base_ch=base_ch, latent_dim=latent_dim, use_sigmoid=use_sigmoid)
@@ -133,12 +182,13 @@ class VoxelAutoencoder(nn.Module):
 
 class VoxelVAE(nn.Module):
     """Voxel Variational Autoencoder."""
-    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=256, use_sigmoid=True):
+    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=512, use_sigmoid=True):
         super().__init__()
         self.encoder = VoxelEncoder(in_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim, is_vae=True)
         self.decoder = VoxelDecoder(out_ch=out_ch, base_ch=base_ch, latent_dim=latent_dim, use_sigmoid=use_sigmoid)
 
     def reparameterize(self, mu, logvar):
+        logvar = logvar.clamp(-20.0, 10.0)  # prevent exp() overflow
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -250,7 +300,7 @@ def build_epoch_log(epoch, means, mode):
 # Main training
 # ============================================================================
 
-def train_baseline(config_path, mode, kl_weight=0.001):
+def train_baseline(config_path, mode, kl_weight=1e-5, kl_warmup_epochs=10):
     """
     Train a baseline voxel autoencoder.
 
@@ -258,6 +308,7 @@ def train_baseline(config_path, mode, kl_weight=0.001):
         config_path: Path to config JSON
         mode: One of 'rgb_ae', 'rgb_vae', 'occ_ae', 'occ_vae'
         kl_weight: Weight for KL divergence (VAE modes only)
+        kl_warmup_epochs: Epochs to linearly ramp KL weight from 0 to kl_weight (VAE only)
     """
     # Parse mode
     is_rgb = mode.startswith("rgb")
@@ -278,12 +329,12 @@ def train_baseline(config_path, mode, kl_weight=0.001):
     root = config["root"]
     voxel_grid_whd = config["voxel_grid_whd"]
 
-    # For occupancy mode, we need to change voxel_mode
+    # Force correct voxel_mode based on training mode (config may have DLP-specific value)
     if is_rgb:
-        voxel_mode = config.get("voxel_mode", "avg_rgb")
+        voxel_mode = "avg_rgb"
     else:
         voxel_mode = "occupancy"
-        hparams["voxel_mode"] = voxel_mode
+    hparams["voxel_mode"] = voxel_mode
 
     device_str = config.get("device", "cuda:0")
     if "cuda" in device_str:
@@ -308,6 +359,7 @@ def train_baseline(config_path, mode, kl_weight=0.001):
     occ_thresh = config.get("occ_thresh", 1e-6)
     fg_weight = config.get("fg_weight", 5.0)
     bg_weight = config.get("bg_weight", 0.1)
+    lambda_color = config.get("baseline_lambda_color", 5.0)  # chroma loss weight (RGB only, per-voxel scale)
 
     # Use BCE for occupancy, MSE for RGB
     loss_type = "bce" if not is_rgb else "mse"
@@ -370,7 +422,7 @@ def train_baseline(config_path, mode, kl_weight=0.001):
 
     # Model
     base_ch = config.get("base_ch", 32)
-    latent_dim = config.get("latent_dim", 256)
+    latent_dim = config.get("latent_dim", 512)
 
     if is_vae:
         model = VoxelVAE(in_ch=in_ch, out_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim).to(device)
@@ -435,19 +487,47 @@ def train_baseline(config_path, mode, kl_weight=0.001):
 
             if is_vae:
                 rec_x, mu, logvar = model(x)
+            else:
+                rec_x, z = model(x)
+
+            # For RGB: occupancy-weighted MSE + foreground chroma loss (matches DLP)
+            if is_rgb:
+                occ_mask = (x.abs().mean(dim=1, keepdim=True) > occ_thresh).float()
+                loss_rec, psnr = recon_loss(x, rec_x, loss_type=loss_type,
+                                            occ=occ_mask, fg_weight=fg_weight, bg_weight=bg_weight)
+                # Chroma loss: penalize wrong hue/saturation on foreground voxels
+                L_gt = x.mean(dim=1, keepdim=True)        # luminance [B,1,D,H,W]
+                L_rec = rec_x.mean(dim=1, keepdim=True)
+                C_gt = x - L_gt                            # chrominance [B,3,D,H,W]
+                C_rec = rec_x - L_rec
+                fg = occ_mask.expand_as(C_gt)
+                chroma_err = (C_rec - C_gt) ** 2 * fg
+                # Normalize by foreground count (same per-voxel scale as recon_loss)
+                loss_chroma = chroma_err.sum() / fg.sum().clamp_min(1.0)
+                loss_rec = loss_rec + lambda_color * loss_chroma
+            else:
                 loss_rec, psnr = recon_loss(x, rec_x, loss_type=loss_type)
-                loss_kl = kl_divergence(mu, logvar)
-                loss = loss_rec + kl_weight * loss_kl
+                loss_chroma = None
+
+            if is_vae:
+                # Clamp logvar before computing KL to prevent exp() overflow
+                logvar_clamped = logvar.clamp(-20.0, 10.0)
+                loss_kl = kl_divergence(mu, logvar_clamped)
+                # Linear KL warmup to prevent posterior collapse
+                kl_frac = min(1.0, epoch / max(kl_warmup_epochs, 1))
+                if kl_frac > 0:
+                    loss = loss_rec + (kl_weight * kl_frac) * loss_kl
+                else:
+                    loss = loss_rec  # epoch 0: pure reconstruction, avoids 0*NaN
 
                 loss_dict = {
                     "loss": loss,
                     "loss_rec": loss_rec,
-                    "loss_kl": loss_kl,
+                    "loss_kl": loss_kl.detach(),
                     "psnr": psnr,
+                    "kl_frac": kl_frac,
                 }
             else:
-                rec_x, z = model(x)
-                loss_rec, psnr = recon_loss(x, rec_x, loss_type=loss_type)
                 loss = loss_rec
 
                 loss_dict = {
@@ -455,6 +535,9 @@ def train_baseline(config_path, mode, kl_weight=0.001):
                     "loss_rec": loss_rec,
                     "psnr": psnr,
                 }
+
+            if loss_chroma is not None:
+                loss_dict["loss_chroma"] = loss_chroma.detach()
 
             loss.backward()
             optimizer.step()
@@ -540,22 +623,35 @@ def train_baseline(config_path, mode, kl_weight=0.001):
 
                     if is_vae:
                         rec_val, mu_val, logvar_val = model(x_val)
-                        loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type)
-                        loss_kl_val = kl_divergence(mu_val, logvar_val)
-                        loss_val = loss_rec_val + kl_weight * loss_kl_val
-
-                        val_epoch_losses.append(float(loss_val.item()))
-                        val_epoch_losses_rec.append(float(loss_rec_val.item()))
-                        val_epoch_losses_kl.append(float(loss_kl_val.item()))
-                        val_psnrs.append(float(psnr_val.item()))
                     else:
                         rec_val, z_val = model(x_val)
+
+                    # Use same occupancy-weighted + chroma loss as training for RGB
+                    if is_rgb:
+                        occ_mask_val = (x_val.abs().mean(dim=1, keepdim=True) > occ_thresh).float()
+                        loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type,
+                                                            occ=occ_mask_val, fg_weight=fg_weight, bg_weight=bg_weight)
+                        L_gt_v = x_val.mean(dim=1, keepdim=True)
+                        L_rec_v = rec_val.mean(dim=1, keepdim=True)
+                        C_gt_v = x_val - L_gt_v
+                        C_rec_v = rec_val - L_rec_v
+                        fg_v = occ_mask_val.expand_as(C_gt_v)
+                        chroma_err_v = (C_rec_v - C_gt_v) ** 2 * fg_v
+                        loss_rec_val = loss_rec_val + lambda_color * chroma_err_v.sum() / fg_v.sum().clamp_min(1.0)
+                    else:
                         loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type)
+
+                    if is_vae:
+                        logvar_val_clamped = logvar_val.clamp(-20.0, 10.0)
+                        loss_kl_val = kl_divergence(mu_val, logvar_val_clamped)
+                        loss_val = loss_rec_val + kl_weight * loss_kl_val
+                        val_epoch_losses_kl.append(float(loss_kl_val.item()))
+                    else:
                         loss_val = loss_rec_val
 
-                        val_epoch_losses.append(float(loss_val.item()))
-                        val_epoch_losses_rec.append(float(loss_rec_val.item()))
-                        val_psnrs.append(float(psnr_val.item()))
+                    val_epoch_losses.append(float(loss_val.item()))
+                    val_epoch_losses_rec.append(float(loss_rec_val.item()))
+                    val_psnrs.append(float(psnr_val.item()))
 
                     # Compute main comparison metrics: Occ IoU + Masked Color PSNR
                     # (same metrics as train_dlp_voxel.py for fair comparison)
@@ -699,8 +795,12 @@ if __name__ == "__main__":
         help="Training mode: rgb_ae, rgb_vae, occ_ae, occ_vae"
     )
     parser.add_argument(
-        "--kl_weight", type=float, default=0.001,
-        help="KL divergence weight for VAE modes (default: 0.001)"
+        "--kl_weight", type=float, default=1e-5,
+        help="KL divergence weight for VAE modes (default: 1e-5)"
+    )
+    parser.add_argument(
+        "--kl_warmup_epochs", type=int, default=10,
+        help="Epochs to linearly ramp KL weight from 0 (default: 10)"
     )
 
     args = parser.parse_args()
@@ -711,4 +811,4 @@ if __name__ == "__main__":
     else:
         conf_path = os.path.join("./configs", f"{ds}.json")
 
-    train_baseline(conf_path, mode=args.mode, kl_weight=args.kl_weight)
+    train_baseline(conf_path, mode=args.mode, kl_weight=args.kl_weight, kl_warmup_epochs=args.kl_warmup_epochs)
