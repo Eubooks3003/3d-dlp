@@ -204,8 +204,14 @@ class VoxelVAE(nn.Module):
 # Losses
 # ============================================================================
 
-def recon_loss(x, rec_x, loss_type="mse", occ=None, fg_weight=1.0, bg_weight=1.0):
-    """Reconstruction loss with optional occupancy weighting."""
+def recon_loss(x, rec_x, loss_type="mse", occ=None, fg_weight=1.0, bg_weight=1.0,
+               reduction="mean"):
+    """Reconstruction loss with optional occupancy weighting.
+
+    Args:
+        reduction: "mean" for per-voxel mean (AE default),
+                   "sum_batch" for sum-over-voxels then mean-over-batch (VAE).
+    """
     assert x.shape == rec_x.shape, f"shape mismatch: x {x.shape}, rec_x {rec_x.shape}"
 
     if loss_type == "mse":
@@ -224,9 +230,16 @@ def recon_loss(x, rec_x, loss_type="mse", occ=None, fg_weight=1.0, bg_weight=1.0
         w = fg_weight * fg + bg_weight * bg
         w = w.expand_as(err)
         err = err * w
-        loss = err.sum() / w.sum().clamp_min(1.0)
+
+    if reduction == "sum_batch":
+        # Sum over all spatial/channel dims per sample, then mean over batch
+        loss = err.view(x.shape[0], -1).sum(dim=1).mean()
     else:
-        loss = err.mean()
+        # Per-voxel mean (weighted or plain)
+        if occ is not None:
+            loss = err.sum() / w.sum().clamp_min(1.0)
+        else:
+            loss = err.mean()
 
     # PSNR (for logging)
     with torch.no_grad():
@@ -455,6 +468,9 @@ def train_baseline(config_path, mode, kl_weight=1e-5, kl_warmup_epochs=10):
 
     iteration = 0
 
+    # VAE uses sum-over-voxels, mean-over-batch reduction to match DLP loss scale
+    red = "sum_batch" if is_vae else "mean"
+
     # Loss tracking for curves
     losses = []
     losses_rec = []
@@ -494,7 +510,8 @@ def train_baseline(config_path, mode, kl_weight=1e-5, kl_warmup_epochs=10):
             if is_rgb:
                 occ_mask = (x.abs().mean(dim=1, keepdim=True) > occ_thresh).float()
                 loss_rec, psnr = recon_loss(x, rec_x, loss_type=loss_type,
-                                            occ=occ_mask, fg_weight=fg_weight, bg_weight=bg_weight)
+                                            occ=occ_mask, fg_weight=fg_weight, bg_weight=bg_weight,
+                                            reduction=red)
                 # Chroma loss: penalize wrong hue/saturation on foreground voxels
                 L_gt = x.mean(dim=1, keepdim=True)        # luminance [B,1,D,H,W]
                 L_rec = rec_x.mean(dim=1, keepdim=True)
@@ -502,11 +519,14 @@ def train_baseline(config_path, mode, kl_weight=1e-5, kl_warmup_epochs=10):
                 C_rec = rec_x - L_rec
                 fg = occ_mask.expand_as(C_gt)
                 chroma_err = (C_rec - C_gt) ** 2 * fg
-                # Normalize by foreground count (same per-voxel scale as recon_loss)
-                loss_chroma = chroma_err.sum() / fg.sum().clamp_min(1.0)
+                # Use matching reduction for chroma loss
+                if red == "sum_batch":
+                    loss_chroma = chroma_err.view(x.shape[0], -1).sum(dim=1).mean()
+                else:
+                    loss_chroma = chroma_err.sum() / fg.sum().clamp_min(1.0)
                 loss_rec = loss_rec + lambda_color * loss_chroma
             else:
-                loss_rec, psnr = recon_loss(x, rec_x, loss_type=loss_type)
+                loss_rec, psnr = recon_loss(x, rec_x, loss_type=loss_type, reduction=red)
                 loss_chroma = None
 
             if is_vae:
@@ -630,16 +650,20 @@ def train_baseline(config_path, mode, kl_weight=1e-5, kl_warmup_epochs=10):
                     if is_rgb:
                         occ_mask_val = (x_val.abs().mean(dim=1, keepdim=True) > occ_thresh).float()
                         loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type,
-                                                            occ=occ_mask_val, fg_weight=fg_weight, bg_weight=bg_weight)
+                                                            occ=occ_mask_val, fg_weight=fg_weight, bg_weight=bg_weight,
+                                                            reduction=red)
                         L_gt_v = x_val.mean(dim=1, keepdim=True)
                         L_rec_v = rec_val.mean(dim=1, keepdim=True)
                         C_gt_v = x_val - L_gt_v
                         C_rec_v = rec_val - L_rec_v
                         fg_v = occ_mask_val.expand_as(C_gt_v)
                         chroma_err_v = (C_rec_v - C_gt_v) ** 2 * fg_v
-                        loss_rec_val = loss_rec_val + lambda_color * chroma_err_v.sum() / fg_v.sum().clamp_min(1.0)
+                        if red == "sum_batch":
+                            loss_rec_val = loss_rec_val + lambda_color * chroma_err_v.view(x_val.shape[0], -1).sum(dim=1).mean()
+                        else:
+                            loss_rec_val = loss_rec_val + lambda_color * chroma_err_v.sum() / fg_v.sum().clamp_min(1.0)
                     else:
-                        loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type)
+                        loss_rec_val, psnr_val = recon_loss(x_val, rec_val, loss_type=loss_type, reduction=red)
 
                     if is_vae:
                         logvar_val_clamped = logvar_val.clamp(-20.0, 10.0)
