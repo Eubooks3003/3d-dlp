@@ -40,34 +40,71 @@ from datasets.point_cloud_datasets.get_dataset import get_point_cloud_dataset
 
 
 # ============================================================================
-# Models (copied from train_baselines.py to avoid import issues)
+# Models (must match train_baselines.py exactly)
 # ============================================================================
+
+class ResBlock3d(nn.Module):
+    """Residual block for 3D convolutions."""
+    def __init__(self, ch):
+        super().__init__()
+        self.conv1 = nn.Conv3d(ch, ch, 3, padding=1)
+        self.bn1 = nn.BatchNorm3d(ch)
+        self.conv2 = nn.Conv3d(ch, ch, 3, padding=1)
+        self.bn2 = nn.BatchNorm3d(ch)
+
+    def forward(self, x):
+        residual = x
+        x = F.leaky_relu(self.bn1(self.conv1(x)), 0.2)
+        x = self.bn2(self.conv2(x))
+        return F.leaky_relu(x + residual, 0.2)
+
 
 class VoxelEncoder(nn.Module):
     """Encoder for voxel grids. Works for any number of input channels."""
-    def __init__(self, in_ch=3, base_ch=32, latent_dim=256, is_vae=False):
+    def __init__(self, in_ch=3, base_ch=32, latent_dim=512, is_vae=False):
         super().__init__()
         self.is_vae = is_vae
 
-        self.conv1 = nn.Conv3d(in_ch, base_ch, kernel_size=3, stride=2, padding=1)
-        self.bn1 = nn.BatchNorm3d(base_ch)
+        # [B,in_ch,64,64,64] -> [B,base_ch,32,32,32]
+        self.down1 = nn.Sequential(
+            nn.Conv3d(in_ch, base_ch, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch),
+        )
+        # [B,base_ch,32] -> [B,base_ch*2,16]
+        self.down2 = nn.Sequential(
+            nn.Conv3d(base_ch, base_ch * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 2),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 2),
+        )
+        # [B,base_ch*2,16] -> [B,base_ch*4,8]
+        self.down3 = nn.Sequential(
+            nn.Conv3d(base_ch * 2, base_ch * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 4),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 4),
+        )
+        # [B,base_ch*4,8] -> [B,base_ch*8,4]
+        self.down4 = nn.Sequential(
+            nn.Conv3d(base_ch * 4, base_ch * 8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 8),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 8),
+        )
 
-        self.conv2 = nn.Conv3d(base_ch, base_ch*2, kernel_size=3, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm3d(base_ch*2)
-
-        self.conv3 = nn.Conv3d(base_ch*2, base_ch*4, kernel_size=3, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm3d(base_ch*4)
-
-        self.flatten_dim = base_ch*4 * 8 * 8 * 8
+        self.flatten_dim = base_ch * 8 * 4 * 4 * 4
         self.fc_mu = nn.Linear(self.flatten_dim, latent_dim)
 
         if is_vae:
             self.fc_logvar = nn.Linear(self.flatten_dim, latent_dim)
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.down1(x)
+        x = self.down2(x)
+        x = self.down3(x)
+        x = self.down4(x)
         x = x.view(x.size(0), -1)
 
         mu = self.fc_mu(x)
@@ -79,28 +116,43 @@ class VoxelEncoder(nn.Module):
 
 class VoxelDecoder(nn.Module):
     """Decoder for voxel grids. Works for any number of output channels."""
-    def __init__(self, out_ch=3, base_ch=32, latent_dim=256, use_sigmoid=True):
+    def __init__(self, out_ch=3, base_ch=32, latent_dim=512, use_sigmoid=True):
         super().__init__()
         self.use_sigmoid = use_sigmoid
 
-        self.start_D = self.start_H = self.start_W = 8
-        self.start_ch = base_ch * 4
-        self.fc = nn.Linear(latent_dim, self.start_ch * self.start_D * self.start_H * self.start_W)
+        self.start_ch = base_ch * 8
+        self.fc = nn.Linear(latent_dim, self.start_ch * 4 * 4 * 4)
 
-        self.deconv1 = nn.ConvTranspose3d(self.start_ch, base_ch*2, kernel_size=4, stride=2, padding=1)
-        self.bn1 = nn.BatchNorm3d(base_ch*2)
-
-        self.deconv2 = nn.ConvTranspose3d(base_ch*2, base_ch, kernel_size=4, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm3d(base_ch)
-
-        self.deconv3 = nn.ConvTranspose3d(base_ch, out_ch, kernel_size=4, stride=2, padding=1)
+        # [B,base_ch*8,4] -> [B,base_ch*4,8]
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose3d(self.start_ch, base_ch * 4, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 4),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 4),
+        )
+        # [B,base_ch*4,8] -> [B,base_ch*2,16]
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose3d(base_ch * 4, base_ch * 2, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch * 2),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch * 2),
+        )
+        # [B,base_ch*2,16] -> [B,base_ch,32]
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose3d(base_ch * 2, base_ch, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(base_ch),
+            nn.LeakyReLU(0.2),
+            ResBlock3d(base_ch),
+        )
+        # [B,base_ch,32] -> [B,out_ch,64]
+        self.up4 = nn.ConvTranspose3d(base_ch, out_ch, kernel_size=4, stride=2, padding=1)
 
     def forward(self, z):
-        x = self.fc(z)
-        x = x.view(z.size(0), self.start_ch, self.start_D, self.start_H, self.start_W)
-        x = F.relu(self.bn1(self.deconv1(x)))
-        x = F.relu(self.bn2(self.deconv2(x)))
-        x = self.deconv3(x)
+        x = self.fc(z).view(z.size(0), self.start_ch, 4, 4, 4)
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.up3(x)
+        x = self.up4(x)
         if self.use_sigmoid:
             x = torch.sigmoid(x)
         return x
@@ -108,7 +160,7 @@ class VoxelDecoder(nn.Module):
 
 class VoxelAutoencoder(nn.Module):
     """Voxel Autoencoder (deterministic)."""
-    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=256, use_sigmoid=True):
+    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=512, use_sigmoid=True):
         super().__init__()
         self.encoder = VoxelEncoder(in_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim, is_vae=False)
         self.decoder = VoxelDecoder(out_ch=out_ch, base_ch=base_ch, latent_dim=latent_dim, use_sigmoid=use_sigmoid)
@@ -121,12 +173,13 @@ class VoxelAutoencoder(nn.Module):
 
 class VoxelVAE(nn.Module):
     """Voxel Variational Autoencoder."""
-    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=256, use_sigmoid=True):
+    def __init__(self, in_ch=3, out_ch=3, base_ch=32, latent_dim=512, use_sigmoid=True):
         super().__init__()
         self.encoder = VoxelEncoder(in_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim, is_vae=True)
         self.decoder = VoxelDecoder(out_ch=out_ch, base_ch=base_ch, latent_dim=latent_dim, use_sigmoid=use_sigmoid)
 
     def reparameterize(self, mu, logvar):
+        logvar = logvar.clamp(-20.0, 10.0)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -150,23 +203,26 @@ def save_plotly_json(fig: go.Figure, filepath: str):
     print(f"  Saved: {filepath}")
 
 
-def lock_scene(fig: go.Figure, D: int, H: int, W: int, camera: Optional[Dict] = None):
+def lock_scene(fig: go.Figure, D: int, H: int, W: int, camera: Optional[Dict] = None,
+               aspect_ratio: Optional[tuple] = None):
     """Force a shared scene box for consistent zoom/scale across figures."""
     if camera is None:
         camera = dict(
             eye=dict(x=1.5, y=1.5, z=1.2),
             up=dict(x=0, y=0, z=1),
         )
-    fig.update_layout(
-        scene=dict(
-            xaxis=dict(range=[0, W-1], autorange=False),
-            yaxis=dict(range=[0, H-1], autorange=False),
-            zaxis=dict(range=[0, D-1], autorange=False),
-            aspectmode="cube",
-            camera=camera,
-        ),
-        margin=dict(l=0, r=0, t=0, b=0),
+    scene_dict = dict(
+        xaxis=dict(range=[0, W-1], autorange=False),
+        yaxis=dict(range=[0, H-1], autorange=False),
+        zaxis=dict(range=[0, D-1], autorange=False),
+        camera=camera,
     )
+    if aspect_ratio is not None:
+        scene_dict["aspectmode"] = "manual"
+        scene_dict["aspectratio"] = dict(x=aspect_ratio[0], y=aspect_ratio[1], z=aspect_ratio[2])
+    else:
+        scene_dict["aspectmode"] = "cube"
+    fig.update_layout(scene=scene_dict, margin=dict(l=0, r=0, t=0, b=0))
 
 
 def create_rgb_voxel_figure(
@@ -351,6 +407,10 @@ def main():
                         help="Alpha threshold for voxel visibility (default 0.1, same as train_baselines)")
     parser.add_argument("--start-sample", type=int, default=0,
                         help="Index of first sample to process (for matching with DLP visualization)")
+    parser.add_argument("--samples", type=str, default=None,
+                        help="Comma-separated sample indices to visualize, e.g. '0,3,7,12'")
+    parser.add_argument("--aspect-ratio", type=str, default=None,
+                        help="Aspect ratio as 'x,y,z', e.g. '1,1,0.25'")
     args = parser.parse_args()
 
     # Handle --run-dir: auto-discover config and checkpoint
@@ -460,18 +520,7 @@ def main():
         )
         dataloader = DataLoader(base_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    # Build model
-    base_ch = cfg.get("base_ch", 32)
-    latent_dim = cfg.get("latent_dim", 256)
-
-    if is_vae:
-        model = VoxelVAE(in_ch=in_ch, out_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim).to(device)
-    else:
-        model = VoxelAutoencoder(in_ch=in_ch, out_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim).to(device)
-
-    print(f"[info] Model: {'VoxelVAE' if is_vae else 'VoxelAutoencoder'}(in_ch={in_ch}, latent_dim={latent_dim})")
-
-    # Load checkpoint
+    # Load checkpoint first so we can infer architecture from weights
     print(f"[info] Loading checkpoint: {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location=device)
 
@@ -491,11 +540,46 @@ def main():
 
     state = _strip_prefix(state, "module.")
     state = _strip_prefix(state, "model.")
+
+    # Infer latent_dim and base_ch from checkpoint weights
+    latent_dim = cfg.get("latent_dim", 512)
+    base_ch = cfg.get("base_ch", 32)
+    if "encoder.fc_mu.weight" in state:
+        latent_dim = state["encoder.fc_mu.weight"].shape[0]
+        flatten_dim = state["encoder.fc_mu.weight"].shape[1]
+        # flatten_dim = base_ch * 8 * 4 * 4 * 4 = base_ch * 512
+        base_ch = flatten_dim // 512
+        print(f"[info] Inferred from checkpoint: latent_dim={latent_dim}, base_ch={base_ch}")
+
+    # Build model
+    if is_vae:
+        model = VoxelVAE(in_ch=in_ch, out_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim).to(device)
+    else:
+        model = VoxelAutoencoder(in_ch=in_ch, out_ch=in_ch, base_ch=base_ch, latent_dim=latent_dim).to(device)
+
+    print(f"[info] Model: {'VoxelVAE' if is_vae else 'VoxelAutoencoder'}(in_ch={in_ch}, base_ch={base_ch}, latent_dim={latent_dim})")
+
     model.load_state_dict(state, strict=False)
     model.eval()
 
+    # Parse aspect ratio
+    aspect_ratio = None
+    if args.aspect_ratio:
+        try:
+            parts = [float(x.strip()) for x in args.aspect_ratio.split(',')]
+            if len(parts) == 3:
+                aspect_ratio = tuple(parts)
+        except ValueError:
+            pass
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Parse sample selection
+    selected_samples = None
+    if args.samples is not None:
+        selected_samples = set(int(s.strip()) for s in args.samples.split(','))
+        print(f"[info] Only processing samples: {sorted(selected_samples)}")
 
     # Process samples
     sample_idx = 0
@@ -504,7 +588,7 @@ def main():
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             # Skip samples before start_sample
-            if sample_idx < args.start_sample:
+            if sample_idx < args.start_sample and selected_samples is None:
                 sample_idx += batch["voxels"].shape[0]
                 continue
 
@@ -529,7 +613,13 @@ def main():
 
             # Process each sample in batch
             for b in range(x.shape[0]):
-                if processed_count >= args.max_samples:
+                if selected_samples is not None:
+                    if sample_idx not in selected_samples:
+                        sample_idx += 1
+                        continue
+                    if processed_count >= len(selected_samples):
+                        break
+                elif processed_count >= args.max_samples:
                     break
 
                 gt_vol = x[b]
@@ -546,27 +636,30 @@ def main():
                 if is_rgb:
                     # RGB mode: create RGB voxel figures
                     fig_gt = create_rgb_voxel_figure(gt_vol, alpha_thresh=args.alpha_thresh)
-                    lock_scene(fig_gt, D, H, W)
+                    lock_scene(fig_gt, D, H, W, aspect_ratio=aspect_ratio)
                     save_plotly_json(fig_gt, os.path.join(sample_output_dir, "gt_rgb.plotly.json"))
 
                     fig_rec = create_rgb_voxel_figure(rec_vol, alpha_thresh=args.alpha_thresh)
-                    lock_scene(fig_rec, D, H, W)
+                    lock_scene(fig_rec, D, H, W, aspect_ratio=aspect_ratio)
                     save_plotly_json(fig_rec, os.path.join(sample_output_dir, "rec_rgb.plotly.json"))
 
                 else:
                     # Occupancy mode: create occupancy figures
                     fig_gt = create_occupancy_voxel_figure(gt_vol, alpha_thresh=args.alpha_thresh)
-                    lock_scene(fig_gt, D, H, W)
+                    lock_scene(fig_gt, D, H, W, aspect_ratio=aspect_ratio)
                     save_plotly_json(fig_gt, os.path.join(sample_output_dir, "gt_occ.plotly.json"))
 
                     fig_rec = create_occupancy_voxel_figure(rec_vol, alpha_thresh=args.alpha_thresh)
-                    lock_scene(fig_rec, D, H, W)
+                    lock_scene(fig_rec, D, H, W, aspect_ratio=aspect_ratio)
                     save_plotly_json(fig_rec, os.path.join(sample_output_dir, "rec_occ.plotly.json"))
 
                 sample_idx += 1
                 processed_count += 1
 
-            if processed_count >= args.max_samples:
+            if selected_samples is not None:
+                if processed_count >= len(selected_samples):
+                    break
+            elif processed_count >= args.max_samples:
                 break
 
     print(f"\n[done] Generated visualizations for {processed_count} samples in {args.output_dir}")

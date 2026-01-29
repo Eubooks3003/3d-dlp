@@ -1094,6 +1094,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=4,
                         help="Maximum number of samples to visualize")
+    parser.add_argument("--samples", type=str, default=None,
+                        help="Comma-separated sample indices to visualize, e.g. '0,3,7,12'")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Directory to save Plotly JSON files (default: run_dir/paper_figures)")
     parser.add_argument("--iou-thresh", type=float, default=0.3,
@@ -1250,10 +1252,21 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Parse sample selection
+    selected_samples = None
+    if args.samples is not None:
+        selected_samples = set(int(s.strip()) for s in args.samples.split(','))
+        print(f"[info] Only processing samples: {sorted(selected_samples)}")
+
     # Process samples
     sample_idx = 0
+    n_saved = 0
     with torch.no_grad():
         for batch in dataloader:
+            if selected_samples is not None and sample_idx not in selected_samples:
+                sample_idx += 1
+                continue
+
             vox = batch["voxels"].to(device)
 
             # Forward pass
@@ -1394,10 +1407,14 @@ def main():
             )
 
             sample_idx += 1
-            if sample_idx >= args.max_samples:
+            n_saved += 1
+            if selected_samples is not None:
+                if n_saved >= len(selected_samples):
+                    break
+            elif sample_idx >= args.max_samples:
                 break
 
-    print(f"\n[done] Generated visualizations for {sample_idx} samples in {args.output_dir}")
+    print(f"\n[done] Generated visualizations for {n_saved} samples in {args.output_dir}")
     print(f"\nTo render figures, use a script like:")
     print("""
 import json
