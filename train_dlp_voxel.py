@@ -1,46 +1,30 @@
 """
 Single-GPU training of DLPv2
 """
-# imports
-import numpy as np
-import os
-from tqdm import tqdm
-import matplotlib
 import argparse
-# torch
+from collections import defaultdict
+import os
+
+import matplotlib
+import numpy as np
+from tqdm import tqdm
 import torch
-from utils.loss_functions import calc_reconstruction_loss, LossLPIPS
-from torch.utils.data import DataLoader
-import torchvision.utils as vutils
 import torch.optim as optim
-# modules
-from models import DLP
-from voxel_models import DLP
-# datasets
-from datasets.get_dataset import get_image_dataset
-from datasets.point_cloud_datasets.get_dataset import get_point_cloud_dataset, pc_collate
-from datasets.voxelize_ds_wrapper import VoxelizedDataset
-# util functions
-from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save_config, log_line,
-                             plot_bb_on_image_batch_from_z_scale_nms, plot_bb_on_image_batch_from_masks_nms,
-                             create_segmentation_map, get_config, LinearWithWarmupScheduler, format_epoch_summary,
-                             plot_training_metrics, save_metrics_data, save_code_backup, depth_to_rgb)
-from utils.rgbd_utils import get_depth_range, normalize_rgbd
-from utils.log_utils import (save_checkpoint, load_checkpoint, log_block_grads, log_param_updates, plot_grad_flow,
-                            topk_indices_from_output, wandb_log_iter_losses)
-from eval.eval_model import evaluate_validation_elbo
-from eval.eval_gen_metrics import eval_dlp_im_metric
-from eval.eval_vox import (log_vox_overlay_plotly, log_vox_isoseries, log_cov_ellipsoids_over_voxels,
-                           extract_volumes_for_vis, print_vol_stats, log_voxel_rec_distributions, filter_topk_kps_3d,
-                           log_rgb_voxels, evaluate_validation_voxel, plot_loss_curves)
+from torch.utils.data import DataLoader
 import wandb
+
+from voxel_models import DLP
+from datasets.point_cloud_datasets.get_dataset import get_point_cloud_dataset
+from utils.loss_functions import calc_reconstruction_loss, LossLPIPS
+from utils.util_func import (prepare_logdir, save_config, log_line, get_config,
+                             LinearWithWarmupScheduler, save_code_backup)
+from utils.log_utils import save_checkpoint, load_checkpoint
+from eval.eval_vox import log_rgb_voxels, evaluate_validation_voxel, plot_loss_curves
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
-
-from collections import defaultdict
 
 def _to_float_safe(x, default=None):
     if x is None:
@@ -54,16 +38,6 @@ def _to_float_safe(x, default=None):
     except Exception:
         return default
 
-def wandb_log_lossdict(loss_dict: dict, step: int):
-    """Logs all scalar-like entries in loss_dict to W&B under their existing keys."""
-    flat = {}
-    for k, v in loss_dict.items():
-        val = _to_float_safe(v)
-        if val is not None:
-            flat[k] = val
-    if flat:
-        wandb.log(flat, step=step)
-    return flat  # return what was logged (as floats) for local use
 
 class EpochAverager:
     """Collect per-iteration floats and compute epoch means for the keys we’ve actually seen."""
@@ -110,7 +84,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
-    image_size = config['image_size']
     root = config['root']  # dataset root
 
     run_prefix = config['run_prefix']
@@ -184,11 +157,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
     # evaluation
     eval_epoch_freq = 1
-    eval_im_metrics = config['eval_im_metrics']
 
     # visualization
     topk = min(config['topk'], config['n_kp_enc'])  # top-k particles to plot
-    iou_thresh = config['iou_thresh']  # threshold for NMS for plotting bounding boxes
 
     #RGBD Stuff
     separate_depth_features = config["separate_depth_features"]  # use separate depth feature encoding
@@ -196,12 +167,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     split_loss = config["split_loss"]  # split loss into components for logging
     depth_loss_ratio = config["depth_loss_ratio"]  # weight of depth loss if split_loss is True
 
-    # Point Cloud Stuff
-
-    decoder_point_mode = config["decoder_point_mode"]
-
     # Voxel Stuff
-    voxel_mode = config["voxel_mode"]
     voxel_grid_whd = config["voxel_grid_whd"]
     voxel_root = config.get("voxel_root", None)
 
@@ -343,8 +309,6 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     log_line(log_dir, backup_info)
     print(backup_info)
 
-    # get the range of the keypoints, it is [-1, 1] by default
-    kp_range = model.kp_range
     # prepare loss functions
     if recon_loss_type == "vgg":
         recon_loss_func = LossLPIPS(normalized_rgb=normalize_rgb).to(device)
@@ -373,39 +337,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             print(f"[ckpt] Resume skipped: {e}")
 
 
-    # log statistics
+    # log statistics (for loss curves)
     losses = []
     losses_rec = []
     losses_kl = []
-    losses_kl_kp = []
-    losses_kl_feat = []
-    losses_kl_scale = []
-    losses_kl_depth = []
-    losses_kl_obj_on = []
-
-    # validation statistics
     val_losses = []
     val_losses_rec = []
     val_losses_kl = []
-
-
-
-    # initialize validation statistics
-    valid_loss = best_valid_loss = 1e8
-    valid_losses = []
-    best_valid_epoch = 0
-
-    # save PSNR values of the reconstruction
-    psnrs = []
-
-    # image metrics
-    if eval_im_metrics:
-        val_lpipss = []
-        best_val_lpips_epoch = 0
-        val_lpips = best_val_lpips = 1e8
-    else:
-        best_val_lpips_epoch = None
-        val_lpips = best_val_lpips = None
 
     # iteration counter
     iteration = 0
@@ -417,25 +355,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     )
     for epoch in range(start_epoch, num_epochs):
         model.train()
-        batch_losses = []
-        batch_losses_rec = []
-        batch_losses_kl = []
-        batch_losses_kl_kp = []
-        batch_losses_kl_feat = []
-        batch_losses_kl_scale = []
-        batch_losses_kl_obj_on = []
-
-        # recon components (DCD & optional weighted CD)
-        losses_rec_dcd = []
-        losses_rec_cd_w = []
-
-        obj_on_l1_list = []
-        obj_on_mean_list = []
-        mu_scale_mean_list = []
-
         epoch_avg = EpochAverager()
-
-        
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
@@ -481,9 +401,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
            
 
         pbar.close()
-        # at end of epoch
-        # end of epoch
-        means = epoch_avg.means()   # {'loss': ..., 'loss_rec': ..., 'kl': ..., ...} only for keys that appeared
+
+        # End of epoch - compute mean losses
+        means = epoch_avg.means()
 
         # pretty print (robust to missing keys)
         log_str = build_epoch_log(epoch, means)
@@ -498,32 +418,17 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         # Collect all epoch-end logs into a single dict to avoid multiple wandb.log at same step
         epoch_log_dict = {**{f"epoch/{k}": v for k, v in means.items()}, "epoch_idx": epoch}
 
-        # choose monitored metric robustly
+        # Decide monitored metric (robust to missing keys)
         monitor_map = {
             "loss": "loss",
             "rec": "loss_rec",
             "kl": "kl",
-            "vox/psnr_c0": "vox/psnr_c0",  # if you logged it in loss_dict or elsewhere
+            "vox/psnr_c0": "vox/psnr_c0",
         }
         mon_key = monitor_map.get(monitor, "loss")
         monitored = means.get(mon_key, means.get("loss", None))
 
-        # ---- Decide monitored metric (robust to missing keys) ----
-        means = epoch_avg.means()  # e.g., {'loss': ..., 'loss_rec': ..., 'kl': ..., ...}
-
-        def pick(mkey, default=None):
-            return means.get(mkey, default)
-
-        monitor_map = {
-            "loss": "loss",
-            "rec": "loss_rec",
-            "kl": "kl",
-            "vox/psnr_c0": "vox/psnr_c0",  # log this into means if you want to monitor it
-        }
-        mon_key   = monitor_map.get(monitor, "loss")
-        monitored = pick(mon_key, pick("loss", None))  # fallback to total loss if chosen key missing
-
-        # Optional: guard against NaN/Inf
+        # Guard against NaN/Inf
         if monitored is not None and (not np.isfinite(monitored)):
             print(f"[warn] monitored metric {mon_key} is non-finite ({monitored}); skipping model selection this epoch.")
             monitored = None

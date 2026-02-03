@@ -330,11 +330,6 @@ class FeatureKMeansRGB(nn.Module):
         return kp, cov, meta
 
 
-import torch
-import torch.nn as nn
-import numpy as np
-from typing import Tuple, Union
-
 class VoxelPatcher(nn.Module):
     """
     3D patcher in canonical PyTorch layout.
@@ -3580,11 +3575,6 @@ class ParticleFeaturesEncoder(nn.Module):
 """
 DLP components
 """
-
-import math
-import numpy as np
-import torch
-import torch.nn as nn
 
 # expects you already have:
 #   - VoxelPatcher(cdim, volume_size, patch_size) with attributes ph,pw,pl

@@ -15,7 +15,7 @@ from modules.modules import DLPDynamics
 from utils.util_func import calc_model_size, generate_dlp_logo
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \
     ChamferLossKL, bce_logits_weighted
-from modules.vision_modules import rgb_to_minusoneone, minusoneone_to_rgb
+from modules.vision_modules import rgb_to_minusoneone
 
 
 class DLP(nn.Module):

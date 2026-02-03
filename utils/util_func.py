@@ -1280,7 +1280,7 @@ def load_metrics_data(run_name, save_dir):
     return metrics_data
 
 
-def save_code_backup(source_dir='.', backup_dir='backups'):
+def save_code_backup(source_dir='.', backup_dir='backups', verbose=False):
     """
     Creates a compressed backup of code files while maintaining directory structure.
     Only includes .py, README, requirements.txt, .ipynb, and environment.yml files.
@@ -1288,6 +1288,7 @@ def save_code_backup(source_dir='.', backup_dir='backups'):
     Args:
         source_dir (str): Source directory to backup (defaults to current directory)
         backup_dir (str): Directory where backups will be stored (defaults to 'backups')
+        verbose (bool): If True, print each file added (defaults to False)
 
     Returns:
         str: Path to the created backup file
@@ -1303,10 +1304,18 @@ def save_code_backup(source_dir='.', backup_dir='backups'):
     # Patterns to match
     patterns = ['*.py', 'README*', 'requirements.txt', '*.ipynb', 'environment.yml']
 
+    # Directories to skip
+    skip_dirs = {'wandb', '.git', '__pycache__', 'logs', '.venv', 'venv', 'env',
+                 'node_modules', '.idea', '.vscode', 'build', 'dist', '*.egg-info'}
+
+    file_count = 0
     # Create zip file
     with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         # Walk through directory
         for root, dirs, files in os.walk(source_dir):
+            # Skip excluded directories (modify dirs in-place to prevent descent)
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.endswith('.egg-info')]
+
             # Skip the backup directory itself
             if os.path.abspath(root).startswith(os.path.abspath(backup_dir)):
                 continue
@@ -1322,9 +1331,11 @@ def save_code_backup(source_dir='.', backup_dir='backups'):
 
                     # Add file to zip
                     zipf.write(file_path, rel_path)
-                    print(f"Added: {rel_path}")
+                    file_count += 1
+                    if verbose:
+                        print(f"Added: {rel_path}")
 
-    info = f"\nBackup created successfully: {backup_path}\nTotal Backup size: {os.path.getsize(backup_path) / (1024 * 1024):.2f} MB "
+    info = f"Backup created: {backup_path} ({file_count} files, {os.path.getsize(backup_path) / (1024 * 1024):.2f} MB)"
     return info
 
 
