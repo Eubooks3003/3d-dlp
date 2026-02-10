@@ -56,7 +56,6 @@ TASK_SPECIFIC_BOUNDS = {
     "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
     "mug_cleanup": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6},
     "three_piece_assembly": {"xmin": -0.7, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6},
-    # "stack": {"xmin": ..., "xmax": ..., "ymin": ..., "ymax": ..., "zmin": ..., "zmax": ...},
 }
 
 
