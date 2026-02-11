@@ -8,6 +8,8 @@ from typing import Dict, List, Tuple, Optional
 import torch
 from torch.utils.data import Dataset
 
+from datasets.voxelize_ds_wrapper import load_voxel
+
 class VoxelDataset(Dataset):
     """
     Reads precomputed voxel files from a flat folder:
@@ -119,7 +121,7 @@ class VoxelDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, object]:
         id_str, vox_path, meta_path = self.items[idx]
 
-        vox = torch.load(vox_path)  # expected [C, D, H, W] float tensor
+        vox = load_voxel(vox_path)  # expected [C, D, H, W] float tensor
         meta = torch.load(meta_path)  # dict with pmin/pmax/voxel_size, etc.
 
         # move to requested device if provided

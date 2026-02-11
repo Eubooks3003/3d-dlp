@@ -10,6 +10,8 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from datasets.voxelize_ds_wrapper import load_voxel
+
 
 class MimicGenVoxelDataset(Dataset):
     """
@@ -196,7 +198,7 @@ class MimicGenVoxelDataset(Dataset):
         demo_idx, frame_idx, vox_path, meta_path, extras_path = self.items[idx]
 
         # Load voxels
-        vox = torch.load(vox_path)  # [C, D, H, W]
+        vox = load_voxel(vox_path)  # [C, D, H, W]
 
         # Load meta (skip existence check for speed - assume it exists)
         try:
@@ -446,7 +448,7 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
         task, demo_idx, frame_idx, vox_path, meta_path = self.items[idx]
 
         # Load voxels
-        vox = torch.load(vox_path)  # [C, D, H, W]
+        vox = load_voxel(vox_path)  # [C, D, H, W]
 
         # Load meta
         try:

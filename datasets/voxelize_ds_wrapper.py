@@ -28,6 +28,24 @@ def _safe_tensor(x, dtype=torch.float32, device=None):
         t = t.to(device=device)
     return t
 
+def load_voxel(path):
+    """
+    Load a voxel grid — handles both compressed (sparse float16) and
+    uncompressed (dense float32) formats transparently.
+
+    Returns dense float32 tensor [C, D, H, W].
+    """
+    data = torch.load(path, weights_only=False)
+    if isinstance(data, dict) and data.get("compressed"):
+        shape = data["shape"]
+        coords = data["coords"].long()
+        values = data["values"].float()
+        vox = torch.zeros(shape, dtype=torch.float32)
+        vox[:, coords[:, 0], coords[:, 1], coords[:, 2]] = values.T
+        return vox
+    return data
+
+
 @dataclass
 class VoxelMetaXYZ:
     grid_whd: tuple

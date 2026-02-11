@@ -55,11 +55,20 @@ import robomimic.utils.env_utils as EnvUtils
 DEFAULT_CAMS = ["agentview", "sideview"]
 
 DEFAULT_CROP = {
-    "xmin": -0.7, "xmax": 0.9,
+    "xmin": -1.1, "xmax": 0.9,
     "ymin": -0.5, "ymax": 0.5,
     "zmin": -0.2, "zmax": 2.5,
 }
 
+# Per-task PLY crop bounds — looser than voxel bounds to avoid cutting off the scene.
+# Points outside these are discarded before voxelization.
+# Falls back to DEFAULT_CROP if a task is not listed here.
+TASK_SPECIFIC_CROP = {  
+    "stack_three": {"xmin": -0.7, "xmax": 0.9, "ymin": -0.5, "ymax": 0.5,"zmin": -0.2, "zmax": 2.5,},
+    "stack": {"xmin": -0.7, "xmax": 0.9, "ymin": -0.5, "ymax": 0.5,"zmin": -0.2, "zmax": 2.5,}, 
+}
+
+# Per-task voxel grid bounds — tighter, defines the voxel grid extent.
 TASK_SPECIFIC_BOUNDS = {
     "hammer_cleanup": {"xmin": -0.4, "xmax": 0.2, "ymin": -0.4, "ymax": 0.4, "zmin": 0.7, "zmax": 1.4},
     "nut_assembly": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.1, "zmax": 1.6},
@@ -67,11 +76,12 @@ TASK_SPECIFIC_BOUNDS = {
     "square": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.0, "zmax": 1.6},
     "stack_three": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
     "threading": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
-    "kitchen": {"xmin": -0.5, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.9, "zmax": 1.4},
+    "kitchen": {"xmin": -1.1, "xmax": 0.3,"ymin": -0.4, "ymax": 0.4,"zmin": 0.7, "zmax": 1.4,},
     "coffee": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
     "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
     "mug_cleanup": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6},
     "three_piece_assembly": {"xmin": -0.7, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6},
+    "stack":     {"xmin": -0.7, "xmax": 0.4, "ymin": -0.5, "ymax": 0.5, "zmin": -0.2, "zmax": 1.6}
 }
 
 
@@ -290,14 +300,9 @@ def build_points_for_cam(sim, obs_dict, cam, K, near_m, far_m,
 
 
 def fuse_cameras(sim, obs_dict, cams, K_by_cam, convention, crop_bounds,
-                 pixel_stride, max_points, rng, return_per_cam=False):
-    """
-    Fuse point clouds from multiple cameras into one.
-
-    If return_per_cam=True, also returns a dict of per-camera point clouds.
-    """
+                 pixel_stride, max_points, rng):
+    """Fuse point clouds from multiple cameras into one."""
     all_xyz, all_rgb = [], []
-    per_cam = {}
 
     for cam in cams:
         pts, rgb = build_points_for_cam(
@@ -309,18 +314,11 @@ def fuse_cameras(sim, obs_dict, cams, K_by_cam, convention, crop_bounds,
         if pts is not None:
             all_xyz.append(pts)
             all_rgb.append(rgb)
-            if return_per_cam:
-                per_cam[cam] = (pts, rgb)
 
     if not all_xyz:
-        return (None, None, per_cam) if return_per_cam else (None, None)
+        return None, None
 
-    fused_xyz = np.concatenate(all_xyz, axis=0)
-    fused_rgb = np.concatenate(all_rgb, axis=0)
-
-    if return_per_cam:
-        return fused_xyz, fused_rgb, per_cam
-    return fused_xyz, fused_rgb
+    return np.concatenate(all_xyz, axis=0), np.concatenate(all_rgb, axis=0)
 
 
 # ==================== Auto Convention Picking ====================
@@ -438,6 +436,28 @@ def voxelize_points(xyz, rgb, grid_whd, bounds, voxel_mode="avg_rgb"):
     return vox, md_cpu
 
 
+# ==================== Compressed Voxel I/O ====================
+
+def save_voxel_compressed(path, vox):
+    """
+    Save a sparse voxel grid efficiently.
+
+    Stores only occupied voxel coords + values in float16.
+    At 2% occupancy this is ~50x smaller than dense float32.
+    """
+    occupied = vox.abs().sum(dim=0) > 0  # [D, H, W]
+    coords_long = occupied.nonzero(as_tuple=False)  # [N, 3] int64
+    values = vox[:, coords_long[:, 0], coords_long[:, 1], coords_long[:, 2]].T.half()  # [N, C]
+    coords = coords_long.to(torch.int16)  # store as int16 to save space
+
+    torch.save({
+        "coords": coords,
+        "values": values,
+        "shape": list(vox.shape),
+        "compressed": True,
+    }, path)
+
+
 # ==================== PLY Writing (debug) ====================
 
 def write_ply(path, xyz, rgb):
@@ -520,17 +540,30 @@ def process_hdf5(args):
         demos = demos[:1]
         print("[DEBUG] Processing 1 demo, 1 frame only")
 
-    # 6. Setup crop bounds
-    crop_bounds = None if args.no_crop else DEFAULT_CROP
-
-    # 7. Setup voxel bounds
+    # 6. Setup crop bounds (PLY-level, before voxelization)
     task_name_lower = env_name.lower().replace(" ", "_")
+    if args.no_crop:
+        crop_bounds = None
+    elif args.use_task_bounds:
+        crop_bounds = DEFAULT_CROP  # fallback
+        for key in TASK_SPECIFIC_CROP:
+            if key in task_name_lower:
+                crop_bounds = TASK_SPECIFIC_CROP[key]
+                print(f"PLY crop: task-specific '{key}'")
+                break
+        else:
+            print("PLY crop: DEFAULT_CROP (no task-specific crop for this env)")
+    else:
+        crop_bounds = DEFAULT_CROP
+        print("PLY crop: DEFAULT_CROP")
+
+    # 7. Setup voxel bounds (tighter, defines the voxel grid)
     task_bounds = None
     if args.use_task_bounds:
         for key in TASK_SPECIFIC_BOUNDS:
             if key in task_name_lower:
                 task_bounds = TASK_SPECIFIC_BOUNDS[key]
-                print(f"Matched task-specific bounds: '{key}'")
+                print(f"Matched task-specific voxel bounds: '{key}'")
                 break
 
     if task_bounds is not None:
@@ -558,6 +591,9 @@ def process_hdf5(args):
     K_by_cam = None
     total_frames = 0
 
+    if args.frame_stride > 1:
+        print(f"Frame stride: {args.frame_stride} (saving every {args.frame_stride}th frame)")
+
     print(f"\nProcessing {len(demos)} demos from {args.input}")
     print(f"Output: {output_dir}\n")
 
@@ -575,11 +611,15 @@ def process_hdf5(args):
         elif args.max_frames_per_demo > 0:
             traj_len = min(traj_len, args.max_frames_per_demo)
 
+        # Output subdirs: output_dir/voxel/demo_X and output_dir/ply/demo_X
+        voxel_demo_dir = os.path.join(output_dir, "voxel", ep)
+        ply_demo_dir = os.path.join(output_dir, "ply", ep)
+
         # Resume: skip fully-cached demos
-        demo_out_dir = os.path.join(output_dir, ep)
+        expected_frames = len(range(0, traj_len, args.frame_stride))
         if not args.force and not args.debug_one:
-            cached = count_cached_frames(demo_out_dir)
-            if cached >= traj_len:
+            cached = count_cached_frames(voxel_demo_dir)
+            if cached >= expected_frames:
                 tqdm.write(f"  {ep}: {cached} frames cached, skipping")
                 total_frames += cached
                 continue
@@ -603,10 +643,23 @@ def process_hdf5(args):
                 seed=args.seed,
             )
 
-        os.makedirs(demo_out_dir, exist_ok=True)
+        os.makedirs(voxel_demo_dir, exist_ok=True)
+        if args.debug_one or args.save_ply:
+            os.makedirs(ply_demo_dir, exist_ok=True)
+
+        # Build list of frames to actually voxelize (respecting stride)
+        frame_stride = args.frame_stride
+        save_frames = set(range(0, traj_len, frame_stride))
 
         for t in tqdm(range(traj_len), desc=f"  {ep}", leave=False):
-            vox_path = os.path.join(demo_out_dir, f"frame{t}_voxels.pt")
+            # Always step the env (to keep sim in sync), but only
+            # voxelize + save on frames that match the stride.
+            if t not in save_frames:
+                if t < actions.shape[0]:
+                    obs, _, _, _ = env.step(actions[t])
+                continue
+
+            vox_path = os.path.join(voxel_demo_dir, f"frame{t}_voxels.pt")
 
             # Skip if already cached (frame-level resume)
             if not args.force and not args.debug_one and os.path.exists(vox_path):
@@ -617,33 +670,17 @@ def process_hdf5(args):
                 continue
 
             # Build fused point cloud from current obs
-            want_per_cam = args.debug_one or args.debug_per_cam
-            if want_per_cam:
-                xyz, rgb, per_cam = fuse_cameras(
-                    sim, obs, chosen_cams, K_by_cam, convention,
-                    crop_bounds, args.pixel_stride, args.max_points, rng,
-                    return_per_cam=True,
-                )
-            else:
-                xyz, rgb = fuse_cameras(
-                    sim, obs, chosen_cams, K_by_cam, convention,
-                    crop_bounds, args.pixel_stride, args.max_points, rng,
-                )
+            xyz, rgb = fuse_cameras(
+                sim, obs, chosen_cams, K_by_cam, convention,
+                crop_bounds, args.pixel_stride, args.max_points, rng,
+            )
 
             if xyz is not None and xyz.shape[0] > 0:
-                # Save per-camera PLY (debug)
-                if want_per_cam:
-                    for cam, (cam_pts, cam_rgb) in per_cam.items():
-                        cam_ply = os.path.join(demo_out_dir, f"frame{t:06d}_{cam}.ply")
-                        write_ply(cam_ply, cam_pts, cam_rgb)
-                        if args.debug_one:
-                            print(f"  [PLY] {cam}: {cam_ply} (N={cam_pts.shape[0]})")
-
                 # Save fused PLY (debug or explicit)
                 if args.debug_one or args.save_ply:
-                    fused_ply = os.path.join(demo_out_dir, f"frame{t:06d}_fused.ply")
+                    fused_ply = os.path.join(ply_demo_dir, f"frame{t:06d}_fused.ply")
                     write_ply(fused_ply, xyz, rgb)
-                    print(f"  [PLY] fused: {fused_ply} (N={xyz.shape[0]})")
+                    print(f"  [PLY] {fused_ply} (N={xyz.shape[0]})")
 
                 # Determine voxel bounds for this frame
                 if voxel_bounds is not None:
@@ -656,21 +693,12 @@ def process_hdf5(args):
                 vox, meta = voxelize_points(xyz, rgb, grid_whd, bounds, args.voxel_mode)
 
                 # Save voxel + meta
-                meta_path = os.path.join(demo_out_dir, f"frame{t}_meta.pt")
-                torch.save(vox, vox_path)
+                meta_path = os.path.join(voxel_demo_dir, f"frame{t}_meta.pt")
+                if args.compress:
+                    save_voxel_compressed(vox_path, vox)
+                else:
+                    torch.save(vox, vox_path)
                 torch.save(meta, meta_path)
-
-                # Save extras (compatible with preprocess_mimicgen_voxels.py)
-                demo_idx = int(ep.split("_")[-1])
-                extras = {
-                    "source_hdf5": args.input,
-                    "task": env_name,
-                    "demo": demo_idx,
-                    "frame": t,
-                    "points": np.concatenate([xyz, rgb], axis=1),
-                }
-                extras_path = os.path.join(demo_out_dir, f"frame{t}_extras.pt")
-                torch.save(extras, extras_path)
 
                 total_frames += 1
 
@@ -690,6 +718,13 @@ def process_hdf5(args):
                     print(f"  [META] pmin={meta['pmin'].tolist()}")
                     print(f"  [META] pmax={meta['pmax'].tolist()}")
                     print(f"  [META] voxel_size={meta['voxel_size'].tolist()}")
+                    vox_bytes = os.path.getsize(vox_path)
+                    dense_bytes = vox.numel() * 4  # float32
+                    print(f"  [STORAGE] {vox_bytes / 1024:.0f}KB on disk "
+                          f"(vs {dense_bytes / 1024:.0f}KB dense, "
+                          f"{dense_bytes / vox_bytes:.0f}x compression)"
+                          if args.compress else
+                          f"  [STORAGE] {vox_bytes / 1024:.0f}KB on disk (use --compress for ~{dense_bytes / (n_occupied * 10 + 256):.0f}x reduction)")
 
                     # Log to wandb
                     try:
@@ -736,6 +771,7 @@ def process_hdf5(args):
         "grid_whd": list(grid_whd),
         "voxel_mode": args.voxel_mode,
         "bounds_mode": bounds_mode,
+        "frame_stride": args.frame_stride,
         "crop_bounds": crop_bounds,
         "complete": True,
     }
@@ -758,7 +794,8 @@ def process_hdf5(args):
     print(f"Output: {output_dir}")
 
     if args.debug_one:
-        print(f"\n[DEBUG] Inspect the PLY files in {output_dir}/{demos[0]}/ to verify quality.")
+        print(f"\n[DEBUG] Inspect the PLY in {ply_demo_dir}/")
+        print(f"[DEBUG] Inspect the voxel in {voxel_demo_dir}/")
         print("[DEBUG] Re-run without --debug-one for full processing.")
 
 
@@ -782,6 +819,9 @@ def main():
                         help="End demo index (exclusive, 0-indexed)")
     parser.add_argument("--max-frames-per-demo", type=int, default=-1,
                         help="Max frames per demo (-1 = all)")
+    parser.add_argument("--frame-stride", type=int, default=1,
+                        help="Only voxelize every Nth frame (default: 1 = all frames). "
+                             "Saves with original frame numbers.")
 
     # Camera
     parser.add_argument("--cams", nargs="+", default=DEFAULT_CAMS,
@@ -799,8 +839,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
 
     # Voxelization
-    parser.add_argument("--grid-whd", type=int, nargs=3, default=[64, 64, 64],
-                        help="Voxel grid dimensions (default: 64 64 64)")
+    parser.add_argument("--grid-whd", type=int, nargs=3, default=[128, 128, 128],
+                        help="Voxel grid dimensions (default: 128 128 128)")
     parser.add_argument("--voxel-mode", type=str, default="avg_rgb",
                         choices=["occupancy", "density", "avg_rgb"],
                         help="Voxelization mode (default: avg_rgb)")
@@ -814,8 +854,8 @@ def main():
                         help="Debug: process 1 demo, 1 frame, save PLY + voxels with stats")
     parser.add_argument("--save-ply", action="store_true",
                         help="Save fused PLY files for all frames")
-    parser.add_argument("--debug-per-cam", action="store_true",
-                        help="Save per-camera PLY files (with --debug-one or --save-ply)")
+    parser.add_argument("--compress", action="store_true",
+                        help="Save voxels as sparse float16 (~50x smaller for typical occupancy)")
     parser.add_argument("--force", action="store_true",
                         help="Reprocess even if output already exists")
     parser.add_argument("--wandb-project", type=str, default="mimicgen-voxel-debug",
