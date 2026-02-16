@@ -625,8 +625,12 @@ def process_hdf5(args):
                 continue
 
         # Reset env to initial state
-        env.reset()
-        obs = env.reset_to(initial_state)
+        try:
+            env.reset()
+            obs = env.reset_to(initial_state)
+        except (ValueError, RuntimeError) as e:
+            tqdm.write(f"  [WARN] {ep}: env.reset_to failed ({e}), skipping demo")
+            continue
 
         # Get sim reference (for camera params)
         sim = get_sim(env)
