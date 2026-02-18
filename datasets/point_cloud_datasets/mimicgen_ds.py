@@ -76,6 +76,11 @@ class MimicGenVoxelDataset(Dataset):
         else:
             self.cache_dir = self.root
 
+        # Auto-detect voxel/ subdirectory (some pipelines nest demos under voxel_cache/voxel/)
+        voxel_sub = os.path.join(self.cache_dir, "voxel")
+        if os.path.isdir(voxel_sub) and glob.glob(os.path.join(voxel_sub, "demo_*")):
+            self.cache_dir = voxel_sub
+
         if not os.path.isdir(self.cache_dir):
             raise FileNotFoundError(f"Voxel cache not found: {self.cache_dir}")
 
@@ -324,6 +329,10 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
             suffix = self.task_cache_suffixes.get(task, self.default_cache_suffix)
             cache_name = f"voxel_cache{suffix}"
             cache_dir = os.path.join(self.root, f"{task}_d0", "core", cache_name)
+            # Auto-detect voxel/ subdirectory
+            voxel_sub = os.path.join(cache_dir, "voxel")
+            if os.path.isdir(voxel_sub) and glob.glob(os.path.join(voxel_sub, "demo_*")):
+                cache_dir = voxel_sub
             if not os.path.isdir(cache_dir):
                 print(f"[MimicGenMultiTaskVoxelDataset] Warning: cache not found for {task}: {cache_dir}")
                 continue

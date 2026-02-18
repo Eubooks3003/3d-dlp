@@ -4,7 +4,7 @@
   "modality": "point_cloud",
   "decoder_point_mode": "spawn",
   "voxel_mode": "avg_rgb",
-  "voxel_grid_whd": [64, 64, 64],
+  "voxel_grid_whd": [128, 128, 128],
   "points_per_object": 64,
   "points_bg": 256,
   "points_per_scale": [32, 64],
