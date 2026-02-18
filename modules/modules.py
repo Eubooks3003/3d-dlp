@@ -6153,7 +6153,7 @@ class DLPDecoder(nn.Module):
 
         self.num_obj_upsample = self.particle_dec.num_upsample # TODO:This never gets used
         # bg decoder
-        self.bg_dec = BgDecoder(cdim=cdim, image_size=48,
+        self.bg_dec = BgDecoder(cdim=cdim, image_size=image_size,
                                 pad_mode='replicate', learned_bg_feature_dim=learned_bg_feature_dim,
                                 use_resblock=use_resblock, context_dim=context_dim, film=decode_with_ctx,
                                 timestep_horizon=timestep_horizon,
@@ -6409,6 +6409,10 @@ class DLPDecoder(nn.Module):
         )
 
         bg_rec = self.bg_dec(z_bg_features, z_ctx)   # [B*, C_bg, *spatial*]
+
+        # Ensure bg_rec matches object spatial dims
+        if bg_rec.shape[-3:] != dec_objects_trans.shape[-3:]:
+            bg_rec = F.interpolate(bg_rec, size=dec_objects_trans.shape[-3:], mode="trilinear", align_corners=False)
 
         C_bg   = bg_rec.shape[1]
 

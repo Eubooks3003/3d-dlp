@@ -226,8 +226,7 @@ class MimicGenVoxelDataset(Dataset):
             else:
                 fg_mask = (vox.abs().sum(dim=0) > 0).to(torch.bool)
         else:
-            # Fallback: create empty mask if vox format unexpected
-            fg_mask = torch.zeros((64, 64, 64), dtype=torch.bool)
+            fg_mask = None
 
         task_str = self.task if self.task else "mimicgen"
         sample = {
@@ -494,7 +493,7 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
             else:
                 fg_mask = (vox.abs().sum(dim=0) > 0).to(torch.bool)
         else:
-            fg_mask = torch.zeros((64, 64, 64), dtype=torch.bool)
+            fg_mask = None
 
         sample = {
             "voxels": vox,
