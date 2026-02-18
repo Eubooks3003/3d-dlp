@@ -304,11 +304,15 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
         val_ratio: float = 0.1,
         seed: int = 42,
         max_demos_per_task: Optional[int] = None,
+        proportion: float = 1.0,
         device: Optional[torch.device] = None,
     ):
         self.root = os.path.abspath(root)
         self.split = split
         self.device = device
+        self.proportion = float(proportion)
+        if not (0.0 < self.proportion <= 1.0):
+            raise ValueError(f"proportion must be in (0,1], got {self.proportion}")
         self.task_cache_suffixes = task_cache_suffixes or {}
         self.default_cache_suffix = default_cache_suffix
 
@@ -351,6 +355,18 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
 
         if len(all_frames) == 0:
             raise RuntimeError(f"No voxel files found in any task cache")
+
+        # Per-task proportion downsampling (keep only p% of frames from each task)
+        if self.proportion < 1.0:
+            by_task = {}
+            for f in all_frames:
+                by_task.setdefault(f[0], []).append(f)
+            all_frames = []
+            for t in sorted(by_task):
+                frames_t = by_task[t]
+                n_keep = max(1, int(round(len(frames_t) * self.proportion)))
+                all_frames.extend(frames_t[:n_keep])
+                print(f"  - {t}: kept {n_keep}/{len(frames_t)} frames ({self.proportion:.0%})")
 
         print(f"[MimicGenMultiTaskVoxelDataset] Total: {len(all_frames)} frames across {len(self.task_cache_dirs)} tasks")
 

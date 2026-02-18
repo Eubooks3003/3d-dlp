@@ -36,6 +36,7 @@ def get_point_cloud_dataset(
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     seed: int = 42,
+    proportion: float = 1.0,
 ):
     """
     Generic getter for point-cloud datasets.
@@ -94,6 +95,7 @@ def get_point_cloud_dataset(
             val_ratio=val_ratio,
             seed=seed,
             max_demos_per_task=max_demos,
+            proportion=proportion,
             device=device,
         )
 
