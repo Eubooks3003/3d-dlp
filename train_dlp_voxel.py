@@ -175,6 +175,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     task = config.get("task", None)  # task name for mimicgen_voxel
     max_demos = config.get("max_demos", None)  # limit number of demos
     cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
+    proportion = config.get("proportion", 1.0)
 
     # Prior mode configuration
 
@@ -186,6 +187,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         task=task,
         max_demos=max_demos,
         cache_suffix=cache_suffix,
+        proportion=proportion,
     )
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
@@ -199,6 +201,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         task=task,
         max_demos=max_demos,
         cache_suffix=cache_suffix,
+        proportion=proportion,
     )
 
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
