@@ -1253,7 +1253,9 @@ def evaluate_validation_voxel(
     """
     from utils.loss_functions import calc_reconstruction_loss
 
-    model.eval()
+    # Stay in train mode: BatchNorm running stats may not be calibrated yet,
+    # causing Beta distribution overflow.  torch.no_grad() already skips autograd.
+    model.train()
 
     if recon_loss_func is None:
         recon_loss_func = calc_reconstruction_loss
