@@ -60,14 +60,16 @@ class MimicGenVoxelDataset(Dataset):
         max_demos: Optional[int] = None,  # limit number of demos (not frames)
         cache_suffix: str = "",           # e.g., "_debug" for voxel_cache_debug
         device: Optional[torch.device] = None,
-        kmeans_cache_dir: Optional[str] = None,
+        precompute_kmeans: bool = False,
+        kmeans_cache_dir: Optional[str] = None,  # deprecated, use precompute_kmeans
     ):
         self.root = os.path.abspath(root)
         self.task = task
         self.split = split
         self.max_demos = max_demos
         self.device = device
-        self.kmeans_cache_dir = kmeans_cache_dir
+        self.precompute_kmeans = precompute_kmeans
+        self.kmeans_cache_dir = kmeans_cache_dir  # legacy flat-index fallback
 
         # Build cache directory path
         # If task is provided: {root}/{task}_d0/core/voxel_cache{suffix}/
@@ -75,8 +77,13 @@ class MimicGenVoxelDataset(Dataset):
         if task is not None:
             cache_name = f"voxel_cache{cache_suffix}"
             self.cache_dir = os.path.join(self.root, f"{task}_d0", "core", cache_name)
+            if precompute_kmeans:
+                kmeans_name = f"kmeans_cache{cache_suffix}"
+                self.kmeans_dir = os.path.join(self.root, f"{task}_d0", "core", kmeans_name)
         else:
             self.cache_dir = self.root
+            if precompute_kmeans:
+                self.kmeans_dir = os.path.join(self.root, "kmeans_cache")
 
         # Auto-detect voxel/ subdirectory (some pipelines nest demos under voxel_cache/voxel/)
         voxel_sub = os.path.join(self.cache_dir, "voxel")
@@ -201,6 +208,22 @@ class MimicGenVoxelDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
+    def get_kmeans_path(self, idx: int) -> Optional[str]:
+        """Return the on-disk path for precomputed kmeans for item *idx*."""
+        if self.precompute_kmeans and hasattr(self, "kmeans_dir"):
+            demo_idx, frame_idx = self.items[idx][0], self.items[idx][1]
+            return os.path.join(self.kmeans_dir, f"demo_{demo_idx}", f"frame{frame_idx}_kmeans.pt")
+        if self.kmeans_cache_dir is not None:
+            return os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+        return None
+
+    def _load_kmeans_into_meta(self, idx: int, meta: dict):
+        km_path = self.get_kmeans_path(idx)
+        if km_path is not None and os.path.exists(km_path):
+            km = torch.load(km_path, map_location="cpu")
+            meta["kmeans_kp"] = km["kp"]    # [K, 3]
+            meta["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+
     def __getitem__(self, idx: int) -> Dict[str, object]:
         demo_idx, frame_idx, vox_path, meta_path, extras_path = self.items[idx]
 
@@ -212,8 +235,6 @@ class MimicGenVoxelDataset(Dataset):
             meta = torch.load(meta_path)
         except FileNotFoundError:
             meta = {}
-
-        # Skip loading extras - contains raw points (~100KB), not needed for training
 
         # Move to device if specified
         if self.device is not None:
@@ -230,13 +251,7 @@ class MimicGenVoxelDataset(Dataset):
         else:
             fg_mask = None
 
-        # load precomputed kmeans cache if available
-        if self.kmeans_cache_dir is not None:
-            km_path = os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
-            if os.path.exists(km_path):
-                km = torch.load(km_path, map_location="cpu")
-                meta["kmeans_kp"] = km["kp"]    # [K, 3]
-                meta["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+        self._load_kmeans_into_meta(idx, meta)
 
         task_str = self.task if self.task else "mimicgen"
         sample = {
@@ -315,12 +330,14 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
         max_demos_per_task: Optional[int] = None,
         proportion: float = 1.0,
         device: Optional[torch.device] = None,
-        kmeans_cache_dir: Optional[str] = None,
+        precompute_kmeans: bool = False,
+        kmeans_cache_dir: Optional[str] = None,  # deprecated, use precompute_kmeans
     ):
         self.root = os.path.abspath(root)
         self.split = split
         self.device = device
-        self.kmeans_cache_dir = kmeans_cache_dir
+        self.precompute_kmeans = precompute_kmeans
+        self.kmeans_cache_dir = kmeans_cache_dir  # legacy flat-index fallback
         self.proportion = float(proportion)
         if not (0.0 < self.proportion <= 1.0):
             raise ValueError(f"proportion must be in (0,1], got {self.proportion}")
@@ -355,6 +372,16 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
 
         if len(self.task_cache_dirs) == 0:
             raise RuntimeError(f"No valid voxel caches found for any task in {self.root}")
+
+        # Per-task kmeans cache dirs (sibling of voxel_cache under core/)
+        self.task_kmeans_dirs: Dict[str, str] = {}
+        if precompute_kmeans:
+            for task in self.task_cache_dirs:
+                suffix = self.task_cache_suffixes.get(task, self.default_cache_suffix)
+                kmeans_name = f"kmeans_cache{suffix}"
+                self.task_kmeans_dirs[task] = os.path.join(
+                    self.root, f"{task}_d0", "core", kmeans_name
+                )
 
         # Discover all frames from all tasks
         # Format: (task, demo_idx, frame_idx, vox_path, meta_path)
@@ -480,6 +507,24 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
+    def get_kmeans_path(self, idx: int) -> Optional[str]:
+        """Return the on-disk path for precomputed kmeans for item *idx*."""
+        task, demo_idx, frame_idx = self.items[idx][0], self.items[idx][1], self.items[idx][2]
+        if self.precompute_kmeans and task in self.task_kmeans_dirs:
+            return os.path.join(
+                self.task_kmeans_dirs[task], f"demo_{demo_idx}", f"frame{frame_idx}_kmeans.pt"
+            )
+        if self.kmeans_cache_dir is not None:
+            return os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+        return None
+
+    def _load_kmeans_into_meta(self, idx: int, meta: dict):
+        km_path = self.get_kmeans_path(idx)
+        if km_path is not None and os.path.exists(km_path):
+            km = torch.load(km_path, map_location="cpu")
+            meta["kmeans_kp"] = km["kp"]    # [K, 3]
+            meta["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+
     def __getitem__(self, idx: int) -> Dict[str, object]:
         task, demo_idx, frame_idx, vox_path, meta_path = self.items[idx]
 
@@ -507,13 +552,7 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
         else:
             fg_mask = None
 
-        # load precomputed kmeans cache if available
-        if self.kmeans_cache_dir is not None:
-            km_path = os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
-            if os.path.exists(km_path):
-                km = torch.load(km_path, map_location="cpu")
-                meta["kmeans_kp"] = km["kp"]    # [K, 3]
-                meta["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+        self._load_kmeans_into_meta(idx, meta)
 
         sample = {
             "voxels": vox,

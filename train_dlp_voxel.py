@@ -27,21 +27,37 @@ torch.backends.cudnn.deterministic = True
 
 
 @torch.no_grad()
-def precompute_kmeans_cache(dataset, prior_module, cache_dir):
+def precompute_kmeans_cache(dataset, prior_module, cache_dir=None):
     """
     Iterate over dataset on CPU, run the DLPPrior's kmeans for each sample,
-    and save {idx:06d}_kmeans.pt files to cache_dir.
-    Skips samples that already have a cached file.
+    and save the results to disk.
+
+    Path resolution (in priority order):
+      1. dataset.get_kmeans_path(idx) — per-task/demo/frame paths (mimicgen)
+      2. cache_dir/{idx:06d}_kmeans.pt  — flat-index fallback (other datasets)
+
+    Skips samples whose cache file already exists.
     Returns the number of newly computed samples.
     """
-    os.makedirs(cache_dir, exist_ok=True)
+    use_method = hasattr(dataset, "get_kmeans_path")
+    if not use_method and cache_dir is None:
+        return 0
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+
     device_orig = next(prior_module.parameters()).device
     prior_module = prior_module.cpu().eval()
     n_new = 0
     for idx in tqdm(range(len(dataset)), desc="Precomputing kmeans cache"):
-        out_path = os.path.join(cache_dir, f"{idx:06d}_kmeans.pt")
-        if os.path.exists(out_path):
+        if use_method:
+            out_path = dataset.get_kmeans_path(idx)
+        else:
+            out_path = os.path.join(cache_dir, f"{idx:06d}_kmeans.pt")
+
+        if out_path is None or os.path.exists(out_path):
             continue
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
         sample = dataset[idx]
         x = sample["voxels"].unsqueeze(0).float()  # [1, C, D, H, W]
         kp, cov = prior_module.encode_prior(x)      # [1, K, 3], [1, K, 3, 3]
@@ -203,12 +219,13 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     proportion = config.get("proportion", 1.0)
 
     # -------------------------------------------------
-    # KMEANS CACHE DIR (determined early, before datasets)
+    # KMEANS CACHING
     # -------------------------------------------------
+    precompute_kmeans = config.get("precompute_kmeans", False)
+    # Flat-index fallback for non-mimicgen datasets (VoxelizedDataset, RealWorldVoxelDataset)
     kmeans_cache_base = config.get("kmeans_cache_dir", None)
-    if kmeans_cache_base is None and voxel_root is not None:
+    if kmeans_cache_base is None and voxel_root is not None and not precompute_kmeans:
         kmeans_cache_base = os.path.join(voxel_root, "kmeans_cache")
-
     kmeans_train_dir = os.path.join(kmeans_cache_base, "train") if kmeans_cache_base else None
     kmeans_val_dir = os.path.join(kmeans_cache_base, "val") if kmeans_cache_base else None
 
@@ -221,6 +238,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         max_demos=max_demos,
         cache_suffix=cache_suffix,
         proportion=proportion,
+        precompute_kmeans=precompute_kmeans,
         kmeans_cache_dir=kmeans_train_dir,
     )
 
@@ -236,6 +254,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         max_demos=max_demos,
         cache_suffix=cache_suffix,
         proportion=proportion,
+        precompute_kmeans=precompute_kmeans,
         kmeans_cache_dir=kmeans_val_dir,
     )
 
@@ -312,10 +331,10 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     # -------------------------------------------------
     # OFFLINE KMEANS CACHE
     # -------------------------------------------------
-    if kmeans_cache_base:
-        print(f"[kmeans] Precomputing kmeans cache to {kmeans_cache_base} ...")
-        n_new = precompute_kmeans_cache(dataset, model.prior_module, kmeans_train_dir)
-        n_new += precompute_kmeans_cache(val_dataset, model.prior_module, kmeans_val_dir)
+    if precompute_kmeans or kmeans_cache_base:
+        print(f"[kmeans] Precomputing kmeans cache ...")
+        n_new = precompute_kmeans_cache(dataset, model.prior_module, cache_dir=kmeans_train_dir)
+        n_new += precompute_kmeans_cache(val_dataset, model.prior_module, cache_dir=kmeans_val_dir)
         print(f"[kmeans] Done ({n_new} newly computed)")
 
     model_info = model.info()

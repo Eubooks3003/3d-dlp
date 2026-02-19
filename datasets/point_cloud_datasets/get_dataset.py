@@ -28,7 +28,8 @@ def get_point_cloud_dataset(
     max_items: Optional[int] = None,     # max items to read from cache (None = no limit)
     device=None,
     # --- kmeans caching ---
-    kmeans_cache_dir: Optional[str] = None,  # path to precomputed kmeans cache
+    precompute_kmeans: bool = False,         # enable per-item kmeans caching (mimicgen)
+    kmeans_cache_dir: Optional[str] = None,  # flat-index kmeans cache (non-mimicgen)
     # --- mimicgen specific ---
     task: Optional[str] = None,          # for mimicgen_voxel: single task name
     tasks: Optional[List[str]] = None,   # for mimicgen multi-task: list of task names or None for auto-discover
@@ -79,6 +80,7 @@ def get_point_cloud_dataset(
             max_demos=max_demos,
             cache_suffix=cache_suffix,
             device=device,
+            precompute_kmeans=precompute_kmeans,
             kmeans_cache_dir=kmeans_cache_dir,
         )
 
@@ -100,6 +102,7 @@ def get_point_cloud_dataset(
             max_demos_per_task=max_demos,
             proportion=proportion,
             device=device,
+            precompute_kmeans=precompute_kmeans,
             kmeans_cache_dir=kmeans_cache_dir,
         )
 

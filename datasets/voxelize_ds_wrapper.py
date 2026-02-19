@@ -326,14 +326,19 @@ class VoxelizedDataset(Dataset):
             return min(base_len, self.max_items)
         return base_len
 
+    def get_kmeans_path(self, idx: int):
+        """Return the on-disk path for precomputed kmeans for item *idx*."""
+        if self.kmeans_cache_dir is not None:
+            return os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+        return None
+
     def _load_kmeans(self, idx, md):
         """Load precomputed kmeans cache into meta dict if available."""
-        if self.kmeans_cache_dir is not None:
-            km_path = os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
-            if os.path.exists(km_path):
-                km = torch.load(km_path, map_location="cpu")
-                md["kmeans_kp"] = km["kp"]    # [K, 3]
-                md["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+        km_path = self.get_kmeans_path(idx)
+        if km_path is not None and os.path.exists(km_path):
+            km = torch.load(km_path, map_location="cpu")
+            md["kmeans_kp"] = km["kp"]    # [K, 3]
+            md["kmeans_cov"] = km["cov"]   # [K, 3, 3]
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Lazy load (separate run)
