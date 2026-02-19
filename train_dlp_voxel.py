@@ -26,6 +26,31 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
 
+@torch.no_grad()
+def precompute_kmeans_cache(dataset, prior_module, cache_dir):
+    """
+    Iterate over dataset on CPU, run the DLPPrior's kmeans for each sample,
+    and save {idx:06d}_kmeans.pt files to cache_dir.
+    Skips samples that already have a cached file.
+    Returns the number of newly computed samples.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    device_orig = next(prior_module.parameters()).device
+    prior_module = prior_module.cpu().eval()
+    n_new = 0
+    for idx in tqdm(range(len(dataset)), desc="Precomputing kmeans cache"):
+        out_path = os.path.join(cache_dir, f"{idx:06d}_kmeans.pt")
+        if os.path.exists(out_path):
+            continue
+        sample = dataset[idx]
+        x = sample["voxels"].unsqueeze(0).float()  # [1, C, D, H, W]
+        kp, cov = prior_module.encode_prior(x)      # [1, K, 3], [1, K, 3, 3]
+        torch.save({"kp": kp[0].cpu(), "cov": cov[0].cpu()}, out_path)
+        n_new += 1
+    prior_module.to(device_orig)
+    return n_new
+
+
 def _to_float_safe(x, default=None):
     if x is None:
         return default
@@ -177,7 +202,15 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
     proportion = config.get("proportion", 1.0)
 
-    # Prior mode configuration
+    # -------------------------------------------------
+    # KMEANS CACHE DIR (determined early, before datasets)
+    # -------------------------------------------------
+    kmeans_cache_base = config.get("kmeans_cache_dir", None)
+    if kmeans_cache_base is None and voxel_root is not None:
+        kmeans_cache_base = os.path.join(voxel_root, "kmeans_cache")
+
+    kmeans_train_dir = os.path.join(kmeans_cache_base, "train") if kmeans_cache_base else None
+    kmeans_val_dir = os.path.join(kmeans_cache_base, "val") if kmeans_cache_base else None
 
     dataset = get_point_cloud_dataset(
         ds, root, mode="train",
@@ -188,6 +221,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         max_demos=max_demos,
         cache_suffix=cache_suffix,
         proportion=proportion,
+        kmeans_cache_dir=kmeans_train_dir,
     )
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
@@ -202,6 +236,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         max_demos=max_demos,
         cache_suffix=cache_suffix,
         proportion=proportion,
+        kmeans_cache_dir=kmeans_val_dir,
     )
 
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
@@ -273,7 +308,16 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         depth_loss_ratio=depth_loss_ratio,
 
         ).to(device)
-        
+
+    # -------------------------------------------------
+    # OFFLINE KMEANS CACHE
+    # -------------------------------------------------
+    if kmeans_cache_base:
+        print(f"[kmeans] Precomputing kmeans cache to {kmeans_cache_base} ...")
+        n_new = precompute_kmeans_cache(dataset, model.prior_module, kmeans_train_dir)
+        n_new += precompute_kmeans_cache(val_dataset, model.prior_module, kmeans_val_dir)
+        print(f"[kmeans] Done ({n_new} newly computed)")
+
     model_info = model.info()
     # print(model_info)
     # prepare saving location
@@ -363,6 +407,7 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
             vox = batch["voxels"].to(device)
+            meta = batch.get("meta", None)
 
             warmup = (epoch < warmup_epoch)
             # forward pass
@@ -371,7 +416,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
-                                 beta_obj=beta_obj)
+                                 beta_obj=beta_obj,
+                                 meta=meta)
 
             # Compute & backprop
             all_losses = model_output['loss_dict']
