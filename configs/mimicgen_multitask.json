@@ -119,5 +119,6 @@
   "debug_stats": true,
   "debug_every": 200,
   "lambda_color": 500.0,
-  "proportion": 0.1
+  "proportion": 0.1,
+  "precompute_kmeans": true
 }
