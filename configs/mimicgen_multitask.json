@@ -1,6 +1,6 @@
 {
-  "ds": "mimicgen",
-  "root": "/home/ubuntu/pathaklab/data/mimicgen",
+  "ds": "mimicgen_multitask_voxel",
+  "root": "/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data",
   "modality": "point_cloud",
   "decoder_point_mode": "spawn",
   "voxel_mode": "avg_rgb",
@@ -9,7 +9,7 @@
   "points_bg": 256,
   "points_per_scale": [32, 64],
   "device": "cuda",
-  "batch_size": 4,
+  "batch_size": 8,
   "lr": 0.00008,
   "use_scheduler": false,
   "scheduler_gamma": 0.99,
@@ -41,7 +41,7 @@
   "beta_rec": 1.0,
   "kl_balance": 0.01,
   "beta_obj": 0.02,
-  "image_size": 64,
+  "image_size": 128,
   "ch": 3,
   "features_dist": "gauss",
   "learned_feature_dim": 4,
@@ -118,5 +118,6 @@
   "bg_weight": 0.1,
   "debug_stats": true,
   "debug_every": 200,
-  "lambda_color": 500.0
+  "lambda_color": 500.0,
+  "proportion": 0.1
 }
