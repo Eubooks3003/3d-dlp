@@ -820,7 +820,7 @@ class DLP(nn.Module):
         return self.prior_module(x)
 
     def encode_all(self, x, deterministic=False, warmup=False, actions=None, actions_mask=None, lang_embed=None,
-                   x_goal=None):
+                   x_goal=None, precomputed_prior=None):
         """
         encode posterior particles
         """
@@ -831,7 +831,8 @@ class DLP(nn.Module):
             # that means x: [bs, ch, h, w, l]
             x = x.unsqueeze(1)  # -> [bs, T=1, ch, h, w]]
         enc_dict = self.encoder_module(x, deterministic, warmup, actions=actions, actions_mask=actions_mask,
-                                       lang_embed=lang_embed, x_goal=x_goal)
+                                       lang_embed=lang_embed, x_goal=x_goal,
+                                       precomputed_prior=precomputed_prior)
         cropped_objects = enc_dict['cropped_objects']
         enc_dict['cropped_objects_rgb'] = cropped_objects
         return enc_dict
@@ -1118,7 +1119,7 @@ class DLP(nn.Module):
     def forward(self, x, deterministic=False, warmup=False, with_loss=False, beta_kl=0.1, beta_dyn=0.1,
                 beta_rec=1.0, kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
                 balance=0.5, beta_dyn_rec=1.0, num_static=None, actions=None, actions_mask=None, lang_embed=None,
-                beta_obj=0.0, done_mask=None, x_goal=None):
+                beta_obj=0.0, done_mask=None, x_goal=None, meta=None):
         if len(x.shape) == 5:
             # x: [bs, ch, h, w, l]
             batch_size = x.size(0)
@@ -1128,10 +1129,15 @@ class DLP(nn.Module):
             # x: [bs, T + 1, ch, h, w, l]
             batch_size, timestep_horizon = x.size(0), x.size(1)
 
+        # extract precomputed kmeans prior from meta if available
+        precomputed_prior = None
+        if meta is not None and 'kmeans_kp' in meta and 'kmeans_cov' in meta:
+            precomputed_prior = (meta['kmeans_kp'].to(x.device), meta['kmeans_cov'].to(x.device))
 
         # encode particles
         enc_dict = self.encode_all(x, deterministic, warmup=warmup, actions=actions, actions_mask=actions_mask,
-                                   lang_embed=lang_embed, x_goal=x_goal)
+                                   lang_embed=lang_embed, x_goal=x_goal,
+                                   precomputed_prior=precomputed_prior)
 
         # unpack encoder output: [bs, T, ...]
         kp_p = enc_dict['kp_p']

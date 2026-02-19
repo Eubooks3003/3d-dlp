@@ -55,10 +55,12 @@ class RealWorldVoxelDataset(Dataset):
         include_augmented: bool = False,
         cache_suffix: str = "",                   # e.g., "_debug" for voxel_cache_debug
         device: Optional[torch.device] = None,
+        kmeans_cache_dir: Optional[str] = None,
     ):
         self.root = os.path.abspath(root)
         self.split = split
         self.device = device
+        self.kmeans_cache_dir = kmeans_cache_dir
         self.include_augmented = include_augmented
 
         # Use root directly as cache directory
@@ -220,8 +222,17 @@ class RealWorldVoxelDataset(Dataset):
         else:
             fg_mask = torch.zeros((64, 64, 64), dtype=torch.bool)
 
+        # load precomputed kmeans cache if available
+        if self.kmeans_cache_dir is not None:
+            km_path = os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+            if os.path.exists(km_path):
+                km = torch.load(km_path, map_location="cpu")
+                meta["kmeans_kp"] = km["kp"]    # [K, 3]
+                meta["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+
         sample = {
             "voxels": vox,                          # [C, D, H, W]
+            "meta": meta,
             "fg_mask": fg_mask,                     # [D, H, W] bool
         }
         return sample

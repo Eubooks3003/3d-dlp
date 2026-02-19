@@ -60,12 +60,14 @@ class MimicGenVoxelDataset(Dataset):
         max_demos: Optional[int] = None,  # limit number of demos (not frames)
         cache_suffix: str = "",           # e.g., "_debug" for voxel_cache_debug
         device: Optional[torch.device] = None,
+        kmeans_cache_dir: Optional[str] = None,
     ):
         self.root = os.path.abspath(root)
         self.task = task
         self.split = split
         self.max_demos = max_demos
         self.device = device
+        self.kmeans_cache_dir = kmeans_cache_dir
 
         # Build cache directory path
         # If task is provided: {root}/{task}_d0/core/voxel_cache{suffix}/
@@ -228,6 +230,14 @@ class MimicGenVoxelDataset(Dataset):
         else:
             fg_mask = None
 
+        # load precomputed kmeans cache if available
+        if self.kmeans_cache_dir is not None:
+            km_path = os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+            if os.path.exists(km_path):
+                km = torch.load(km_path, map_location="cpu")
+                meta["kmeans_kp"] = km["kp"]    # [K, 3]
+                meta["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+
         task_str = self.task if self.task else "mimicgen"
         sample = {
             "voxels": vox,                          # [C, D, H, W]
@@ -305,10 +315,12 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
         max_demos_per_task: Optional[int] = None,
         proportion: float = 1.0,
         device: Optional[torch.device] = None,
+        kmeans_cache_dir: Optional[str] = None,
     ):
         self.root = os.path.abspath(root)
         self.split = split
         self.device = device
+        self.kmeans_cache_dir = kmeans_cache_dir
         self.proportion = float(proportion)
         if not (0.0 < self.proportion <= 1.0):
             raise ValueError(f"proportion must be in (0,1], got {self.proportion}")
@@ -494,6 +506,14 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
                 fg_mask = (vox.abs().sum(dim=0) > 0).to(torch.bool)
         else:
             fg_mask = None
+
+        # load precomputed kmeans cache if available
+        if self.kmeans_cache_dir is not None:
+            km_path = os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+            if os.path.exists(km_path):
+                km = torch.load(km_path, map_location="cpu")
+                meta["kmeans_kp"] = km["kp"]    # [K, 3]
+                meta["kmeans_cov"] = km["cov"]   # [K, 3, 3]
 
         sample = {
             "voxels": vox,

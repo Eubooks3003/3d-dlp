@@ -1274,6 +1274,7 @@ def evaluate_validation_voxel(
 
     for batch in val_dataloader:
         vox = batch["voxels"].to(device)
+        meta = batch.get("meta", None)
 
         model_output = model(
             vox,
@@ -1285,6 +1286,7 @@ def evaluate_validation_voxel(
             recon_loss_type=recon_loss_type,
             recon_loss_func=recon_loss_func,
             beta_obj=beta_obj,
+            meta=meta,
         )
 
         loss_dict = model_output['loss_dict']

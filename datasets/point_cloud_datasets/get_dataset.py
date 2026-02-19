@@ -27,6 +27,8 @@ def get_point_cloud_dataset(
     force_rebuild: bool = False,
     max_items: Optional[int] = None,     # max items to read from cache (None = no limit)
     device=None,
+    # --- kmeans caching ---
+    kmeans_cache_dir: Optional[str] = None,  # path to precomputed kmeans cache
     # --- mimicgen specific ---
     task: Optional[str] = None,          # for mimicgen_voxel: single task name
     tasks: Optional[List[str]] = None,   # for mimicgen multi-task: list of task names or None for auto-discover
@@ -77,6 +79,7 @@ def get_point_cloud_dataset(
             max_demos=max_demos,
             cache_suffix=cache_suffix,
             device=device,
+            kmeans_cache_dir=kmeans_cache_dir,
         )
 
     # --- MimicGen MULTI-TASK precomputed voxel cache ---
@@ -97,6 +100,7 @@ def get_point_cloud_dataset(
             max_demos_per_task=max_demos,
             proportion=proportion,
             device=device,
+            kmeans_cache_dir=kmeans_cache_dir,
         )
 
     # --- Real-world tabletop voxel cache (from preprocess_realworld_voxels.py) ---
@@ -115,6 +119,7 @@ def get_point_cloud_dataset(
             include_augmented=False,  # can be added as param if needed
             cache_suffix=cache_suffix,
             device=device,
+            kmeans_cache_dir=kmeans_cache_dir,
         )
 
     if ds_key in ("to","to-scene","to_scene"):
@@ -134,6 +139,7 @@ def get_point_cloud_dataset(
                 cache_extras=cache_extras,
                 force_rebuild=force_rebuild,
                 max_items=max_items,
+                kmeans_cache_dir=kmeans_cache_dir,
             )
         return base
 
@@ -178,6 +184,7 @@ def get_point_cloud_dataset(
                 cache_extras=cache_extras,
                 force_rebuild=force_rebuild,
                 max_items=max_items,
+                kmeans_cache_dir=kmeans_cache_dir,
             )
         return base
 
@@ -212,6 +219,7 @@ def get_point_cloud_dataset(
                 cache_dir=cache_dir,
                 cache_extras=cache_extras,
                 force_rebuild=force_rebuild,
+                kmeans_cache_dir=kmeans_cache_dir,
                 max_items=max_items,
             )
         return base
@@ -254,6 +262,7 @@ def get_point_cloud_dataset(
                 cache_extras=cache_extras,
                 force_rebuild=force_rebuild,
                 max_items=max_items,
+                kmeans_cache_dir=kmeans_cache_dir,
             )
         return base
 

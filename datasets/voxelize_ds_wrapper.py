@@ -156,7 +156,8 @@ class VoxelizedDataset(Dataset):
                  cache_dir: Optional[str] = None,
                  cache_extras: bool = False,
                  force_rebuild: bool = False,
-                 max_items: Optional[int] = None):
+                 max_items: Optional[int] = None,
+                 kmeans_cache_dir: Optional[str] = None):
        # --- inside VoxelizedDataset.__init__ ---
 
         self.base_ds = base_ds
@@ -167,6 +168,7 @@ class VoxelizedDataset(Dataset):
         self.cache_dir = cache_dir
         self.cache_extras = bool(cache_extras)
         self.max_items = max_items  # None means no limit
+        self.kmeans_cache_dir = kmeans_cache_dir
 
         # Prepare manifest path (if any)
         mani_path = os.path.join(self.cache_dir, "manifest.json") if self.cache_dir else None
@@ -324,6 +326,15 @@ class VoxelizedDataset(Dataset):
             return min(base_len, self.max_items)
         return base_len
 
+    def _load_kmeans(self, idx, md):
+        """Load precomputed kmeans cache into meta dict if available."""
+        if self.kmeans_cache_dir is not None:
+            km_path = os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+            if os.path.exists(km_path):
+                km = torch.load(km_path, map_location="cpu")
+                md["kmeans_kp"] = km["kp"]    # [K, 3]
+                md["kmeans_cov"] = km["cov"]   # [K, 3, 3]
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Lazy load (separate run)
         if self.cache_dir and self._use_cache and not hasattr(self, "_voxels"):
@@ -335,6 +346,8 @@ class VoxelizedDataset(Dataset):
             for k in ("pmin","pmax","voxel_size"):
                 if k in md and torch.is_tensor(md[k]):
                     md[k] = md[k].to(self.device)
+
+            self._load_kmeans(idx, md)
 
             out = {}
 
@@ -365,5 +378,16 @@ class VoxelizedDataset(Dataset):
                 out[k] = v
             out["voxels"] = vox.to(self.device)
             out["meta"]   = md
+            return out
+
+        # In-memory path (built in this process)
+        if hasattr(self, "_voxels"):
+            vox = self._voxels[idx]
+            md = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in self._metas[idx].items()}
+            self._load_kmeans(idx, md)
+            out = {"voxels": vox, "meta": md}
+            extra = self._pass[idx]
+            for k, v in extra.items():
+                out[k] = v
             return out
 

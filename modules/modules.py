@@ -3843,10 +3843,16 @@ class DLPPrior(nn.Module):
     def zyx_to_xyz(self, v):  # [...,3]
         return torch.stack([v[..., 2], v[..., 1], v[..., 0]], dim=-1)
 
-    def encode_prior(self, x, filtering_heuristic='none', k=None):
+    def encode_prior(self, x, filtering_heuristic='none', k=None,
+                     precomputed_prior=None):
         """
         x: [B, C, D, H, W]  (D=z, H=y, W=x)
+        precomputed_prior: optional (kp, cov) tuple from offline kmeans cache
         """
+        if precomputed_prior is not None:
+            kp, cov = precomputed_prior
+            return kp.to(x.device, x.dtype), cov.to(x.device, x.dtype)
+
         B, C, D, H, W = x.shape
         assert (D, H, W) == self.volume_size, f"got {(D,H,W)}, expected {self.volume_size}"
 
@@ -3904,8 +3910,9 @@ class DLPPrior(nn.Module):
         b = torch.arange(B, device=x.device)[:, None]
         return kp_global_xyz.view(B, -1, 3)[b, idx], cov_global.view(B, -1, 3, 3)[b, idx]
 
-    def forward(self, x):
-        return self.encode_prior(x, filtering_heuristic=self.filtering_heuristic)
+    def forward(self, x, precomputed_prior=None):
+        return self.encode_prior(x, filtering_heuristic=self.filtering_heuristic,
+                                 precomputed_prior=precomputed_prior)
 
 
 
@@ -4936,14 +4943,15 @@ class ParticleEncoder(nn.Module):
         #         if conv1.bias is not None and conv3.bias is not None:
         #             conv3.bias.copy_(conv1.bias)
 
-    def encode_prior(self, x):
-        return self.prior_encoder(x)
+    def encode_prior(self, x, precomputed_prior=None):
+        return self.prior_encoder(x, precomputed_prior=precomputed_prior)
 
-    def encode_pos_scale_with_prior(self, x, deterministic=False, warmup=False, timesteps=None):
+    def encode_pos_scale_with_prior(self, x, deterministic=False, warmup=False, timesteps=None,
+                                    precomputed_prior=None):
         batch_size, ch, d, h, w = x.shape
 
         # prior now returns (x,y,z) and full covariance
-        kp_p, cov_kp = self.encode_prior(x)  # kp_p: [B, n_kp_prior, 3], cov_kp: [B, n_kp_prior, 3, 3]
+        kp_p, cov_kp = self.encode_prior(x, precomputed_prior=precomputed_prior)  # kp_p: [B, n_kp_prior, 3], cov_kp: [B, n_kp_prior, 3, 3]
         
         # kp_init: [B, n_kp_prior, 3] in [-1, 1]
         kp_init = kp_p
@@ -5174,7 +5182,7 @@ class ParticleEncoder(nn.Module):
         }
 
 
-    def encode_all(self, x, deterministic=False, warmup=False):
+    def encode_all(self, x, deterministic=False, warmup=False, precomputed_prior=None):
         # make sure x is [bs, T, ch, h, w, l]
         if x.dim() == 5:
             # x: [B, C, D, H, W]  -> add T=1
@@ -5183,9 +5191,17 @@ class ParticleEncoder(nn.Module):
         bs, timestep_horizon, ch, D, H, W = x.shape  # DHW (z,y,x)
         x = x.view(bs * timestep_horizon, ch, D, H, W)  # [B*T, C, D, H, W]
 
+        # repeat precomputed_prior along T if needed
+        if precomputed_prior is not None and timestep_horizon > 1:
+            kp_pre, cov_pre = precomputed_prior
+            kp_pre = kp_pre.unsqueeze(1).expand(-1, timestep_horizon, -1, -1).reshape(bs * timestep_horizon, *kp_pre.shape[1:])
+            cov_pre = cov_pre.unsqueeze(1).expand(-1, timestep_horizon, -1, -1, -1).reshape(bs * timestep_horizon, *cov_pre.shape[1:])
+            precomputed_prior = (kp_pre, cov_pre)
+
         # ---- stage 1: positions & scales (DHW throughout) ----
         stage1_dict = self.encode_pos_scale_with_prior(
-            x, deterministic=deterministic, warmup=warmup, timesteps=timestep_horizon
+            x, deterministic=deterministic, warmup=warmup, timesteps=timestep_horizon,
+            precomputed_prior=precomputed_prior
         )
 
         # --- unpack ---
@@ -5316,8 +5332,8 @@ class ParticleEncoder(nn.Module):
         return encode_dict
 
 
-    def forward(self, x, deterministic=False, warmup=False):
-        output_dict = self.encode_all(x, deterministic, warmup)
+    def forward(self, x, deterministic=False, warmup=False, precomputed_prior=None):
+        output_dict = self.encode_all(x, deterministic, warmup, precomputed_prior=precomputed_prior)
         return output_dict
 
 
@@ -5758,7 +5774,7 @@ class DLPEncoder(nn.Module):
 
         return bg_mask
     def encode_all(self, x, deterministic=False, warmup=False, actions=None, actions_mask=None, lang_embed=None,
-                x_goal=None, deterministic_goal=True):
+                x_goal=None, deterministic_goal=True, precomputed_prior=None):
         """
         encoding steps:
         1. encode bg: x -> bg_enc -> [bs * T, projection_dim]
@@ -5777,7 +5793,7 @@ class DLPEncoder(nn.Module):
             x = torch.cat([x, x_goal], dim=1)  # [bs, T+1, ...]
 
         # encode particles +++++++
-        particle_dict = self.particle_enc(x, deterministic, warmup)
+        particle_dict = self.particle_enc(x, deterministic, warmup, precomputed_prior=precomputed_prior)
 
         kp_p              = particle_dict['kp_p']
         cov_kp            = particle_dict['cov_kp']        # full [bs,T,n_kp,3,3]
@@ -5996,9 +6012,10 @@ class DLPEncoder(nn.Module):
         return encode_dict
 
     def forward(self, x, deterministic=False, warmup=False, actions=None, actions_mask=None, lang_embed=None,
-                x_goal=None):
+                x_goal=None, precomputed_prior=None):
         output_dict = self.encode_all(x, deterministic, warmup, actions=actions, actions_mask=actions_mask,
-                                      lang_embed=lang_embed, x_goal=x_goal)
+                                      lang_embed=lang_embed, x_goal=x_goal,
+                                      precomputed_prior=precomputed_prior)
         return output_dict
 
 
