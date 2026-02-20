@@ -518,74 +518,74 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
 
         # ------- VALIDATION -------
-        if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
-            print(f"\n[Validation] Running validation at epoch {epoch}...")
+        # if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
+        #     print(f"\n[Validation] Running validation at epoch {epoch}...")
 
-            # Run validation
-            val_results = evaluate_validation_voxel(
-                model=model,
-                val_dataloader=val_dataloader,
-                device=device,
-                config=config,
-                epoch=epoch,
-                recon_loss_func=recon_loss_func,
-                beta_kl=beta_kl,
-                beta_rec=beta_rec,
-                beta_obj=beta_obj,
-                kl_balance=kl_balance,
-                lambda_color=lambda_color,
-                recon_loss_type=recon_loss_type,
-                fig_dir=fig_dir,
-                save_visuals=True,
-                topk=topk,
-                iteration=iteration,
-            )
+        #     # Run validation
+        #     val_results = evaluate_validation_voxel(
+        #         model=model,
+        #         val_dataloader=val_dataloader,
+        #         device=device,
+        #         config=config,
+        #         epoch=epoch,
+        #         recon_loss_func=recon_loss_func,
+        #         beta_kl=beta_kl,
+        #         beta_rec=beta_rec,
+        #         beta_obj=beta_obj,
+        #         kl_balance=kl_balance,
+        #         lambda_color=lambda_color,
+        #         recon_loss_type=recon_loss_type,
+        #         fig_dir=fig_dir,
+        #         save_visuals=True,
+        #         topk=topk,
+        #         iteration=iteration,
+        #     )
 
-            # Store validation losses
-            val_losses.append(val_results.get('val_loss', 0.0))
-            val_losses_rec.append(val_results.get('val_loss_rec', 0.0))
-            val_losses_kl.append(val_results.get('val_kl', 0.0))
+        #     # Store validation losses
+        #     val_losses.append(val_results.get('val_loss', 0.0))
+        #     val_losses_rec.append(val_results.get('val_loss_rec', 0.0))
+        #     val_losses_kl.append(val_results.get('val_kl', 0.0))
 
-            # Log validation metrics - main metrics: Occ IoU + Masked Color PSNR (with std)
-            val_log_str = f"[Val] epoch {epoch:04d}"
-            if 'occ_iou' in val_results:
-                iou_str = f"{val_results['occ_iou']:.4f}"
-                if 'occ_iou_std' in val_results:
-                    iou_str += f" (±{val_results['occ_iou_std']:.4f})"
-                val_log_str += f" | IoU: {iou_str}"
-            if 'masked_color_psnr' in val_results:
-                psnr_str = f"{val_results['masked_color_psnr']:.2f}"
-                if 'masked_color_psnr_std' in val_results:
-                    psnr_str += f" (±{val_results['masked_color_psnr_std']:.2f})"
-                val_log_str += f" | PSNR: {psnr_str} dB"
-            val_log_str += f" | loss: {val_results.get('val_loss', 0.0):.4f}"
-            if 'val_loss_rec' in val_results:
-                val_log_str += f" | rec: {val_results['val_loss_rec']:.4f}"
-            if 'val_kl' in val_results:
-                val_log_str += f" | kl: {val_results['val_kl']:.4f}"
-            print(val_log_str)
-            log_line(log_dir, val_log_str)
+        #     # Log validation metrics - main metrics: Occ IoU + Masked Color PSNR (with std)
+        #     val_log_str = f"[Val] epoch {epoch:04d}"
+        #     if 'occ_iou' in val_results:
+        #         iou_str = f"{val_results['occ_iou']:.4f}"
+        #         if 'occ_iou_std' in val_results:
+        #             iou_str += f" (±{val_results['occ_iou_std']:.4f})"
+        #         val_log_str += f" | IoU: {iou_str}"
+        #     if 'masked_color_psnr' in val_results:
+        #         psnr_str = f"{val_results['masked_color_psnr']:.2f}"
+        #         if 'masked_color_psnr_std' in val_results:
+        #             psnr_str += f" (±{val_results['masked_color_psnr_std']:.2f})"
+        #         val_log_str += f" | PSNR: {psnr_str} dB"
+        #     val_log_str += f" | loss: {val_results.get('val_loss', 0.0):.4f}"
+        #     if 'val_loss_rec' in val_results:
+        #         val_log_str += f" | rec: {val_results['val_loss_rec']:.4f}"
+        #     if 'val_kl' in val_results:
+        #         val_log_str += f" | kl: {val_results['val_kl']:.4f}"
+        #     print(val_log_str)
+        #     log_line(log_dir, val_log_str)
 
-            # Add validation metrics to epoch log dict (don't log separately)
-            epoch_log_dict.update({f"val/{k}": v for k, v in val_results.items()})
+        #     # Add validation metrics to epoch log dict (don't log separately)
+        #     epoch_log_dict.update({f"val/{k}": v for k, v in val_results.items()})
 
-            # Plot and save loss curves
-            loss_curve_path = os.path.join(fig_dir, f"loss_curves_epoch{epoch:04d}.png")
-            plot_loss_curves(
-                train_losses=losses,
-                val_losses=val_losses,
-                train_losses_rec=losses_rec,
-                val_losses_rec=val_losses_rec,
-                train_losses_kl=losses_kl,
-                val_losses_kl=val_losses_kl,
-                save_path=loss_curve_path,
-                title=f"Training Progress - Epoch {epoch}",
-            )
+        #     # Plot and save loss curves
+        #     loss_curve_path = os.path.join(fig_dir, f"loss_curves_epoch{epoch:04d}.png")
+        #     plot_loss_curves(
+        #         train_losses=losses,
+        #         val_losses=val_losses,
+        #         train_losses_rec=losses_rec,
+        #         val_losses_rec=val_losses_rec,
+        #         train_losses_kl=losses_kl,
+        #         val_losses_kl=val_losses_kl,
+        #         save_path=loss_curve_path,
+        #         title=f"Training Progress - Epoch {epoch}",
+        #     )
 
-            # Add loss curves image to epoch log dict
-            epoch_log_dict["loss_curves"] = wandb.Image(loss_curve_path)
+        #     # Add loss curves image to epoch log dict
+        #     epoch_log_dict["loss_curves"] = wandb.Image(loss_curve_path)
 
-            model.train()  # Back to training mode
+        #     model.train()  # Back to training mode
 
         # Log all epoch metrics in a single call (avoids issues with multiple logs at same step)
         wandb.log(epoch_log_dict, step=iteration)
