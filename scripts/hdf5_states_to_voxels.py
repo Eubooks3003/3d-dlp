@@ -510,16 +510,13 @@ def process_hdf5(args):
         raise RuntimeError(f"Need at least 2 cameras, got: {chosen_cams}")
 
     # 4. Create env with depth enabled
-    env_meta_depth = deepcopy(env_meta)
-    env_meta_depth["env_kwargs"] = dict(env_meta_depth.get("env_kwargs", {}))
-    env_meta_depth["env_kwargs"]["camera_depths"] = [True] * len(chosen_cams)
-
     env = EnvUtils.create_env_for_data_processing(
-        env_meta=env_meta_depth,
+        env_meta=env_meta,
         camera_names=chosen_cams,
         camera_height=args.camera_height,
         camera_width=args.camera_width,
         reward_shaping=False,
+        use_depth_obs=True,
     )
 
     is_robosuite = EnvUtils.is_robosuite_env(env_meta)
