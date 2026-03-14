@@ -2,10 +2,10 @@
 set -e
 
 # ============ CONFIGURE THESE ============
-DATA_ROOT="/home/ellina/Desktop/data/3D-DLP-mimicgen-data"
-LPWM_DIR="/home/ellina/Desktop/lpwm-copy"
-DLP_CFG=""   # e.g. /path/to/hparams.json
-DLP_CKPT=""  # e.g. /path/to/saves/last.pt
+DATA_ROOT="/home/ubuntu/tal-lpwm-neurips-2026/data/3D-DLP-mimicgen-data"
+LPWM_DIR="/home/ubuntu/tal-lpwm-neurips-2026/ellina/lpwm-dev"
+DLP_CFG="${LPWM_DIR}/logs/010326_173829_mimicgen_multitask/hparams.json"
+DLP_CKPT="${LPWM_DIR}/logs/010326_173829_mimicgen_multitask/saves/best.pt"
 OUT_DIR="${DATA_ROOT}/preprocessed"
 
 BATCH=8
@@ -13,8 +13,28 @@ ACTION_MODE="relative"
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
 # =========================================
 
-if [[ -z "$DLP_CFG" || -z "$DLP_CKPT" ]]; then
-    echo "ERROR: Set DLP_CFG and DLP_CKPT in this script before running."
+# ---------- Debug mode ----------
+# Usage:  bash run_preprocess_all_tasks.sh --debug [NUM_SAMPLES] [WANDB_PROJECT]
+#   Runs encode->decode on the first available task, logs GT vs reconstruction
+#   to wandb, then exits. Good for verifying the checkpoint before a long run.
+DEBUG=0
+DEBUG_SAMPLES=3
+WANDB_PROJECT="ec-diffuser-debug"
+
+if [[ "$1" == "--debug" ]]; then
+    DEBUG=1
+    if [[ -n "$2" ]]; then DEBUG_SAMPLES="$2"; fi
+    if [[ -n "$3" ]]; then WANDB_PROJECT="$3"; fi
+fi
+# --------------------------------
+
+if [[ ! -f "$DLP_CFG" ]]; then
+    echo "ERROR: DLP_CFG not found at $DLP_CFG"
+    echo "  If hparams.json is elsewhere, update DLP_CFG in this script."
+    exit 1
+fi
+if [[ ! -f "$DLP_CKPT" ]]; then
+    echo "ERROR: DLP_CKPT not found at $DLP_CKPT"
     exit 1
 fi
 
@@ -36,6 +56,44 @@ TASKS=(
 mkdir -p "$OUT_DIR"
 cd "$LPWM_DIR"
 
+# ---------- Debug: run on first available task then exit ----------
+if [[ "$DEBUG" -eq 1 ]]; then
+    echo "========================================"
+    echo "  DEBUG MODE — encode/decode sanity check"
+    echo "  Samples: $DEBUG_SAMPLES | wandb project: $WANDB_PROJECT"
+    echo "========================================"
+
+    for TASK in "${TASKS[@]}"; do
+        H5="${DATA_ROOT}/core/${TASK}.hdf5"
+        VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
+
+        if [[ ! -f "$H5" ]]; then continue; fi
+        if [[ ! -d "$VOX_CACHE" ]]; then continue; fi
+
+        echo "  Using task: $TASK"
+        PYTHONPATH=. \
+        python -u scripts/ec_diffuser_voxel_preprocess.py \
+            --h5 "$H5" \
+            --voxel-cache-dir "$VOX_CACHE" \
+            --dlp-cfg "$DLP_CFG" \
+            --dlp-ckpt "$DLP_CKPT" \
+            --out-pkl "/dev/null" \
+            --action-mode "$ACTION_MODE" \
+            --batch "$BATCH" \
+            --device cuda \
+            --debug \
+            --debug-samples "$DEBUG_SAMPLES" \
+            --wandb-project "$WANDB_PROJECT"
+
+        echo "[DEBUG DONE] Check wandb project '$WANDB_PROJECT'"
+        exit 0
+    done
+
+    echo "ERROR: No task found with both H5 and voxel cache."
+    exit 1
+fi
+
+# ---------- Full preprocessing ----------
 for TASK in "${TASKS[@]}"; do
     H5="${DATA_ROOT}/core/${TASK}.hdf5"
     VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
