@@ -2,15 +2,23 @@
 """
 Fast parallel kmeans precomputation for all tasks.
 
-Splits work across GPUs and uses multiple workers per GPU to keep utilization high.
-Saves per-frame kmeans cache files that ec_diffuser_voxel_preprocess.py will pick up.
+Launches N worker processes per GPU, each with its own model replica +
+background I/O threads for voxel loading. On a GH200 (96GB), 4-8 workers
+on a single GPU keeps utilization high since per-frame kmeans uses <1GB.
 
-Usage:
-    python scripts/precompute_kmeans.py \
+Usage (single GH200):
+    PYTHONPATH=. python scripts/precompute_kmeans.py \
         --data-root /path/to/3D-DLP-mimicgen-data \
-        --dlp-cfg /path/to/hparams.json \
+        --dlp-cfg  /path/to/hparams.json \
         --dlp-ckpt /path/to/saves/best.pt \
-        --workers-per-gpu 2
+        --workers-per-gpu 4
+
+Usage (2x 4090):
+    PYTHONPATH=. python scripts/precompute_kmeans.py \
+        --data-root /path/to/3D-DLP-mimicgen-data \
+        --dlp-cfg  /path/to/hparams.json \
+        --dlp-ckpt /path/to/saves/best.pt \
+        --num-gpus 2 --workers-per-gpu 2
 """
 import os
 import re
@@ -18,6 +26,8 @@ import sys
 import argparse
 import torch
 import torch.multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 import numpy.core as _core
 sys.modules['numpy._core'] = _core
@@ -76,8 +86,10 @@ def scan_voxel_cache(voxel_cache_dir):
 
 
 def build_frame_list(data_root, tasks):
-    """Build flat list of (task, demo, frame_idx, voxel_path, kmeans_out_path)."""
+    """Build flat list of (task, demo, frame_idx, voxel_path, kmeans_out_path).
+    Skips frames that already have a cached kmeans file."""
     work = []
+    cached = 0
     for task in tasks:
         vox_dir = os.path.join(data_root, task, "voxel_cache", "voxel")
         km_dir = os.path.join(data_root, task, "voxel_cache", "kmeans_cache")
@@ -85,21 +97,23 @@ def build_frame_list(data_root, tasks):
             print(f"[skip] {task}: no voxel cache at {vox_dir}")
             continue
         voxel_map = scan_voxel_cache(vox_dir)
+        task_total, task_cached = 0, 0
         for demo in sorted(voxel_map.keys(), key=lambda s: int(s.split("_")[-1])):
             demo_km_dir = os.path.join(km_dir, demo)
             for frame_idx in sorted(voxel_map[demo].keys()):
+                task_total += 1
                 km_path = os.path.join(demo_km_dir, f"frame{frame_idx}_kmeans.pt")
                 if os.path.exists(km_path):
-                    continue  # already cached
-                work.append((task, demo, frame_idx, voxel_map[demo][frame_idx], km_path))
-    return work
+                    task_cached += 1
+                    cached += 1
+                else:
+                    work.append((task, demo, frame_idx, voxel_map[demo][frame_idx], km_path))
+        print(f"  {task}: {task_total - task_cached}/{task_total} to compute")
+    return work, cached
 
 
-def worker_fn(gpu_id, work_items, cfg_path, ckpt_path, batch_size):
-    """Worker process: loads model on assigned GPU and processes its work items."""
-    device = torch.device(f"cuda:{gpu_id}")
-    torch.cuda.set_device(device)
-
+def build_model(cfg_path, ckpt_path, device):
+    """Build DLP model and return just the prior module."""
     cfg = get_config(cfg_path)
     model = DLP(
         cdim=cfg["ch"],
@@ -146,78 +160,115 @@ def worker_fn(gpu_id, work_items, cfg_path, ckpt_path, batch_size):
     ).to(device)
     model.eval()
     _ = load_checkpoint(ckpt_path, model, None, None, map_location=device)
+    return model.prior_module
 
-    prior = model.prior_module
-    print(f"[GPU {gpu_id}] Model loaded, processing {len(work_items)} frames")
 
-    from tqdm import tqdm
-    pbar = tqdm(range(0, len(work_items), batch_size), desc=f"GPU {gpu_id}", unit="batch")
-    done = 0
+def worker_fn(worker_id, gpu_id, work_items, cfg_path, ckpt_path, progress_queue):
+    """Worker process: loads model on assigned GPU, prefetches I/O, processes frames."""
+    device = torch.device(f"cuda:{gpu_id}")
+    torch.cuda.set_device(device)
 
-    for i in pbar:
-        batch = work_items[i:i + batch_size]
+    prior = build_model(cfg_path, ckpt_path, device)
+    print(f"[Worker {worker_id} / GPU {gpu_id}] Model loaded, {len(work_items)} frames")
 
-        # Load voxels
-        vox_list = []
-        for _, _, _, vox_path, _ in batch:
-            vox_list.append(load_voxel_dense(vox_path).to(device))
-        vox = torch.stack(vox_list, dim=0)
+    # Prefetch voxels in background threads while GPU computes
+    PREFETCH = 8
 
-        # Run kmeans prior only
-        with torch.no_grad():
-            kp, cov = prior.encode_prior(vox)
+    def _load(item):
+        _, _, _, vox_path, _ = item
+        return load_voxel_dense(vox_path)
 
-        # Save per-frame
-        for j, (task, demo, frame_idx, _, km_path) in enumerate(batch):
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        futures = [io_pool.submit(_load, item) for item in work_items[:PREFETCH]]
+        submitted = PREFETCH
+
+        for i, item in enumerate(work_items):
+            # Get prefetched voxel
+            vox = futures[0].result().unsqueeze(0).to(device)
+            futures.pop(0)
+
+            # Submit next prefetch
+            if submitted < len(work_items):
+                futures.append(io_pool.submit(_load, work_items[submitted]))
+                submitted += 1
+
+            # Run kmeans
+            task, demo, frame_idx, _, km_path = item
+            with torch.no_grad():
+                kp, cov = prior.encode_prior(vox)
+
+            # Save
             os.makedirs(os.path.dirname(km_path), exist_ok=True)
-            torch.save({"kp": kp[j].cpu(), "cov": cov[j].cpu()}, km_path)
+            torch.save({"kp": kp[0].cpu(), "cov": cov[0].cpu()}, km_path)
 
-        done += len(batch)
-        pbar.set_postfix(done=done, total=len(work_items))
+            progress_queue.put(1)
+
+
+def progress_listener(queue, total):
+    """Print progress from a single process."""
+    from tqdm import tqdm
+    pbar = tqdm(total=total, desc="Total", unit="frame")
+    done = 0
+    while done < total:
+        n = queue.get()
+        if n is None:
+            break
+        done += n
+        pbar.update(n)
+    pbar.close()
 
 
 def main():
     mp.set_start_method("spawn", force=True)
 
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Fast parallel kmeans precomputation")
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--dlp-cfg", required=True)
     ap.add_argument("--dlp-ckpt", required=True)
-    ap.add_argument("--batch", type=int, default=1,
-                    help="Batch size per worker (kmeans is sequential per sample, so 1 is fine)")
     ap.add_argument("--num-gpus", type=int, default=None,
-                    help="Number of GPUs to use (default: all available)")
+                    help="Number of GPUs (default: all available)")
+    ap.add_argument("--workers-per-gpu", type=int, default=4,
+                    help="Worker processes per GPU (default: 4)")
     ap.add_argument("--tasks", nargs="*", default=None,
-                    help="Subset of tasks to process (default: all)")
+                    help="Subset of tasks (default: all)")
     args = ap.parse_args()
 
     num_gpus = args.num_gpus or torch.cuda.device_count()
     tasks = args.tasks if args.tasks else TASKS
-    print(f"Using {num_gpus} GPUs, {len(tasks)} tasks")
 
-    # Build work list (skips already-cached frames)
-    work = build_frame_list(args.data_root, tasks)
-    print(f"Total frames to compute: {len(work)}")
+    # Build work list
+    work, cached = build_frame_list(args.data_root, tasks)
+    print(f"\nTotal: {len(work)} to compute, {cached} already cached")
+    print(f"Workers: {num_gpus} GPU(s) x {args.workers_per_gpu} workers = {num_gpus * args.workers_per_gpu} processes")
     if not work:
-        print("Nothing to do — all frames already cached!")
+        print("Nothing to do!")
         return
 
-    # Split work evenly across GPUs
-    chunks = [[] for _ in range(num_gpus)]
+    # Split work across all workers
+    total_workers = num_gpus * args.workers_per_gpu
+    chunks = [[] for _ in range(total_workers)]
     for i, item in enumerate(work):
-        chunks[i % num_gpus].append(item)
+        chunks[i % total_workers].append(item)
 
-    for g in range(num_gpus):
-        print(f"  GPU {g}: {len(chunks[g])} frames")
+    # Progress queue
+    progress_queue = mp.Queue()
+
+    # Launch progress listener
+    import threading
+    progress_thread = threading.Thread(
+        target=progress_listener, args=(progress_queue, len(work)), daemon=True
+    )
+    progress_thread.start()
 
     # Launch workers
     processes = []
-    for gpu_id in range(num_gpus):
-        if not chunks[gpu_id]:
+    for w in range(total_workers):
+        if not chunks[w]:
             continue
+        gpu_id = w // args.workers_per_gpu
         p = mp.Process(
             target=worker_fn,
-            args=(gpu_id, chunks[gpu_id], args.dlp_cfg, args.dlp_ckpt, args.batch),
+            args=(w, gpu_id, chunks[w], args.dlp_cfg, args.dlp_ckpt, progress_queue),
         )
         p.start()
         processes.append(p)
@@ -225,6 +276,8 @@ def main():
     for p in processes:
         p.join()
 
+    progress_queue.put(None)
+    progress_thread.join(timeout=5)
     print("\nAll done!")
 
 

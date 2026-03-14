@@ -475,46 +475,69 @@ def main():
     kmeans_cache = {}  # {demo: {frame_idx: {"kp": tensor, "cov": tensor}}}
 
     from tqdm import tqdm
-    total_frames = sum(len(voxel_map[d]) for d in demos)
-    print(f"[kmeans] Precomputing kmeans prior for {total_frames} frames -> {kmeans_cache_dir}")
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
 
-    km_computed, km_cached = 0, 0
-    with torch.no_grad():
-        for demo in tqdm(demos, desc="KMeans prior", unit="demo"):
-            kmeans_cache[demo] = {}
-            demo_km_dir = os.path.join(kmeans_cache_dir, demo)
-            os.makedirs(demo_km_dir, exist_ok=True)
+    # Build work list: (demo, frame_idx, voxel_path, km_path), skip cached
+    km_work = []
+    km_cached = 0
+    for demo in demos:
+        kmeans_cache[demo] = {}
+        demo_km_dir = os.path.join(kmeans_cache_dir, demo)
+        for tt in sorted(voxel_map[demo].keys()):
+            km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
+            if os.path.exists(km_path):
+                km_cached += 1
+            else:
+                km_work.append((demo, tt, voxel_map[demo][tt], km_path))
 
-            frames = sorted(voxel_map[demo].keys())
-            for t0 in range(0, len(frames), args.batch):
-                batch_frames = frames[t0:t0 + args.batch]
-                # Check which frames need computing
-                to_compute = []
-                for tt in batch_frames:
-                    km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
-                    if os.path.exists(km_path):
-                        km = torch.load(km_path, map_location=device, weights_only=False)
-                        kmeans_cache[demo][tt] = km
-                        km_cached += 1
-                    else:
-                        to_compute.append(tt)
+    print(f"[kmeans] {len(km_work)} frames to compute, {km_cached} already cached -> {kmeans_cache_dir}")
 
-                if not to_compute:
-                    continue
+    if km_work:
+        # Prefetch queue: background threads load+decompress voxels while GPU computes
+        PREFETCH = 16
+        prefetch_queue = []
+        prefetch_lock = threading.Lock()
 
-                # Load and run kmeans for uncached frames
-                vox_list = [load_voxel(voxel_map[demo][tt], device) for tt in to_compute]
-                vox_batch = torch.stack(vox_list, dim=0)
-                kp_batch, cov_batch = model.prior_module.encode_prior(vox_batch)
+        def _load_one(item):
+            demo, tt, vox_path, km_path = item
+            vox = _load_voxel_any(vox_path)  # decompress on CPU
+            return (demo, tt, vox, km_path)
 
-                for i, tt in enumerate(to_compute):
-                    km = {"kp": kp_batch[i].cpu(), "cov": cov_batch[i].cpu()}
-                    km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
-                    torch.save(km, km_path)
-                    kmeans_cache[demo][tt] = km
-                    km_computed += 1
+        pbar = tqdm(total=len(km_work), desc="KMeans prior", unit="frame")
+        km_computed = 0
 
-    print(f"[kmeans] Done: {km_computed} computed, {km_cached} from cache")
+        with ThreadPoolExecutor(max_workers=4) as io_pool:
+            # Submit all I/O work upfront as futures
+            futures = [io_pool.submit(_load_one, item) for item in km_work]
+
+            for fut in futures:
+                demo, tt, vox, km_path = fut.result()
+
+                # Run kmeans on single frame (no batch overhead)
+                with torch.no_grad():
+                    vox_gpu = vox.unsqueeze(0).to(device)
+                    kp, cov = model.prior_module.encode_prior(vox_gpu)
+
+                # Save to disk
+                km = {"kp": kp[0].cpu(), "cov": cov[0].cpu()}
+                os.makedirs(os.path.dirname(km_path), exist_ok=True)
+                torch.save(km, km_path)
+                kmeans_cache[demo][tt] = km
+                km_computed += 1
+                pbar.update(1)
+
+        pbar.close()
+        print(f"[kmeans] Done: {km_computed} computed, {km_cached} from cache")
+
+    # Load any cached kmeans that we skipped above
+    for demo in demos:
+        demo_km_dir = os.path.join(kmeans_cache_dir, demo)
+        for tt in sorted(voxel_map[demo].keys()):
+            if tt not in kmeans_cache[demo]:
+                km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
+                if os.path.exists(km_path):
+                    kmeans_cache[demo][tt] = torch.load(km_path, map_location="cpu", weights_only=False)
 
     # Process demos
     ep_obs, ep_act, ep_gripper, ep_bg_features, path_lengths = [], [], [], [], []
