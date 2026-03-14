@@ -166,41 +166,72 @@ def worker_fn(worker_id, gpu_id, work_items, cfg_path, ckpt_path, counter_file, 
 
     BATCH_SIZE = batch_size
 
-    # Prefetch voxels in background threads while GPU computes
+    # Background I/O: load voxels and save results in parallel with GPU compute
     def _load(item):
         _, _, _, vox_path, _ = item
         return load_voxel_dense(vox_path)
 
-    with ThreadPoolExecutor(max_workers=4) as io_pool:
-        # Prefetch ahead
-        PREFETCH = min(BATCH_SIZE * 3, len(work_items))
+    def _save_batch(kp_cpu, cov_cpu, items):
+        for j, (task, demo, frame_idx, _, km_path) in enumerate(items):
+            os.makedirs(os.path.dirname(km_path), exist_ok=True)
+            torch.save({"kp": kp_cpu[j], "cov": cov_cpu[j]}, km_path)
+
+    import time
+    t_io, t_gpu, t_save = 0, 0, 0
+
+    with ThreadPoolExecutor(max_workers=8) as io_pool:
+        # Prefetch many batches ahead to hide NFS latency
+        PREFETCH = min(BATCH_SIZE * 6, len(work_items))
         futures = [io_pool.submit(_load, item) for item in work_items[:PREFETCH]]
         submitted = PREFETCH
+        save_future = None
 
         for batch_start in range(0, len(work_items), BATCH_SIZE):
             batch_items = work_items[batch_start:batch_start + BATCH_SIZE]
             actual_bs = len(batch_items)
 
             # Collect prefetched voxels
+            t0 = time.monotonic()
             vox_list = []
             for _ in range(actual_bs):
                 vox_list.append(futures.pop(0).result())
                 if submitted < len(work_items):
                     futures.append(io_pool.submit(_load, work_items[submitted]))
                     submitted += 1
+            vox_batch = torch.stack(vox_list, dim=0).to(device)
+            t_io += time.monotonic() - t0
 
-            vox_batch = torch.stack(vox_list, dim=0).to(device)  # [BS, C, D, H, W]
+            # Wait for previous save to finish before reusing GPU
+            if save_future is not None:
+                save_future.result()
 
+            # GPU compute
+            t0 = time.monotonic()
             with torch.no_grad():
-                kp, cov = prior.encode_prior(vox_batch)  # [BS, K, 3], [BS, K, 3, 3]
+                kp, cov = prior.encode_prior(vox_batch)
+            torch.cuda.synchronize(device)
+            t_gpu += time.monotonic() - t0
 
-            for j, (task, demo, frame_idx, _, km_path) in enumerate(batch_items):
-                os.makedirs(os.path.dirname(km_path), exist_ok=True)
-                torch.save({"kp": kp[j].cpu(), "cov": cov[j].cpu()}, km_path)
+            # Save in background
+            kp_cpu, cov_cpu = kp.cpu(), cov.cpu()
+            save_future = io_pool.submit(_save_batch, kp_cpu, cov_cpu, batch_items)
 
-            # Atomic counter
+            # Counter
             with open(counter_file, "ab") as f:
                 f.write(b"x" * actual_bs)
+
+            # Print timing every 100 batches
+            n_done = batch_start + actual_bs
+            if (n_done // BATCH_SIZE) % 100 == 0:
+                total_t = t_io + t_gpu + t_save
+                if total_t > 0:
+                    print(f"[Worker {worker_id}] {n_done}/{len(work_items)} | "
+                          f"IO: {t_io:.1f}s ({100*t_io/total_t:.0f}%) | "
+                          f"GPU: {t_gpu:.1f}s ({100*t_gpu/total_t:.0f}%) | "
+                          f"fps: {n_done/(t_io+t_gpu):.1f}", flush=True)
+
+        if save_future is not None:
+            save_future.result()
 
 
 def main():

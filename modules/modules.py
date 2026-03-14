@@ -192,29 +192,67 @@ class FeatureKMeansRGB(nn.Module):
         Z,Y,X = torch.meshgrid(z,y,x, indexing="ij")
         return torch.stack([X,Y,Z], dim=0)  # [3,D,H,W]
 
-    def kmeans_hard_feat(self, X, K, iters=30, tol=1e-4):  # X: [N,D]
-        device = X.device; N = X.shape[0]
-        i0 = torch.randint(0, N, (1,), device=device)
-        C = X[i0].clone()
-        while C.shape[0] < K:
-            d2 = torch.cdist(X, C).pow(2).min(dim=1).values
-            probs = (d2 + 1e-12) / (d2.sum() + 1e-12)
-            i = torch.multinomial(probs, 1)
-            C = torch.cat([C, X[i]], dim=0)
+    def _batched_kmeans_pp_init(self, X, K):
+        """
+        Batched KMeans++ init.
+        X: [B, N, D]
+        Returns: C [B, K, D]
+        """
+        B, N, D = X.shape
+        device = X.device
+
+        # Pick first center randomly
+        i0 = torch.randint(0, N, (B,), device=device)  # [B]
+        C = X[torch.arange(B, device=device), i0].unsqueeze(1)  # [B, 1, D]
+
+        min_d2 = torch.full((B, N), float('inf'), device=device)
+        for j in range(1, K):
+            # Distance to latest center
+            d2_new = (X - C[:, j-1:j, :]).pow(2).sum(dim=-1)  # [B, N]
+            min_d2 = torch.minimum(min_d2, d2_new)
+            probs = (min_d2 + 1e-12) / (min_d2.sum(dim=1, keepdim=True) + 1e-12)
+            idx = torch.multinomial(probs, 1)  # [B, 1]
+            new_c = X[torch.arange(B, device=device).unsqueeze(1), idx]  # [B, 1, D]
+            C = torch.cat([C, new_c], dim=1)
+        return C  # [B, K, D]
+
+    def _batched_kmeans(self, X, K, iters=30, tol=1e-4):
+        """
+        Fully batched KMeans.
+        X: [B, N, D]
+        Returns: C [B, K, D], A [B, N]
+        """
+        B, N, D = X.shape
+        device = X.device
+
+        C = self._batched_kmeans_pp_init(X, K)  # [B, K, D]
+
         for _ in range(iters):
-            d2 = torch.cdist(X, C).pow(2)
-            A  = d2.argmin(dim=1)
-            Cn = torch.stack([X[A==k].mean(dim=0) if (A==k).any() else C[k] for k in range(K)], dim=0)
-            shift = (Cn - C).norm(dim=1).mean()
+            # Assign: [B, N, K] -> [B, N]
+            A = torch.cdist(X, C).argmin(dim=2)  # [B, N]
+
+            # Update centers via scatter
+            A_exp = A.unsqueeze(2).expand(-1, -1, D)  # [B, N, D]
+            sums = torch.zeros(B, K, D, device=device, dtype=X.dtype)
+            sums.scatter_add_(1, A_exp, X)
+            counts = torch.zeros(B, K, 1, device=device, dtype=X.dtype)
+            counts.scatter_add_(1, A.unsqueeze(2), torch.ones(B, N, 1, device=device, dtype=X.dtype))
+            empty = (counts.squeeze(2) == 0)  # [B, K]
+            Cn = sums / counts.clamp_min(1)
+            Cn[empty] = C[empty]
+
+            shift = (Cn - C).norm(dim=2).mean()
             C = Cn
-            if shift < tol: break
-        A = torch.cdist(X, C).pow(2).argmin(dim=1)
+            if shift < tol:
+                break
+
+        A = torch.cdist(X, C).argmin(dim=2)
         return C, A
+
     @torch.no_grad()
     def forward(self, x, centers_init_global=None):
         """
         x:     [B,C,D,H,W] (expects RGB in x[:,:3], range [0,1] or [-1,1] OK)
-        alpha: [B,1,D,H,W] or [B,D,H,W] or None
         centers_init_global: [Npatch,3] in [-1,1] (optional, for compatibility)
 
         Returns:
@@ -224,6 +262,7 @@ class FeatureKMeansRGB(nn.Module):
         """
         B,C,D,H,W = x.shape
         device, dtype = x.device, x.dtype
+        K = self.K
 
         # RGB in [0,1]
         RGB = x[:, :3]
@@ -242,92 +281,132 @@ class FeatureKMeansRGB(nn.Module):
             XYZ = self.build_xyz_grid(D,H,W, device, dtype).unsqueeze(0).expand(B,-1,-1,-1,-1)
             feat = torch.cat([feat, XYZ], dim=1)    # [B,Cf(+3),D,H,W]
 
+        Cf = feat.shape[1]
+
         # saliency
         if self.saliency == "L":
             if self.feat_mode == "lab":
-                sal = feat[:,0]                     # L*
+                sal = feat[:,0]                     # [B,D,H,W]
             else:
                 sal = self.rgb_to_lab_srgb(RGB)[:,0]
         else:
             sal = torch.linalg.norm(RGB, dim=1)
 
-        # flat xyz grid for μ,Σ
+        # flat xyz grid
         xyz_flat = self.build_xyz_grid(D,H,W, device, dtype).view(3, -1)  # [3,DHW]
 
-        out_centers, out_covs, out_mass, out_count = [], [], [], []
-        K = self.K
+        # ---- Batched topk + feature extraction ----
+        sal_flat = sal.reshape(B, -1)  # [B, DHW]
+        k_keep = min(self.keep_top, sal_flat.shape[1])
+        top_vals, top_idx = torch.topk(sal_flat, k=k_keep, largest=True, sorted=False)  # [B, k_keep]
+        wts = top_vals.clamp_min(0)  # [B, k_keep]
 
-        for b in range(B):
-            vals = sal[b].reshape(-1)                    # [DHW]
-            k_keep = min(self.keep_top, vals.numel())
-            top = torch.topk(vals, k=k_keep, largest=True, sorted=False)
-            flat_idx = top.indices                       # [k_keep]
-            wts      = top.values.clamp_min(0)           # [k_keep]
+        # Gather features at top indices: [B, Cf, k_keep]
+        feat_flat = feat.reshape(B, Cf, -1)  # [B, Cf, DHW]
+        top_idx_exp = top_idx.unsqueeze(1).expand(-1, Cf, -1)  # [B, Cf, k_keep]
+        X_all = torch.gather(feat_flat, 2, top_idx_exp).permute(0, 2, 1)  # [B, k_keep, Cf]
 
-            Cf = feat.shape[1]
-            feat_flat = feat[b].view(Cf, -1)[:, flat_idx].t()   # [k_keep,Cf]
-            X = self.whiten(feat_flat)                              # [k_keep,Cf]
+        # Per-sample whitening (batched)
+        mu_w = X_all.mean(dim=1, keepdim=True)  # [B, 1, Cf]
+        sd_w = X_all.std(dim=1, keepdim=True).clamp_min(1e-6)  # [B, 1, Cf]
+        X_all = (X_all - mu_w) / sd_w  # [B, k_keep, Cf]
 
-            # importance subsample for k-means itself
-            probs = (wts + 1e-9) / (wts.sum() + 1e-9)
-            m = min(self.sample_m, X.shape[0])
-            sel = torch.multinomial(probs, num_samples=m, replacement=True)
-            X_sub = X[sel]
+        # Batched importance subsampling
+        m = min(self.sample_m, k_keep)
+        probs = (wts + 1e-9) / (wts.sum(dim=1, keepdim=True) + 1e-9)  # [B, k_keep]
+        sel = torch.multinomial(probs, num_samples=m, replacement=True)  # [B, m]
+        sel_exp = sel.unsqueeze(2).expand(-1, -1, Cf)  # [B, m, Cf]
+        X_sub = torch.gather(X_all, 1, sel_exp)  # [B, m, Cf]
 
-            C_feat, _ = self.kmeans_hard_feat(X_sub, K, iters=self.iters, tol=self.tol)
+        # ---- Batched KMeans ----
+        C_feat, _ = self._batched_kmeans(X_sub, K, iters=self.iters, tol=self.tol)  # [B, K, Cf]
 
-            # re-assign all kept voxels
-            d2 = torch.cdist(X, C_feat).pow(2)                 # [k_keep,K]
-            assign = d2.argmin(dim=1)
+        # Re-assign all kept voxels
+        d2 = torch.cdist(X_all, C_feat).pow(2)  # [B, k_keep, K]
+        assign = d2.argmin(dim=2)  # [B, k_keep]
 
-            pts_xyz = xyz_flat[:, flat_idx].t()                # [k_keep,3] in [-1,1]
-            centers_b, covs_b, mass_b, cnt_b = [], [], [], []
+        # Gather xyz for top indices
+        pts_xyz = xyz_flat[:, top_idx.reshape(-1)].t().reshape(B, k_keep, 3)  # [B, k_keep, 3]
+        # (xyz_flat is shared across batch — index with flat top_idx per sample)
+        # Fix: need per-sample indexing
+        pts_xyz = xyz_flat.unsqueeze(0).expand(B, -1, -1)  # [B, 3, DHW]
+        top_idx_3 = top_idx.unsqueeze(1).expand(-1, 3, -1)  # [B, 3, k_keep]
+        pts_xyz = torch.gather(pts_xyz, 2, top_idx_3).permute(0, 2, 1)  # [B, k_keep, 3]
 
-            for k_id in range(K):
-                msk = (assign == k_id)
-                if not msk.any():
-                    centers_b.append(pts_xyz.mean(dim=0))
-                    covs_b.append(torch.eye(3, device=device, dtype=dtype) * self.ridge)
-                    mass_b.append(0.0); cnt_b.append(0)
-                    continue
+        N_pts = k_keep
 
-                pts_k = pts_xyz[msk]
-                wk    = wts[msk]
-                Xk    = X[msk]
-                d2k   = torch.cdist(Xk, C_feat[k_id:k_id+1]).pow(2).squeeze(1)  # [Mk]
-                tau   = d2k.median().sqrt() + 1e-9
-                w_soft = torch.exp(-d2k / (tau*tau))
-                w_eff  = (wk ** 1.5) * w_soft
+        # ---- Batched cluster stats ----
+        # d2 to assigned center
+        b_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N_pts)  # [B, N_pts]
+        n_idx = torch.arange(N_pts, device=device).unsqueeze(0).expand(B, -1)  # [B, N_pts]
+        d2_to_center = d2[b_idx, n_idx, assign]  # [B, N_pts]
 
-                Wsum = w_eff.sum() + 1e-12
-                mu = (w_eff[:,None] * pts_k).sum(dim=0) / Wsum
-                xc = pts_k - mu[None]
-                cov = (w_eff[:,None,None] * (xc[:,:,None]*xc[:,None,:])).sum(dim=0) / Wsum
-                cov = cov + torch.eye(3, device=device, dtype=dtype) * (self.ridge / Wsum.item())
+        # Per-cluster tau (median of sqrt(d2)) — batched via sort
+        sqrt_d2 = d2_to_center.sqrt()  # [B, N_pts]
+        sort_key = assign.float() * (sqrt_d2.max(dim=1, keepdim=True).values + 1) + sqrt_d2
+        order = sort_key.argsort(dim=1)
+        sorted_sqrt_d2 = torch.gather(sqrt_d2, 1, order)  # [B, N_pts]
 
-                eff = int((wk > (wk.max() * 1e-3)).sum().item())
-                if eff < 8:
-                    var_iso = cov.diag().mean().clamp_min(1e-8)
-                    cov = torch.eye(3, device=device, dtype=dtype) * var_iso
+        counts = torch.zeros(B, K, device=device, dtype=torch.long)
+        counts.scatter_add_(1, assign, torch.ones(B, N_pts, device=device, dtype=torch.long))
+        offsets = torch.zeros(B, K, device=device, dtype=torch.long)
+        offsets[:, 1:] = counts[:, :-1].cumsum(dim=1)
+        median_idx = (offsets + counts // 2).clamp(max=N_pts - 1)  # [B, K]
+        tau_per_k = torch.gather(sorted_sqrt_d2, 1, median_idx).clamp_min(1e-9)  # [B, K]
 
-                centers_b.append(mu); covs_b.append(cov)
-                mass_b.append(float(Wsum.item())); cnt_b.append(eff)
+        tau_pt = torch.gather(tau_per_k, 1, assign)  # [B, N_pts]
+        w_soft = torch.exp(-d2_to_center / (tau_pt * tau_pt))
+        w_eff = (wts ** 1.5) * w_soft  # [B, N_pts]
 
-            out_centers.append(torch.stack(centers_b, dim=0))   # [K,3]
-            out_covs.append(torch.stack(covs_b,    dim=0))      # [K,3,3]
-            out_mass.append(torch.tensor(mass_b, device=device, dtype=dtype))      # [K]
-            out_count.append(torch.tensor(cnt_b, device=device, dtype=torch.int32))# [K]
+        # Weighted mean (centers)
+        Wsum = torch.zeros(B, K, device=device, dtype=dtype)
+        Wsum.scatter_add_(1, assign, w_eff)
+        Wsum_safe = Wsum.clamp_min(1e-12)  # [B, K]
 
-        kp  = torch.stack(out_centers, dim=0)   # [B,K,3]  (x,y,z in [-1,1])
-        cov = torch.stack(out_covs,    dim=0)   # [B,K,3,3]
+        w_pts = w_eff.unsqueeze(2) * pts_xyz  # [B, N_pts, 3]
+        mu_sum = torch.zeros(B, K, 3, device=device, dtype=dtype)
+        mu_sum.scatter_add_(1, assign.unsqueeze(2).expand(-1, -1, 3), w_pts)
+        mu = mu_sum / Wsum_safe.unsqueeze(2)  # [B, K, 3]
+
+        # Weighted covariance
+        mu_gathered = torch.gather(mu, 1, assign.unsqueeze(2).expand(-1, -1, 3))  # [B, N_pts, 3]
+        xc = pts_xyz - mu_gathered  # [B, N_pts, 3]
+        wxc = w_eff.unsqueeze(2) * xc  # [B, N_pts, 3]
+        outer = wxc.unsqueeze(3) * xc.unsqueeze(2)  # [B, N_pts, 3, 3]
+        cov_sum = torch.zeros(B, K, 3, 3, device=device, dtype=dtype)
+        cov_sum.scatter_add_(1, assign.view(B, -1, 1, 1).expand(-1, -1, 3, 3), outer)
+        cov_mat = cov_sum / Wsum_safe.view(B, K, 1, 1)
+        eye3 = torch.eye(3, device=device, dtype=dtype).view(1, 1, 3, 3)  # [1, 1, 3, 3]
+        cov_mat = cov_mat + eye3 * (self.ridge / Wsum_safe.view(B, K, 1, 1))
+
+        # Effective count per cluster
+        wts_max = wts.max(dim=1, keepdim=True).values  # [B, 1]
+        significant = (wts > wts_max * 1e-3).float()  # [B, N_pts]
+        eff_count = torch.zeros(B, K, device=device, dtype=dtype)
+        eff_count.scatter_add_(1, assign, significant)
+
+        # Fix low-count clusters
+        low_mask = (eff_count < 8)  # [B, K]
+        if low_mask.any():
+            var_iso = cov_mat.diagonal(dim1=-2, dim2=-1).mean(dim=-1).clamp_min(1e-8)  # [B, K]
+            iso_cov = eye3 * var_iso.view(B, K, 1, 1)
+            cov_mat = torch.where(low_mask.view(B, K, 1, 1), iso_cov, cov_mat)
+
+        # Fix empty clusters
+        empty = (Wsum < 1e-12)  # [B, K]
+        if empty.any():
+            global_mean = pts_xyz.mean(dim=1, keepdim=True).expand(-1, K, -1)  # [B, K, 3]
+            mu = torch.where(empty.unsqueeze(2), global_mean, mu)
+            cov_mat = torch.where(empty.view(B, K, 1, 1), eye3 * self.ridge, cov_mat)
+
         meta = {
             "mode": f"kmeans_rgb_feat[{self.feat_mode}{'+xyz' if self.append_xyz else ''}]",
             "saliency": self.saliency,
             "K": K, "kept": self.keep_top, "sampled": self.sample_m, "iters": self.iters,
-            "cluster_mass": torch.stack(out_mass,  dim=0),      # [B,K]
-            "cluster_eff_count": torch.stack(out_count, dim=0), # [B,K]
+            "cluster_mass": Wsum,       # [B,K]
+            "cluster_eff_count": eff_count.int(), # [B,K]
         }
-        return kp, cov, meta
+        return mu, cov_mat, meta
 
 
 class VoxelPatcher(nn.Module):
