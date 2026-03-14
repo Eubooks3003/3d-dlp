@@ -156,41 +156,51 @@ def build_model(cfg_path, ckpt_path, device):
     return model.prior_module
 
 
-def worker_fn(worker_id, gpu_id, work_items, cfg_path, ckpt_path, counter_file):
-    """Worker process: loads model on assigned GPU, prefetches I/O, processes frames."""
+def worker_fn(worker_id, gpu_id, work_items, cfg_path, ckpt_path, counter_file, batch_size=32):
+    """Worker process: loads model on assigned GPU, prefetches I/O, processes frames in batches."""
     device = torch.device(f"cuda:{gpu_id}")
     torch.cuda.set_device(device)
 
     prior = build_model(cfg_path, ckpt_path, device)
     print(f"[Worker {worker_id} / GPU {gpu_id}] Model loaded, {len(work_items)} frames", flush=True)
 
+    BATCH_SIZE = batch_size
+
     # Prefetch voxels in background threads while GPU computes
     def _load(item):
         _, _, _, vox_path, _ = item
         return load_voxel_dense(vox_path)
 
-    with ThreadPoolExecutor(max_workers=2) as io_pool:
-        PREFETCH = min(8, len(work_items))
+    with ThreadPoolExecutor(max_workers=4) as io_pool:
+        # Prefetch ahead
+        PREFETCH = min(BATCH_SIZE * 3, len(work_items))
         futures = [io_pool.submit(_load, item) for item in work_items[:PREFETCH]]
         submitted = PREFETCH
 
-        for i, item in enumerate(work_items):
-            vox = futures.pop(0).result().unsqueeze(0).to(device)
+        for batch_start in range(0, len(work_items), BATCH_SIZE):
+            batch_items = work_items[batch_start:batch_start + BATCH_SIZE]
+            actual_bs = len(batch_items)
 
-            if submitted < len(work_items):
-                futures.append(io_pool.submit(_load, work_items[submitted]))
-                submitted += 1
+            # Collect prefetched voxels
+            vox_list = []
+            for _ in range(actual_bs):
+                vox_list.append(futures.pop(0).result())
+                if submitted < len(work_items):
+                    futures.append(io_pool.submit(_load, work_items[submitted]))
+                    submitted += 1
 
-            task, demo, frame_idx, _, km_path = item
+            vox_batch = torch.stack(vox_list, dim=0).to(device)  # [BS, C, D, H, W]
+
             with torch.no_grad():
-                kp, cov = prior.encode_prior(vox)
+                kp, cov = prior.encode_prior(vox_batch)  # [BS, K, 3], [BS, K, 3, 3]
 
-            os.makedirs(os.path.dirname(km_path), exist_ok=True)
-            torch.save({"kp": kp[0].cpu(), "cov": cov[0].cpu()}, km_path)
+            for j, (task, demo, frame_idx, _, km_path) in enumerate(batch_items):
+                os.makedirs(os.path.dirname(km_path), exist_ok=True)
+                torch.save({"kp": kp[j].cpu(), "cov": cov[j].cpu()}, km_path)
 
-            # Atomic counter: append one byte per completed frame
+            # Atomic counter
             with open(counter_file, "ab") as f:
-                f.write(b"x")
+                f.write(b"x" * actual_bs)
 
 
 def main():
@@ -203,8 +213,10 @@ def main():
     ap.add_argument("--dlp-ckpt", required=True)
     ap.add_argument("--num-gpus", type=int, default=None,
                     help="Number of GPUs (default: all available)")
-    ap.add_argument("--workers-per-gpu", type=int, default=32,
-                    help="Worker processes per GPU (default: 32)")
+    ap.add_argument("--workers-per-gpu", type=int, default=2,
+                    help="Worker processes per GPU (default: 2)")
+    ap.add_argument("--batch", type=int, default=32,
+                    help="Batch size per worker — kmeans is now fully batched (default: 32)")
     ap.add_argument("--tasks", nargs="*", default=None,
                     help="Subset of tasks (default: all)")
     args = ap.parse_args()
@@ -238,7 +250,7 @@ def main():
         gpu_id = w // args.workers_per_gpu
         p = mp.Process(
             target=worker_fn,
-            args=(w, gpu_id, chunks[w], args.dlp_cfg, args.dlp_ckpt, counter_file),
+            args=(w, gpu_id, chunks[w], args.dlp_cfg, args.dlp_ckpt, counter_file, args.batch),
         )
         p.start()
         processes.append(p)
