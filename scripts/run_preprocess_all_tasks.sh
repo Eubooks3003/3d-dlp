@@ -10,13 +10,12 @@ OUT_DIR="${DATA_ROOT}/preprocessed"
 
 BATCH=64
 ACTION_MODE="relative"
+WORKERS_PER_GPU=${WORKERS_PER_GPU:-4}
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
 # =========================================
 
 # ---------- Debug mode ----------
 # Usage:  bash run_preprocess_all_tasks.sh --debug [NUM_SAMPLES] [WANDB_PROJECT]
-#   Runs encode->decode on the first available task, logs GT vs reconstruction
-#   to wandb, then exits. Good for verifying the checkpoint before a long run.
 DEBUG=0
 DEBUG_SAMPLES=3
 WANDB_PROJECT="ec-diffuser-debug"
@@ -93,7 +92,32 @@ if [[ "$DEBUG" -eq 1 ]]; then
     exit 1
 fi
 
-# ---------- Full preprocessing ----------
+# ==========================================================
+#  STEP 1: Precompute kmeans for ALL tasks (multi-worker)
+# ==========================================================
+echo ""
+echo "========================================"
+echo "  Step 1: Precompute kmeans (all tasks)"
+echo "  ${WORKERS_PER_GPU} workers x ${NUM_GPUS} GPU(s)"
+echo "========================================"
+
+PYTHONPATH=. python -u scripts/precompute_kmeans.py \
+    --data-root "$DATA_ROOT" \
+    --dlp-cfg "$DLP_CFG" \
+    --dlp-ckpt "$DLP_CKPT" \
+    --num-gpus "$NUM_GPUS" \
+    --workers-per-gpu "$WORKERS_PER_GPU"
+
+echo "[Step 1 DONE] KMeans cache ready"
+echo ""
+
+# ==========================================================
+#  STEP 2: Encode tokens (kmeans cached, GPU goes fast now)
+# ==========================================================
+echo "========================================"
+echo "  Step 2: Encode tokens (all tasks)"
+echo "========================================"
+
 for TASK in "${TASKS[@]}"; do
     H5="${DATA_ROOT}/core/${TASK}.hdf5"
     VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
