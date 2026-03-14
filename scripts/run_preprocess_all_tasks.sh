@@ -10,7 +10,7 @@ OUT_DIR="${DATA_ROOT}/preprocessed"
 
 BATCH=64
 ACTION_MODE="relative"
-WORKERS_PER_GPU=${WORKERS_PER_GPU:-4}
+WORKERS_PER_GPU=${WORKERS_PER_GPU:-32}
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
 # =========================================
 
