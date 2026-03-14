@@ -185,6 +185,23 @@ def pack_tokens_k24(out: dict) -> tuple:
 # ----------------------------
 # Debug visualization
 # ----------------------------
+def _extract_voxel_tensor(vox, path: str) -> torch.Tensor:
+    """Extract tensor from a .pt file that may be a raw tensor or a dict."""
+    if isinstance(vox, torch.Tensor):
+        return vox
+    if isinstance(vox, dict):
+        for key in ("voxel", "voxels", "data", "grid"):
+            if key in vox:
+                return vox[key]
+        # Fall back to first tensor value
+        for k, v in vox.items():
+            if isinstance(v, torch.Tensor):
+                print(f"[warn] Using dict key '{k}' as voxel tensor from {path} (keys: {list(vox.keys())})")
+                return v
+        raise RuntimeError(f"No tensor found in dict from {path}, keys: {list(vox.keys())}")
+    raise RuntimeError(f"Expected tensor or dict in {path}, got {type(vox)}")
+
+
 def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
     """
     Load voxels from nested cache structure: cache_dir/demo_X/frameY_voxels.pt
@@ -216,6 +233,7 @@ def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
     # Load with progress bar
     for vox_path in tqdm(all_vox_paths, desc="Loading voxels"):
         vox = torch.load(vox_path, weights_only=False)
+        vox = _extract_voxel_tensor(vox, vox_path)
         voxels.append((vox, vox_path))
 
     return voxels
@@ -348,9 +366,8 @@ def scan_voxel_cache(voxel_cache_dir: str):
 def load_voxel(voxel_path: str, device: torch.device) -> torch.Tensor:
     """Load a voxel tensor from .pt file."""
     vox = torch.load(voxel_path, map_location=device)
-    if not isinstance(vox, torch.Tensor):
-        raise RuntimeError(f"Expected tensor in {voxel_path}, got {type(vox)}")
-    return vox
+    vox = _extract_voxel_tensor(vox, voxel_path)
+    return vox.to(device)
 
 
 # ----------------------------
