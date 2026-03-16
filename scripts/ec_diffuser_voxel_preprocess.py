@@ -185,6 +185,24 @@ def pack_tokens_k24(out: dict) -> tuple:
 # ----------------------------
 # Debug visualization
 # ----------------------------
+def _load_voxel_any(path: str) -> torch.Tensor:
+    """
+    Load a voxel grid from .pt — handles both compressed (sparse) and
+    uncompressed (dense) formats.  Returns dense float32 [C, D, H, W].
+    """
+    data = torch.load(path, weights_only=False)
+    if isinstance(data, dict) and data.get("compressed"):
+        shape = data["shape"]
+        coords = data["coords"].long()
+        values = data["values"].float()
+        vox = torch.zeros(shape, dtype=torch.float32)
+        vox[:, coords[:, 0], coords[:, 1], coords[:, 2]] = values.T
+        return vox
+    if isinstance(data, torch.Tensor):
+        return data.float()
+    raise RuntimeError(f"Unexpected voxel format in {path}: {type(data)}")
+
+
 def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
     """
     Load voxels from nested cache structure: cache_dir/demo_X/frameY_voxels.pt
@@ -215,7 +233,7 @@ def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
 
     # Load with progress bar
     for vox_path in tqdm(all_vox_paths, desc="Loading voxels"):
-        vox = torch.load(vox_path, weights_only=False)
+        vox = _load_voxel_any(vox_path)
         voxels.append((vox, vox_path))
 
     return voxels
@@ -347,10 +365,7 @@ def scan_voxel_cache(voxel_cache_dir: str):
 
 def load_voxel(voxel_path: str, device: torch.device) -> torch.Tensor:
     """Load a voxel tensor from .pt file."""
-    vox = torch.load(voxel_path, map_location=device)
-    if not isinstance(vox, torch.Tensor):
-        raise RuntimeError(f"Expected tensor in {voxel_path}, got {type(vox)}")
-    return vox
+    return _load_voxel_any(voxel_path).to(device)
 
 
 # ----------------------------
@@ -454,13 +469,82 @@ def main():
     else:
         print(f"[actions] Using RELATIVE action mode")
 
+    # ---- Pass 1: Precompute kmeans prior for all frames ----
+    kmeans_cache_dir = os.path.join(os.path.dirname(args.voxel_cache_dir), "kmeans_cache")
+    os.makedirs(kmeans_cache_dir, exist_ok=True)
+    kmeans_cache = {}  # {demo: {frame_idx: {"kp": tensor, "cov": tensor}}}
+
+    from tqdm import tqdm
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    # Build work list: (demo, frame_idx, voxel_path, km_path), skip cached
+    km_work = []
+    km_cached = 0
+    for demo in demos:
+        kmeans_cache[demo] = {}
+        demo_km_dir = os.path.join(kmeans_cache_dir, demo)
+        for tt in sorted(voxel_map[demo].keys()):
+            km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
+            if os.path.exists(km_path):
+                km_cached += 1
+            else:
+                km_work.append((demo, tt, voxel_map[demo][tt], km_path))
+
+    print(f"[kmeans] {len(km_work)} frames to compute, {km_cached} already cached -> {kmeans_cache_dir}")
+
+    if km_work:
+        # Prefetch queue: background threads load+decompress voxels while GPU computes
+        PREFETCH = 16
+        prefetch_queue = []
+        prefetch_lock = threading.Lock()
+
+        def _load_one(item):
+            demo, tt, vox_path, km_path = item
+            vox = _load_voxel_any(vox_path)  # decompress on CPU
+            return (demo, tt, vox, km_path)
+
+        pbar = tqdm(total=len(km_work), desc="KMeans prior", unit="frame")
+        km_computed = 0
+
+        with ThreadPoolExecutor(max_workers=4) as io_pool:
+            # Submit all I/O work upfront as futures
+            futures = [io_pool.submit(_load_one, item) for item in km_work]
+
+            for fut in futures:
+                demo, tt, vox, km_path = fut.result()
+
+                # Run kmeans on single frame (no batch overhead)
+                with torch.no_grad():
+                    vox_gpu = vox.unsqueeze(0).to(device)
+                    kp, cov = model.prior_module.encode_prior(vox_gpu)
+
+                # Save to disk
+                km = {"kp": kp[0].cpu(), "cov": cov[0].cpu()}
+                os.makedirs(os.path.dirname(km_path), exist_ok=True)
+                torch.save(km, km_path)
+                kmeans_cache[demo][tt] = km
+                km_computed += 1
+                pbar.update(1)
+
+        pbar.close()
+        print(f"[kmeans] Done: {km_computed} computed, {km_cached} from cache")
+
+    # Load any cached kmeans that we skipped above
+    for demo in demos:
+        demo_km_dir = os.path.join(kmeans_cache_dir, demo)
+        for tt in sorted(voxel_map[demo].keys()):
+            if tt not in kmeans_cache[demo]:
+                km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
+                if os.path.exists(km_path):
+                    kmeans_cache[demo][tt] = torch.load(km_path, map_location="cpu", weights_only=False)
+
     # Process demos
     ep_obs, ep_act, ep_gripper, ep_bg_features, path_lengths = [], [], [], [], []
     init_states = []
     demo_indices = []
     total_written = 0
 
-    from tqdm import tqdm
     with h5py.File(args.h5, "r") as h5:
         pbar = tqdm(demos, desc=f"Rank {args.rank}", unit="demo")
         for demo in pbar:
@@ -539,19 +623,23 @@ def main():
                 if vox.shape[1] != expected_c:
                     raise RuntimeError(f"Channel mismatch: got C={vox.shape[1]} expected C={expected_c}")
 
-                # Run DLP encoder
+                # Run DLP encoder (uses cached kmeans if available)
                 with torch.no_grad():
-                    out = model(vox, deterministic=True, warmup=False, with_loss=False)
-                    print(f"[DEBUG PREPROC] DLP output shapes:")
-                    print(f"  z base: {out['z_base'].shape}")
-                    print(f"  z: {out['z'].shape}")
-                    print(f"  z_scale: {out['z_scale'].shape}")
-                    print(f"  z_depth: {out['z_depth'].shape}")
-                    print(f"  obj_on: {out['obj_on'].shape}")
-                    print(f"  z_features: {out['z_features'].shape}")
-                    print(f"  z_bg_features: {out['z_bg_features'].shape}")
+                    # Build meta with precomputed kmeans if cache exists
+                    meta = None
+                    if kmeans_cache is not None:
+                        km_list_kp, km_list_cov = [], []
+                        for tt in valid_ts:
+                            km = kmeans_cache[demo][tt]
+                            km_list_kp.append(km["kp"])
+                            km_list_cov.append(km["cov"])
+                        meta = {
+                            "kmeans_kp": torch.stack(km_list_kp).to(device),
+                            "kmeans_cov": torch.stack(km_list_cov).to(device),
+                        }
+
+                    out = model(vox, deterministic=True, warmup=False, with_loss=False, meta=meta)
                     toks, bg_feats = pack_tokens_k24(out)
-                    print(f"[DEBUG PREPROC] packed toks shape: {toks.shape}, bg_feats shape: {bg_feats.shape}")
 
                 toks_np = toks.detach().cpu().numpy().astype(np.float32)
                 print(f"[DEBUG PREPROC] toks_np shape: {toks_np.shape}")
