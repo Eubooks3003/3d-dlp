@@ -8,7 +8,7 @@ DLP_CFG="${LPWM_DIR}/logs/010326_173829_mimicgen_multitask/hparams.json"
 DLP_CKPT="${LPWM_DIR}/logs/010326_173829_mimicgen_multitask/saves/best.pt"
 OUT_DIR="${DATA_ROOT}/preprocessed"
 
-BATCH=64
+BATCH=8
 ACTION_MODE="relative"
 WORKERS_PER_GPU=${WORKERS_PER_GPU:-2}
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}

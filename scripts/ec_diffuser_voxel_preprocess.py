@@ -242,6 +242,7 @@ def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
 def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_project: str = "ec-diffuser-debug", num_samples: int = 3):
     """
     Run samples through encode->decode and visualize in wandb.
+    Uses cached kmeans (matching the production preprocessing path).
     Shows GT, reconstruction, and difference for each sample.
     """
     import wandb
@@ -254,6 +255,9 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
         raise RuntimeError(f"No voxels found in {voxel_cache_dir}")
 
     print(f"[debug] Loaded {len(voxels)} voxels")
+
+    # Resolve kmeans cache dir (sibling of voxel dir)
+    kmeans_cache_dir = os.path.join(os.path.dirname(voxel_cache_dir), "kmeans_cache")
 
     # Initialize wandb
     wandb.init(project=wandb_project, name=f"debug-dlp-{len(voxels)}-samples")
@@ -275,10 +279,28 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
             show_axes=True,
         )
 
-        # Run through model
+        # Load cached kmeans for this frame (matches production path)
+        # vox_path: .../voxel_cache/voxel/demo_X/frameY_voxels.pt
+        # km_path:  .../voxel_cache/kmeans_cache/demo_X/frameY_kmeans.pt
+        demo_name = os.path.basename(os.path.dirname(vox_path))
+        frame_name = os.path.basename(vox_path).replace("_voxels.pt", "_kmeans.pt")
+        km_path = os.path.join(kmeans_cache_dir, demo_name, frame_name)
+
+        meta = None
+        if os.path.exists(km_path):
+            km = torch.load(km_path, map_location="cpu", weights_only=False)
+            meta = {
+                "kmeans_kp": km["kp"].unsqueeze(0).to(device),
+                "kmeans_cov": km["cov"].unsqueeze(0).to(device),
+            }
+            print(f"[debug] Using cached kmeans from {km_path}")
+        else:
+            print(f"[debug] WARNING: no cached kmeans at {km_path}, recomputing")
+
+        # Run through model (with cached kmeans, matching production path)
         vox_input = vox.unsqueeze(0).to(device)
         with torch.no_grad():
-            out = model(vox_input, deterministic=True, warmup=False, with_loss=True)
+            out = model(vox_input, deterministic=True, warmup=False, with_loss=True, meta=meta)
 
         # Get reconstruction
         vox_rec = out.get("rec", out.get("reconstruction", None))
@@ -479,16 +501,22 @@ def main():
     import threading
 
     # Build work list: (demo, frame_idx, voxel_path, km_path), skip cached
+    # Pre-scan kmeans dirs once per demo (one listdir instead of N stat calls)
     km_work = []
     km_cached = 0
     for demo in demos:
         kmeans_cache[demo] = {}
         demo_km_dir = os.path.join(kmeans_cache_dir, demo)
+        try:
+            cached_files = set(os.listdir(demo_km_dir))
+        except FileNotFoundError:
+            cached_files = set()
         for tt in sorted(voxel_map[demo].keys()):
-            km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
-            if os.path.exists(km_path):
+            km_fname = f"frame{tt}_kmeans.pt"
+            if km_fname in cached_files:
                 km_cached += 1
             else:
+                km_path = os.path.join(demo_km_dir, km_fname)
                 km_work.append((demo, tt, voxel_map[demo][tt], km_path))
 
     print(f"[kmeans] {len(km_work)} frames to compute, {km_cached} already cached -> {kmeans_cache_dir}")

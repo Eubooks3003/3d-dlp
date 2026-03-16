@@ -87,15 +87,25 @@ def build_frame_list(data_root, tasks):
             continue
         voxel_map = scan_voxel_cache(vox_dir)
         task_total, task_cached = 0, 0
+        # Pre-scan kmeans dirs once per demo (one listdir instead of N stat calls)
+        km_existing = {}  # {demo: set of filenames}
+        for demo in voxel_map:
+            demo_km_dir = os.path.join(km_dir, demo)
+            try:
+                km_existing[demo] = set(os.listdir(demo_km_dir))
+            except FileNotFoundError:
+                km_existing[demo] = set()
         for demo in sorted(voxel_map.keys(), key=lambda s: int(s.split("_")[-1])):
             demo_km_dir = os.path.join(km_dir, demo)
+            cached_files = km_existing[demo]
             for frame_idx in sorted(voxel_map[demo].keys()):
                 task_total += 1
-                km_path = os.path.join(demo_km_dir, f"frame{frame_idx}_kmeans.pt")
-                if os.path.exists(km_path):
+                km_fname = f"frame{frame_idx}_kmeans.pt"
+                if km_fname in cached_files:
                     task_cached += 1
                     cached += 1
                 else:
+                    km_path = os.path.join(demo_km_dir, km_fname)
                     work.append((task, demo, frame_idx, voxel_map[demo][frame_idx], km_path))
         print(f"  {task}: {task_total - task_cached}/{task_total} to compute")
     return work, cached
