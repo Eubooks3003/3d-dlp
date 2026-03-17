@@ -558,14 +558,29 @@ def main():
         pbar.close()
         print(f"[kmeans] Done: {km_computed} computed, {km_cached} from cache")
 
-    # Load any cached kmeans that we skipped above
+    # Load any cached kmeans that we skipped above (parallel I/O)
+    km_load_items = []
     for demo in demos:
         demo_km_dir = os.path.join(kmeans_cache_dir, demo)
+        try:
+            cached_files = set(os.listdir(demo_km_dir))
+        except FileNotFoundError:
+            cached_files = set()
         for tt in sorted(voxel_map[demo].keys()):
             if tt not in kmeans_cache[demo]:
-                km_path = os.path.join(demo_km_dir, f"frame{tt}_kmeans.pt")
-                if os.path.exists(km_path):
-                    kmeans_cache[demo][tt] = torch.load(km_path, map_location="cpu", weights_only=False)
+                km_fname = f"frame{tt}_kmeans.pt"
+                if km_fname in cached_files:
+                    km_load_items.append((demo, tt, os.path.join(demo_km_dir, km_fname)))
+
+    if km_load_items:
+        def _load_km(item):
+            demo, tt, path = item
+            return demo, tt, torch.load(path, map_location="cpu", weights_only=False)
+
+        print(f"[kmeans] Loading {len(km_load_items)} cached kmeans files...")
+        with ThreadPoolExecutor(max_workers=8) as io_pool:
+            for demo, tt, km in io_pool.map(_load_km, km_load_items):
+                kmeans_cache[demo][tt] = km
 
     # Process demos
     ep_obs, ep_act, ep_gripper, ep_bg_features, path_lengths = [], [], [], [], []
@@ -624,60 +639,70 @@ def main():
             gripper_steps = []
             bg_steps = []
 
+            # Build batch schedule for this demo
+            batches = []
             t0 = 0
             while t0 < T:
-                if args.max_frames is not None and total_written >= args.max_frames:
+                if args.max_frames is not None and total_written + sum(len(b) for b in batches) >= args.max_frames:
                     break
-
                 Bcap = min(args.batch, T - t0)
                 if args.max_frames is not None:
-                    Bcap = min(Bcap, args.max_frames - total_written)
+                    Bcap = min(Bcap, args.max_frames - total_written - sum(len(b) for b in batches))
                 if Bcap <= 0:
                     break
-
-                ts = list(range(t0, t0 + Bcap))
+                batches.append(list(range(t0, t0 + Bcap)))
                 t0 += Bcap
 
-                # Load voxels for this batch
-                vox_list = []
-                valid_ts = []
+            # Prefetch voxels on CPU threads while GPU computes
+            def _prefetch_batch(ts):
+                voxels = []
                 for tt in ts:
-                    voxel_path = voxel_map[demo][tt]
-                    vox_t = load_voxel(voxel_path, device)
-                    vox_list.append(vox_t)
-                    valid_ts.append(tt)
+                    vox = torch.load(voxel_map[demo][tt], map_location="cpu", weights_only=False)
+                    if not isinstance(vox, torch.Tensor):
+                        raise RuntimeError(f"Expected tensor, got {type(vox)}")
+                    voxels.append(vox)
+                return torch.stack(voxels, dim=0)
 
-                vox = torch.stack(vox_list, dim=0)  # [B,C,D,H,W]
-                if vox.shape[1] != expected_c:
-                    raise RuntimeError(f"Channel mismatch: got C={vox.shape[1]} expected C={expected_c}")
+            with ThreadPoolExecutor(max_workers=2) as io_pool:
+                pending = None
+                if batches:
+                    pending = io_pool.submit(_prefetch_batch, batches[0])
 
-                # Run DLP encoder (uses cached kmeans if available)
-                with torch.no_grad():
-                    # Build meta with precomputed kmeans if cache exists
-                    meta = None
-                    if kmeans_cache is not None:
-                        km_list_kp, km_list_cov = [], []
-                        for tt in valid_ts:
-                            km = kmeans_cache[demo][tt]
-                            km_list_kp.append(km["kp"])
-                            km_list_cov.append(km["cov"])
-                        meta = {
-                            "kmeans_kp": torch.stack(km_list_kp).to(device),
-                            "kmeans_cov": torch.stack(km_list_cov).to(device),
-                        }
+                for bi, ts in enumerate(batches):
+                    vox = pending.result().to(device)  # [B,C,D,H,W]
 
-                    out = model(vox, deterministic=True, warmup=False, with_loss=False, meta=meta)
-                    toks, bg_feats = pack_tokens_k24(out)
+                    # Start loading next batch while GPU runs
+                    if bi + 1 < len(batches):
+                        pending = io_pool.submit(_prefetch_batch, batches[bi + 1])
 
-                toks_np = toks.detach().cpu().numpy().astype(np.float32)
-                print(f"[DEBUG PREPROC] toks_np shape: {toks_np.shape}")
-                bg_np = bg_feats.detach().cpu().numpy().astype(np.float32)
-                obs_steps.append(toks_np)
-                bg_steps.append(bg_np)
-                act_steps.append(actions[valid_ts].astype(np.float32))
-                gripper_steps.append(gripper_state_full[valid_ts].astype(np.float32))
+                    if vox.shape[1] != expected_c:
+                        raise RuntimeError(f"Channel mismatch: got C={vox.shape[1]} expected C={expected_c}")
 
-                total_written += toks_np.shape[0]
+                    # Run DLP encoder (uses cached kmeans if available)
+                    with torch.no_grad():
+                        meta = None
+                        if kmeans_cache is not None:
+                            km_list_kp, km_list_cov = [], []
+                            for tt in ts:
+                                km = kmeans_cache[demo][tt]
+                                km_list_kp.append(km["kp"])
+                                km_list_cov.append(km["cov"])
+                            meta = {
+                                "kmeans_kp": torch.stack(km_list_kp).to(device),
+                                "kmeans_cov": torch.stack(km_list_cov).to(device),
+                            }
+
+                        out = model(vox, deterministic=True, warmup=False, with_loss=False, meta=meta)
+                        toks, bg_feats = pack_tokens_k24(out)
+
+                    toks_np = toks.detach().cpu().numpy().astype(np.float32)
+                    bg_np = bg_feats.detach().cpu().numpy().astype(np.float32)
+                    obs_steps.append(toks_np)
+                    bg_steps.append(bg_np)
+                    act_steps.append(actions[ts].astype(np.float32))
+                    gripper_steps.append(gripper_state_full[ts].astype(np.float32))
+
+                    total_written += toks_np.shape[0]
 
             if len(obs_steps) == 0:
                 raise RuntimeError(f"No frames written for {demo}")
