@@ -657,9 +657,7 @@ def main():
             def _prefetch_batch(ts):
                 voxels = []
                 for tt in ts:
-                    vox = torch.load(voxel_map[demo][tt], map_location="cpu", weights_only=False)
-                    if not isinstance(vox, torch.Tensor):
-                        raise RuntimeError(f"Expected tensor, got {type(vox)}")
+                    vox = _load_voxel_any(voxel_map[demo][tt])
                     voxels.append(vox)
                 return torch.stack(voxels, dim=0)
 
