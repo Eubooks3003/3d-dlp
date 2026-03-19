@@ -121,7 +121,8 @@ echo "========================================"
 for TASK in "${TASKS[@]}"; do
     H5="${DATA_ROOT}/core/${TASK}.hdf5"
     VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
-    OUT_PKL="${OUT_DIR}/${TASK}.pkl"
+    TASK_DIR="${OUT_DIR}/${TASK}"
+    OUT_PKL="${TASK_DIR}/${TASK}.pkl"
 
     if [[ ! -f "$H5" ]]; then
         echo "[SKIP] $TASK: H5 not found at $H5"
@@ -136,6 +137,8 @@ for TASK in "${TASKS[@]}"; do
         continue
     fi
 
+    mkdir -p "$TASK_DIR"
+
     echo ""
     echo "========================================"
     echo "  Processing: $TASK"
@@ -145,7 +148,7 @@ for TASK in "${TASKS[@]}"; do
         # Multi-GPU: launch one process per GPU, then merge
         PIDS=()
         for ((rank=0; rank<NUM_GPUS; rank++)); do
-            LOG_FILE="${OUT_DIR}/${TASK}_rank${rank}.log"
+            LOG_FILE="${TASK_DIR}/${TASK}_rank${rank}.log"
             CUDA_VISIBLE_DEVICES=$rank \
             PYTHONPATH=. \
             python -u scripts/ec_diffuser_voxel_preprocess.py \
@@ -168,7 +171,7 @@ for TASK in "${TASKS[@]}"; do
             if wait ${PIDS[$rank]}; then
                 echo "  [Rank $rank] done"
             else
-                echo "  [Rank $rank] FAILED (see ${OUT_DIR}/${TASK}_rank${rank}.log)"
+                echo "  [Rank $rank] FAILED (see ${TASK_DIR}/${TASK}_rank${rank}.log)"
                 FAILED=1
             fi
         done
@@ -184,6 +187,10 @@ for TASK in "${TASKS[@]}"; do
             --output "$OUT_PKL" \
             --delete-shards
 
+        # Snapshot the DLP checkpoint & config used for this task
+        cp "$DLP_CKPT" "${TASK_DIR}/dlp_ckpt.pt"
+        cp "$DLP_CFG"  "${TASK_DIR}/dlp_config.json"
+
     else
         # Single GPU
         PYTHONPATH=. \
@@ -196,6 +203,10 @@ for TASK in "${TASKS[@]}"; do
             --action-mode "$ACTION_MODE" \
             --batch "$BATCH" \
             --device cuda
+
+        # Snapshot the DLP checkpoint & config used for this task
+        cp "$DLP_CKPT" "${TASK_DIR}/dlp_ckpt.pt"
+        cp "$DLP_CFG"  "${TASK_DIR}/dlp_config.json"
     fi
 
     echo "[DONE] $TASK -> $OUT_PKL"
