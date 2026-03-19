@@ -55,21 +55,29 @@ TASKS=(
 mkdir -p "$OUT_DIR"
 cd "$LPWM_DIR"
 
-# ---------- Debug: run on first available task then exit ----------
+# ---------- Debug: one forward pass per task ----------
 if [[ "$DEBUG" -eq 1 ]]; then
     echo "========================================"
-    echo "  DEBUG MODE — encode/decode sanity check"
+    echo "  DEBUG MODE — encode/decode sanity check (all tasks)"
     echo "  Samples: $DEBUG_SAMPLES | wandb project: $WANDB_PROJECT"
     echo "========================================"
 
+    DEBUG_COUNT=0
     for TASK in "${TASKS[@]}"; do
         H5="${DATA_ROOT}/core/${TASK}.hdf5"
         VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
 
-        if [[ ! -f "$H5" ]]; then continue; fi
-        if [[ ! -d "$VOX_CACHE" ]]; then continue; fi
+        if [[ ! -f "$H5" ]]; then
+            echo "[DEBUG SKIP] $TASK: H5 not found"
+            continue
+        fi
+        if [[ ! -d "$VOX_CACHE" ]]; then
+            echo "[DEBUG SKIP] $TASK: voxel cache not found"
+            continue
+        fi
 
-        echo "  Using task: $TASK"
+        echo ""
+        echo "  ---- $TASK ----"
         PYTHONPATH=. \
         python -u scripts/ec_diffuser_voxel_preprocess.py \
             --h5 "$H5" \
@@ -84,12 +92,17 @@ if [[ "$DEBUG" -eq 1 ]]; then
             --debug-samples "$DEBUG_SAMPLES" \
             --wandb-project "$WANDB_PROJECT"
 
-        echo "[DEBUG DONE] Check wandb project '$WANDB_PROJECT'"
-        exit 0
+        DEBUG_COUNT=$((DEBUG_COUNT + 1))
     done
 
-    echo "ERROR: No task found with both H5 and voxel cache."
-    exit 1
+    if [[ $DEBUG_COUNT -eq 0 ]]; then
+        echo "ERROR: No task found with both H5 and voxel cache."
+        exit 1
+    fi
+
+    echo ""
+    echo "[DEBUG DONE] $DEBUG_COUNT tasks logged to wandb project '$WANDB_PROJECT'"
+    exit 0
 fi
 
 # ==========================================================
