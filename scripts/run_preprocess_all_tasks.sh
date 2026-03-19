@@ -152,6 +152,11 @@ for TASK in "${TASKS[@]}"; do
 
     mkdir -p "$TASK_DIR"
 
+    # Snapshot the DLP checkpoint & config BEFORE processing so we capture
+    # the exact weights used, even if training overwrites best.pt mid-task.
+    cp "$DLP_CKPT" "${TASK_DIR}/dlp_ckpt.pt"
+    cp "$DLP_CFG"  "${TASK_DIR}/dlp_config.json"
+
     echo ""
     echo "========================================"
     echo "  Processing: $TASK"
@@ -167,8 +172,8 @@ for TASK in "${TASKS[@]}"; do
             python -u scripts/ec_diffuser_voxel_preprocess.py \
                 --h5 "$H5" \
                 --voxel-cache-dir "$VOX_CACHE" \
-                --dlp-cfg "$DLP_CFG" \
-                --dlp-ckpt "$DLP_CKPT" \
+                --dlp-cfg "${TASK_DIR}/dlp_config.json" \
+                --dlp-ckpt "${TASK_DIR}/dlp_ckpt.pt" \
                 --out-pkl "$OUT_PKL" \
                 --action-mode "$ACTION_MODE" \
                 --batch "$BATCH" \
@@ -200,26 +205,18 @@ for TASK in "${TASKS[@]}"; do
             --output "$OUT_PKL" \
             --delete-shards
 
-        # Snapshot the DLP checkpoint & config used for this task
-        cp "$DLP_CKPT" "${TASK_DIR}/dlp_ckpt.pt"
-        cp "$DLP_CFG"  "${TASK_DIR}/dlp_config.json"
-
     else
         # Single GPU
         PYTHONPATH=. \
         python -u scripts/ec_diffuser_voxel_preprocess.py \
             --h5 "$H5" \
             --voxel-cache-dir "$VOX_CACHE" \
-            --dlp-cfg "$DLP_CFG" \
-            --dlp-ckpt "$DLP_CKPT" \
+            --dlp-cfg "${TASK_DIR}/dlp_config.json" \
+            --dlp-ckpt "${TASK_DIR}/dlp_ckpt.pt" \
             --out-pkl "$OUT_PKL" \
             --action-mode "$ACTION_MODE" \
             --batch "$BATCH" \
             --device cuda
-
-        # Snapshot the DLP checkpoint & config used for this task
-        cp "$DLP_CKPT" "${TASK_DIR}/dlp_ckpt.pt"
-        cp "$DLP_CFG"  "${TASK_DIR}/dlp_config.json"
     fi
 
     echo "[DONE] $TASK -> $OUT_PKL"
