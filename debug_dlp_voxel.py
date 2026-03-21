@@ -535,7 +535,7 @@ def main():
         sys.exit(1)
 
     print(f"[info] Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     # unwrap common training bundles
     state = None
