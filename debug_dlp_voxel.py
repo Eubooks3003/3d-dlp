@@ -522,36 +522,8 @@ def main():
             cache_suffix=cache_suffix, proportion=proportion,
         )
 
-        # For multi-task: build a batch with exactly 3 samples per task
-        samples_per_task = 3
-        if hasattr(base_ds, 'tasks') and len(getattr(base_ds, 'tasks', [])) > 1:
-            from collections import defaultdict
-            task_sample_indices = defaultdict(list)
-            # Scan dataset for task labels
-            inner_ds = base_ds.base_ds if hasattr(base_ds, 'base_ds') else base_ds
-            for i in range(len(inner_ds)):
-                item = inner_ds[i]
-                t = item.get("task", None)
-                if t is not None and len(task_sample_indices[t]) < samples_per_task:
-                    task_sample_indices[t].append(i)
-                if all(len(v) >= samples_per_task for v in task_sample_indices.values()) \
-                        and len(task_sample_indices) == len(inner_ds.tasks):
-                    break
-
-            # Collect indices in task order
-            debug_indices = []
-            for t in sorted(task_sample_indices.keys()):
-                debug_indices.extend(task_sample_indices[t])
-            print(f"[info] Multi-task debug: {len(task_sample_indices)} tasks, "
-                  f"{samples_per_task} samples each, {len(debug_indices)} total")
-
-            from torch.utils.data import Subset
-            debug_subset = Subset(base_ds, debug_indices)
-            loader = DataLoader(debug_subset, batch_size=args.batch_size,
-                                shuffle=False, num_workers=0)
-        else:
-            loader = DataLoader(base_ds, batch_size=args.batch_size,
-                                shuffle=False, num_workers=4)
+        loader = DataLoader(base_ds, batch_size=args.batch_size,
+                            shuffle=True, num_workers=4)
 
     # ----- model -----
     model = load_model_from_config(cfg, device)
