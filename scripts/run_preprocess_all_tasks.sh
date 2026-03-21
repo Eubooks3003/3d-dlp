@@ -55,21 +55,29 @@ TASKS=(
 mkdir -p "$OUT_DIR"
 cd "$LPWM_DIR"
 
-# ---------- Debug: run on first available task then exit ----------
+# ---------- Debug: one forward pass per task ----------
 if [[ "$DEBUG" -eq 1 ]]; then
     echo "========================================"
-    echo "  DEBUG MODE — encode/decode sanity check"
+    echo "  DEBUG MODE — encode/decode sanity check (all tasks)"
     echo "  Samples: $DEBUG_SAMPLES | wandb project: $WANDB_PROJECT"
     echo "========================================"
 
+    DEBUG_COUNT=0
     for TASK in "${TASKS[@]}"; do
         H5="${DATA_ROOT}/core/${TASK}.hdf5"
         VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
 
-        if [[ ! -f "$H5" ]]; then continue; fi
-        if [[ ! -d "$VOX_CACHE" ]]; then continue; fi
+        if [[ ! -f "$H5" ]]; then
+            echo "[DEBUG SKIP] $TASK: H5 not found"
+            continue
+        fi
+        if [[ ! -d "$VOX_CACHE" ]]; then
+            echo "[DEBUG SKIP] $TASK: voxel cache not found"
+            continue
+        fi
 
-        echo "  Using task: $TASK"
+        echo ""
+        echo "  ---- $TASK ----"
         PYTHONPATH=. \
         python -u scripts/ec_diffuser_voxel_preprocess.py \
             --h5 "$H5" \
@@ -84,12 +92,17 @@ if [[ "$DEBUG" -eq 1 ]]; then
             --debug-samples "$DEBUG_SAMPLES" \
             --wandb-project "$WANDB_PROJECT"
 
-        echo "[DEBUG DONE] Check wandb project '$WANDB_PROJECT'"
-        exit 0
+        DEBUG_COUNT=$((DEBUG_COUNT + 1))
     done
 
-    echo "ERROR: No task found with both H5 and voxel cache."
-    exit 1
+    if [[ $DEBUG_COUNT -eq 0 ]]; then
+        echo "ERROR: No task found with both H5 and voxel cache."
+        exit 1
+    fi
+
+    echo ""
+    echo "[DEBUG DONE] $DEBUG_COUNT tasks logged to wandb project '$WANDB_PROJECT'"
+    exit 0
 fi
 
 # ==========================================================
@@ -121,7 +134,8 @@ echo "========================================"
 for TASK in "${TASKS[@]}"; do
     H5="${DATA_ROOT}/core/${TASK}.hdf5"
     VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
-    OUT_PKL="${OUT_DIR}/${TASK}.pkl"
+    TASK_DIR="${OUT_DIR}/${TASK}"
+    OUT_PKL="${TASK_DIR}/${TASK}.pkl"
 
     if [[ ! -f "$H5" ]]; then
         echo "[SKIP] $TASK: H5 not found at $H5"
@@ -136,6 +150,13 @@ for TASK in "${TASKS[@]}"; do
         continue
     fi
 
+    mkdir -p "$TASK_DIR"
+
+    # Snapshot the DLP checkpoint & config BEFORE processing so we capture
+    # the exact weights used, even if training overwrites best.pt mid-task.
+    cp "$DLP_CKPT" "${TASK_DIR}/dlp_ckpt.pt"
+    cp "$DLP_CFG"  "${TASK_DIR}/dlp_config.json"
+
     echo ""
     echo "========================================"
     echo "  Processing: $TASK"
@@ -145,14 +166,14 @@ for TASK in "${TASKS[@]}"; do
         # Multi-GPU: launch one process per GPU, then merge
         PIDS=()
         for ((rank=0; rank<NUM_GPUS; rank++)); do
-            LOG_FILE="${OUT_DIR}/${TASK}_rank${rank}.log"
+            LOG_FILE="${TASK_DIR}/${TASK}_rank${rank}.log"
             CUDA_VISIBLE_DEVICES=$rank \
             PYTHONPATH=. \
             python -u scripts/ec_diffuser_voxel_preprocess.py \
                 --h5 "$H5" \
                 --voxel-cache-dir "$VOX_CACHE" \
-                --dlp-cfg "$DLP_CFG" \
-                --dlp-ckpt "$DLP_CKPT" \
+                --dlp-cfg "${TASK_DIR}/dlp_config.json" \
+                --dlp-ckpt "${TASK_DIR}/dlp_ckpt.pt" \
                 --out-pkl "$OUT_PKL" \
                 --action-mode "$ACTION_MODE" \
                 --batch "$BATCH" \
@@ -168,7 +189,7 @@ for TASK in "${TASKS[@]}"; do
             if wait ${PIDS[$rank]}; then
                 echo "  [Rank $rank] done"
             else
-                echo "  [Rank $rank] FAILED (see ${OUT_DIR}/${TASK}_rank${rank}.log)"
+                echo "  [Rank $rank] FAILED (see ${TASK_DIR}/${TASK}_rank${rank}.log)"
                 FAILED=1
             fi
         done
@@ -190,8 +211,8 @@ for TASK in "${TASKS[@]}"; do
         python -u scripts/ec_diffuser_voxel_preprocess.py \
             --h5 "$H5" \
             --voxel-cache-dir "$VOX_CACHE" \
-            --dlp-cfg "$DLP_CFG" \
-            --dlp-ckpt "$DLP_CKPT" \
+            --dlp-cfg "${TASK_DIR}/dlp_config.json" \
+            --dlp-ckpt "${TASK_DIR}/dlp_ckpt.pt" \
             --out-pkl "$OUT_PKL" \
             --action-mode "$ACTION_MODE" \
             --batch "$BATCH" \
