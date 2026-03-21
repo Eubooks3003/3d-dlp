@@ -629,11 +629,21 @@ def main():
                 """Visualize one sample: GT, rec, fg, bg with color-coded KPs."""
                 gt_vol = model_output['x'][b_idx]
                 rec_vol = model_output['rec'][b_idx]
-                mu_tot = model_output["z_base"][b_idx] + model_output["mu_offset"][b_idx]
+                z_base = model_output["z_base"][b_idx]
+                mu_tot = z_base + model_output["mu_offset"][b_idx]
                 obj_on_vals = model_output["obj_on"][b_idx].reshape(-1)
                 fg_only = model_output['dec_objects'][b_idx]
                 bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b_idx]
 
+                # GT with z_base only (no offset) — shows prior anchor positions
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/gt_base", rgb_vol=gt_vol, alpha_vol=None,
+                    KPx=z_base, obj_on=obj_on_vals, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                save_or_log_figure(fig, f"{prefix}/gt_base", vis_step)
+
+                # GT with mu_tot (z_base + offset) — shows final KP positions
                 fig = log_rgb_voxels(
                     name=f"{prefix}/gt_kp", rgb_vol=gt_vol, alpha_vol=None,
                     KPx=mu_tot, obj_on=obj_on_vals, step=None,
