@@ -511,10 +511,47 @@ def main():
         # Load from point cloud dataset (original behavior)
         ds_name = cfg['ds']
         root    = cfg['root']
+        task = cfg.get("task", None)
+        tasks = cfg.get("tasks", None)
+        max_demos = cfg.get("max_demos", None)
+        cache_suffix = cfg.get("cache_suffix", "")
+        proportion = cfg.get("proportion", 1.0)
         base_ds = get_point_cloud_dataset(
-            ds_name, root, mode=args.split, max_points=4096, include_rgb=(ch == 6)
+            ds_name, root, mode=args.split, max_points=4096, include_rgb=(ch == 6),
+            task=task, tasks=tasks, max_demos=max_demos,
+            cache_suffix=cache_suffix, proportion=proportion,
         )
-        loader = DataLoader(base_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+        # For multi-task: build a batch with exactly 3 samples per task
+        samples_per_task = 3
+        if hasattr(base_ds, 'tasks') and len(getattr(base_ds, 'tasks', [])) > 1:
+            from collections import defaultdict
+            task_sample_indices = defaultdict(list)
+            # Scan dataset for task labels
+            inner_ds = base_ds.base_ds if hasattr(base_ds, 'base_ds') else base_ds
+            for i in range(len(inner_ds)):
+                item = inner_ds[i]
+                t = item.get("task", None)
+                if t is not None and len(task_sample_indices[t]) < samples_per_task:
+                    task_sample_indices[t].append(i)
+                if all(len(v) >= samples_per_task for v in task_sample_indices.values()) \
+                        and len(task_sample_indices) == len(inner_ds.tasks):
+                    break
+
+            # Collect indices in task order
+            debug_indices = []
+            for t in sorted(task_sample_indices.keys()):
+                debug_indices.extend(task_sample_indices[t])
+            print(f"[info] Multi-task debug: {len(task_sample_indices)} tasks, "
+                  f"{samples_per_task} samples each, {len(debug_indices)} total")
+
+            from torch.utils.data import Subset
+            debug_subset = Subset(base_ds, debug_indices)
+            loader = DataLoader(debug_subset, batch_size=args.batch_size,
+                                shuffle=False, num_workers=0)
+        else:
+            loader = DataLoader(base_ds, batch_size=args.batch_size,
+                                shuffle=False, num_workers=4)
 
     # ----- model -----
     model = load_model_from_config(cfg, device)
@@ -582,117 +619,96 @@ def main():
     # ----- loop -----
     step = 0
     max_batches = args.max_batches
-    iso_main = 0.65
-    iso_sweep = make_iso_sweep()
+    from collections import defaultdict
+    task_sample_count = defaultdict(int)  # track per-task vis count across batches
+
+    def _vis_sample(model_output, b_idx, prefix, vis_step):
+        """Visualize one sample: GT, rec, fg, bg with color-coded KPs."""
+        gt_vol = model_output['x'][b_idx]
+        rec_vol = model_output['rec'][b_idx]
+        z_base = model_output["z_base"][b_idx]
+        mu_tot = z_base + model_output["mu_offset"][b_idx]
+        obj_on_vals = model_output["obj_on"][b_idx].reshape(-1)
+        fg_only = model_output['dec_objects'][b_idx]
+        bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b_idx]
+
+        # GT with z_base only (no offset) — shows prior anchor positions
+        fig = log_rgb_voxels(
+            name=f"{prefix}/gt_base", rgb_vol=gt_vol, alpha_vol=None,
+            KPx=z_base, obj_on=obj_on_vals, step=None,
+            mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+        )
+        save_or_log_figure(fig, f"{prefix}/gt_base", vis_step)
+
+        # GT with mu_tot (z_base + offset) — shows final KP positions
+        fig = log_rgb_voxels(
+            name=f"{prefix}/gt_kp", rgb_vol=gt_vol, alpha_vol=None,
+            KPx=mu_tot, obj_on=obj_on_vals, step=None,
+            mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+        )
+        save_or_log_figure(fig, f"{prefix}/gt_kp", vis_step)
+
+        fig = log_rgb_voxels(
+            name=f"{prefix}/rec_kp", rgb_vol=rec_vol, alpha_vol=None,
+            KPx=mu_tot, obj_on=obj_on_vals, step=None,
+            mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+        )
+        save_or_log_figure(fig, f"{prefix}/rec_kp", vis_step)
+
+        fig = log_rgb_voxels(
+            name=f"{prefix}/fg_kp", rgb_vol=fg_only, alpha_vol=None,
+            KPx=mu_tot, obj_on=obj_on_vals, step=None,
+            mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+        )
+        save_or_log_figure(fig, f"{prefix}/fg_kp", vis_step)
+
+        fig = log_rgb_voxels(
+            name=f"{prefix}/bg", rgb_vol=bg_only, alpha_vol=None,
+            KPx=None, step=None,
+            mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+        )
+        save_or_log_figure(fig, f"{prefix}/bg", vis_step)
+
+    samples_per_task = 3
 
     with torch.no_grad():
         for batch in loader:
             batch = to_device(batch, device)
-            # training fed: vox = batch["voxels"]
-            vox  = batch["voxels"]  # [B, C, D, H, W] or [B, D, H, W] depending on your wrapper
-            # forward (with loss to get obj_on_l1)
+            vox = batch["voxels"]
             model_output = model(vox, warmup=False, with_loss=True)
 
-            # Print obj_on stats
-            obj_on = model_output.get('obj_on', None)
-            if obj_on is not None:
-                obj_on_l1 = obj_on.abs().mean().item()
-                obj_on_mean = obj_on.mean().item()
-                obj_on_min = obj_on.min().item()
-                obj_on_max = obj_on.max().item()
-                print(f"[obj_on] L1={obj_on_l1:.6f}  mean={obj_on_mean:.6f}  min={obj_on_min:.6f}  max={obj_on_max:.6f}")
+            # Print stats for first batch
+            if step == 0:
+                obj_on = model_output.get('obj_on', None)
+                if obj_on is not None:
+                    print(f"[obj_on] L1={obj_on.abs().mean():.6f}  mean={obj_on.mean():.6f}")
+                if 'loss' in model_output:
+                    print(f"[loss] total = {model_output['loss'].item():.4f}")
+                print_vol_stats("GT", model_output['x'][0])
+                print_vol_stats("REC", model_output['rec'][0])
 
-            # Print loss components if available
-            if 'obj_on_l1' in model_output:
-                print(f"[loss] obj_on_l1 = {model_output['obj_on_l1'].item():.6f}")
-            if 'loss' in model_output:
-                print(f"[loss] total = {model_output['loss'].item():.4f}")
-            if 'rec_loss' in model_output:
-                print(f"[loss] rec = {model_output['rec_loss'].item():.4f}")
-            if 'kl_loss' in model_output:
-                print(f"[loss] kl = {model_output['kl_loss'].item():.4f}")
-
-            print_vol_stats("GT", model_output['x'][0])
-            print_vol_stats("REC", model_output['rec'][0])
-
-            # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
-            with torch.no_grad():
-                out = filter_topk_kps_3d(
-                    z_base_var=model_output["z_base_var"],
-                    mu_tot=model_output["z_base"] + model_output["mu_offset"],
-                    topk=cfg['topk'],
-                    obj_on=model_output.get("obj_on", None),
-                    use_posterior_in_score=False,
-                )
-
-            def _vis_sample(b_idx, prefix, vis_step):
-                """Visualize one sample: GT, rec, fg, bg with color-coded KPs."""
-                gt_vol = model_output['x'][b_idx]
-                rec_vol = model_output['rec'][b_idx]
-                z_base = model_output["z_base"][b_idx]
-                mu_tot = z_base + model_output["mu_offset"][b_idx]
-                obj_on_vals = model_output["obj_on"][b_idx].reshape(-1)
-                fg_only = model_output['dec_objects'][b_idx]
-                bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b_idx]
-
-                # GT with z_base only (no offset) — shows prior anchor positions
-                fig = log_rgb_voxels(
-                    name=f"{prefix}/gt_base", rgb_vol=gt_vol, alpha_vol=None,
-                    KPx=z_base, obj_on=obj_on_vals, step=None,
-                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                )
-                save_or_log_figure(fig, f"{prefix}/gt_base", vis_step)
-
-                # GT with mu_tot (z_base + offset) — shows final KP positions
-                fig = log_rgb_voxels(
-                    name=f"{prefix}/gt_kp", rgb_vol=gt_vol, alpha_vol=None,
-                    KPx=mu_tot, obj_on=obj_on_vals, step=None,
-                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                )
-                save_or_log_figure(fig, f"{prefix}/gt_kp", vis_step)
-
-                fig = log_rgb_voxels(
-                    name=f"{prefix}/rec_kp", rgb_vol=rec_vol, alpha_vol=None,
-                    KPx=mu_tot, obj_on=obj_on_vals, step=None,
-                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                )
-                save_or_log_figure(fig, f"{prefix}/rec_kp", vis_step)
-
-                fig = log_rgb_voxels(
-                    name=f"{prefix}/fg_kp", rgb_vol=fg_only, alpha_vol=None,
-                    KPx=mu_tot, obj_on=obj_on_vals, step=None,
-                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                )
-                save_or_log_figure(fig, f"{prefix}/fg_kp", vis_step)
-
-                fig = log_rgb_voxels(
-                    name=f"{prefix}/bg", rgb_vol=bg_only, alpha_vol=None,
-                    KPx=None, step=None,
-                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
-                )
-                save_or_log_figure(fig, f"{prefix}/bg", vis_step)
-
-            # Check if multi-task
             batch_tasks = batch.get("task", None)
             is_multitask = batch_tasks is not None and len(set(batch_tasks)) > 1
 
             if is_multitask:
-                from collections import defaultdict
-                task_indices = defaultdict(list)
                 for b_idx, t in enumerate(batch_tasks):
-                    task_indices[t].append(b_idx)
+                    if task_sample_count[t] >= samples_per_task:
+                        continue
+                    j = task_sample_count[t]
+                    _vis_sample(model_output, b_idx, t, j)
+                    task_sample_count[t] += 1
 
-                for task_name, indices in sorted(task_indices.items()):
-                    for j, b_idx in enumerate(indices[:3]):
-                        sample_step = step * 1000 + j
-                        _vis_sample(b_idx, task_name, sample_step)
+                # Stop once all tasks have enough samples
+                all_done = all(c >= samples_per_task for c in task_sample_count.values())
+                if all_done:
+                    print(f"[info] Collected {samples_per_task} samples for all "
+                          f"{len(task_sample_count)} tasks, stopping.")
+                    break
             else:
-                _vis_sample(0, "debug", step)
-
-            print(f"\n[Step {step}] Visualizations saved/logged successfully.")
-            step += 1
-            if step >= max_batches:
-                break
+                _vis_sample(model_output, 0, "debug", step)
+                step += 1
+                if step >= max_batches:
+                    break
 
     print("[done] voxel debug pass complete.")
     if args.wandb:
