@@ -901,10 +901,11 @@ def log_rgb_voxels(
         if space == "global":
             r0, r1 = kp_range
             span = (r1 - r0)
-            # DLP outputs kp in (z,y,x) order -> voxel indices
-            z_vox = (kpx[:, 0] - r0) / span * (D - 1)
+            # DLP z_pos is (x, y, z) order — see spatial_transform() in util_func.py
+            # PyTorch affine_grid: x->W, y->H, z->D
+            x_vox = (kpx[:, 0] - r0) / span * (W - 1)
             y_vox = (kpx[:, 1] - r0) / span * (H - 1)
-            x_vox = (kpx[:, 2] - r0) / span * (W - 1)
+            z_vox = (kpx[:, 2] - r0) / span * (D - 1)
             kpx = np.stack([x_vox, y_vox, z_vox], axis=1)
 
         if obj_on_np is None:

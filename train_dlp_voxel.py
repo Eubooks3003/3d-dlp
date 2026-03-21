@@ -612,10 +612,11 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                     on_np = np.asarray(obj_on_vals, dtype=np.float32).reshape(-1)
 
                 # Convert from normalized [-1,1] to voxel indices
-                # DLP KP order: (dim0→D, dim1→H, dim2→W)
-                z_vox = (kp_np[:, 0] + 1) / 2 * (D - 1)
+                # DLP z_pos is (x, y, z) order — see spatial_transform() in util_func.py
+                # PyTorch affine_grid: x->W, y->H, z->D
+                x_vox = (kp_np[:, 0] + 1) / 2 * (W - 1)
                 y_vox = (kp_np[:, 1] + 1) / 2 * (H - 1)
-                x_vox = (kp_np[:, 2] + 1) / 2 * (W - 1)
+                z_vox = (kp_np[:, 2] + 1) / 2 * (D - 1)
 
                 for i in range(len(kp_np)):
                     x, y, z = float(x_vox[i]), float(y_vox[i]), float(z_vox[i])
