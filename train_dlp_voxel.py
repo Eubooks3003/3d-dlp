@@ -590,122 +590,117 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         # Log all epoch metrics in a single call (avoids issues with multiple logs at same step)
         wandb.log(epoch_log_dict, step=iteration)
 
-        # ------- TRAIN VISUALS (same as debug_dlp_voxel.py) -------
+        # ------- TRAIN VISUALS -------
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
-            b0 = 0
+            import plotly.graph_objects as go
 
-            gt_vol = model_output['x'][b0]
-            rec_vol = model_output['rec'][b0]
+            def _add_colored_kp_crosses(fig, kp_positions, obj_on_vals, D, H, W, half=2.0):
+                """Add KP crosses color-coded by obj_on: red=off, green=on."""
+                if kp_positions is None:
+                    return
+                if torch.is_tensor(kp_positions):
+                    kp_np = kp_positions.detach().cpu().tolist()
+                    kp_np = np.asarray(kp_np, dtype=np.float32)
+                else:
+                    kp_np = np.asarray(kp_positions, dtype=np.float32)
+                kp_np = kp_np.reshape(-1, 3)
 
-            # Extract keypoints
-            z_base_b0 = model_output["z_base"][b0]  # [K, 3]
-            mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
+                if torch.is_tensor(obj_on_vals):
+                    on_np = obj_on_vals.detach().cpu().tolist()
+                    on_np = np.asarray(on_np, dtype=np.float32).reshape(-1)
+                else:
+                    on_np = np.asarray(obj_on_vals, dtype=np.float32).reshape(-1)
 
-            # Extract fg/bg (same as debug_dlp_voxel.py)
-            fg_only = model_output['dec_objects'][b0]
-            bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b0]
+                # Convert from normalized [-1,1] to voxel indices
+                # DLP KP order: (dim0→D, dim1→H, dim2→W)
+                z_vox = (kp_np[:, 0] + 1) / 2 * (D - 1)
+                y_vox = (kp_np[:, 1] + 1) / 2 * (H - 1)
+                x_vox = (kp_np[:, 2] + 1) / 2 * (W - 1)
 
-            print(f"[Train Vis] gt_vol: {gt_vol.shape}, rec_vol: {rec_vol.shape}")
-            print(f"[Train Vis] fg_only: {fg_only.shape}, bg_only: {bg_only.shape}")
-            print(f"[Train Vis] mu_tot_b0 range: {mu_tot_b0.min():.3f} to {mu_tot_b0.max():.3f}")
+                for i in range(len(kp_np)):
+                    x, y, z = float(x_vox[i]), float(y_vox[i]), float(z_vox[i])
+                    on = float(np.clip(on_np[i], 0, 1))
+                    if on < 0.5:
+                        r, g, b = 255, int(255 * on * 2), 0
+                    else:
+                        r, g, b = int(255 * (1 - (on - 0.5) * 2)), 255, 0
+                    color = f"rgb({r},{g},{b})"
 
-            # 1. Full Reconstruction with KPs
-            log_rgb_voxels(
-                name="train/rec_with_kp",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                KPx=mu_tot_b0,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                    xs = [x - half, x + half, None, x, x, None, x, x, None]
+                    ys = [y, y, None, y - half, y + half, None, y, y, None]
+                    zs = [z, z, None, z, z, None, z - half, z + half, None]
+                    fig.add_trace(go.Scatter3d(
+                        x=xs, y=ys, z=zs, mode="lines",
+                        line=dict(width=6, color=color),
+                        name=f"KP{i} on={on:.2f}",
+                        showlegend=False,
+                    ))
 
-            # 2. Foreground only with KPs
-            log_rgb_voxels(
-                name="train/fg_with_kp",
-                rgb_vol=fg_only,
-                alpha_vol=None,
-                KPx=mu_tot_b0,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+            def _vis_one_sample(b_idx, prefix, model_output, iteration):
+                """Visualize one sample: GT, rec, fg, bg with color-coded KPs."""
+                gt_vol = model_output['x'][b_idx]
+                rec_vol = model_output['rec'][b_idx]
+                mu_tot = model_output["z_base"][b_idx] + model_output["mu_offset"][b_idx]
+                obj_on_vals = model_output["obj_on"][b_idx].reshape(-1)
+                fg_only = model_output['dec_objects'][b_idx]
+                bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b_idx]
 
-            # 3. Background only
-            log_rgb_voxels(
-                name="train/bg_only",
-                rgb_vol=bg_only,
-                alpha_vol=None,
-                KPx=None,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                D, H, W = gt_vol.shape[1], gt_vol.shape[2], gt_vol.shape[3]
 
-            # 4. Foreground only (no KPs)
-            log_rgb_voxels(
-                name="train/fg_only",
-                rgb_vol=fg_only,
-                alpha_vol=None,
-                KPx=None,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                # GT with color-coded KPs
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/gt_kp", rgb_vol=gt_vol,
+                    alpha_vol=None, KPx=None, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                _add_colored_kp_crosses(fig, mu_tot, obj_on_vals, D, H, W)
+                wandb.log({f"{prefix}/gt_kp": fig}, step=iteration)
 
-            # 5. Full rec (no KPs)
-            log_rgb_voxels(
-                name="train/rec_only",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                KPx=None,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                # Rec with color-coded KPs
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/rec_kp", rgb_vol=rec_vol,
+                    alpha_vol=None, KPx=None, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                _add_colored_kp_crosses(fig, mu_tot, obj_on_vals, D, H, W)
+                wandb.log({f"{prefix}/rec_kp": fig}, step=iteration)
 
-            # 6. GT voxels
-            log_rgb_voxels(
-                name="train/gt",
-                rgb_vol=gt_vol,
-                alpha_vol=None,
-                KPx=None,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                # FG with color-coded KPs
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/fg_kp", rgb_vol=fg_only,
+                    alpha_vol=None, KPx=None, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                _add_colored_kp_crosses(fig, mu_tot, obj_on_vals, D, H, W)
+                wandb.log({f"{prefix}/fg_kp": fig}, step=iteration)
 
-            # 7. GT voxels with KPs
-            log_rgb_voxels(
-                name="train/gt_with_kp",
-                rgb_vol=gt_vol,
-                alpha_vol=None,
-                KPx=mu_tot_b0,
-                step=iteration,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
+                # BG only (no KPs)
+                log_rgb_voxels(
+                    name=f"{prefix}/bg", rgb_vol=bg_only,
+                    alpha_vol=None, KPx=None, step=iteration,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+
+            # Check if multi-task: look for task labels in batch
+            batch_tasks = batch.get("task", None)
+            is_multitask = batch_tasks is not None and len(set(batch_tasks)) > 1
+
+            if is_multitask:
+                # Group batch indices by task, render up to 3 per task
+                # Use wandb step = iteration * 1000 + sample_idx so the slider
+                # scrubs through samples within each task panel
+                from collections import defaultdict
+                task_indices = defaultdict(list)
+                for b_idx, t in enumerate(batch_tasks):
+                    task_indices[t].append(b_idx)
+
+                for task_name, indices in sorted(task_indices.items()):
+                    for j, b_idx in enumerate(indices[:3]):
+                        sample_step = iteration * 1000 + j
+                        _vis_one_sample(b_idx, f"train/{task_name}", model_output, sample_step)
+            else:
+                # Single task: render first sample
+                _vis_one_sample(0, "train", model_output, iteration)
 
 
     wandb.finish()

@@ -612,148 +612,72 @@ def main():
             if 'kl_loss' in model_output:
                 print(f"[loss] kl = {model_output['kl_loss'].item():.4f}")
 
-            gt_vol = model_output['x'][0]
-            rec_vol = model_output['rec'][0]
-            print_vol_stats("GT", gt_vol)
-            print_vol_stats("REC", rec_vol)
+            print_vol_stats("GT", model_output['x'][0])
+            print_vol_stats("REC", model_output['rec'][0])
 
             # keypoints in normalized scene coords, shape [B,K,3] (order z,y,x)
-            kp_xyz = model_output.get('kp_p', None)
             with torch.no_grad():
-                # z_base_var: [B,K,6], mu_tot: [B,K,3], obj_on: [B,K,1]
                 out = filter_topk_kps_3d(
                     z_base_var=model_output["z_base_var"],
                     mu_tot=model_output["z_base"] + model_output["mu_offset"],
                     topk=cfg['topk'],
                     obj_on=model_output.get("obj_on", None),
-                    use_posterior_in_score=False  # set True to include posterior uncertainty
+                    use_posterior_in_score=False,
                 )
-                indices  = out["indices"]
-                topk_kp  = out["topk_kp"]
-                bb_scores= out["bb_scores"]
-            
-            print("bb scores: ", bb_scores)
-            b0 = 0  # first in batch
-            topk_kp_b0 = topk_kp[b0]  # [k, 3]
-            cov_b0 = model_output["cov_kp"][b0]  # [K, 6]
 
-            z_base_cov_b0 = model_output["z_base_cov"][b0]  # [K, 6]
+            def _vis_sample(b_idx, prefix, vis_step):
+                """Visualize one sample: GT, rec, fg, bg with color-coded KPs."""
+                gt_vol = model_output['x'][b_idx]
+                rec_vol = model_output['rec'][b_idx]
+                mu_tot = model_output["z_base"][b_idx] + model_output["mu_offset"][b_idx]
+                obj_on_vals = model_output["obj_on"][b_idx].reshape(-1)
+                fg_only = model_output['dec_objects'][b_idx]
+                bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[b_idx]
 
-            z_base_b0 = model_output["z_base"][b0]  # [K, 3]
-            mu_tot_b0 = z_base_b0 + model_output["mu_offset"][b0]  # [K, 3]
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/gt_kp", rgb_vol=gt_vol, alpha_vol=None,
+                    KPx=mu_tot, obj_on=obj_on_vals, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                save_or_log_figure(fig, f"{prefix}/gt_kp", vis_step)
 
-            print("z_base shape: ", z_base_b0.shape)
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/rec_kp", rgb_vol=rec_vol, alpha_vol=None,
+                    KPx=mu_tot, obj_on=obj_on_vals, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                save_or_log_figure(fig, f"{prefix}/rec_kp", vis_step)
 
-            # Voxel grid dimensions
-            D, H, W = voxel_grid_whd[2], voxel_grid_whd[1], voxel_grid_whd[0]
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/fg_kp", rgb_vol=fg_only, alpha_vol=None,
+                    KPx=mu_tot, obj_on=obj_on_vals, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                save_or_log_figure(fig, f"{prefix}/fg_kp", vis_step)
 
-            # NOTE: Keep keypoints in normalized [-1,1] space
-            # log_rgb_voxels now handles conversion internally with space="global"
-            print(f"[KP Debug] mu_tot_b0 range: {mu_tot_b0.min():.3f} to {mu_tot_b0.max():.3f}")
-            print(f"[KP Debug] z_base_b0 range: {z_base_b0.min():.3f} to {z_base_b0.max():.3f}")
-            print(f"[KP Debug] Voxel grid (D,H,W): ({D}, {H}, {W})")
+                fig = log_rgb_voxels(
+                    name=f"{prefix}/bg", rgb_vol=bg_only, alpha_vol=None,
+                    KPx=None, step=None,
+                    mode="splat", topk=60000, alpha_thresh=0.05, pad=2.0, show_axes=True,
+                )
+                save_or_log_figure(fig, f"{prefix}/bg", vis_step)
 
-            # Extract components for visualization
-            rec_rgb = model_output['rec_rgb'][0]           # Full composite reconstruction
-            fg_only = model_output['dec_objects'][0]       # Foreground only
-            bg_only = (model_output['bg_mask'] * model_output['bg'][:, :3])[0]  # Background only
+            # Check if multi-task
+            batch_tasks = batch.get("task", None)
+            is_multitask = batch_tasks is not None and len(set(batch_tasks)) > 1
 
-            print("fg only shape: ", fg_only.shape)
-            print("bg only shape: ", bg_only.shape)
-            print("rec_rgb shape: ", rec_rgb.shape)
+            if is_multitask:
+                from collections import defaultdict
+                task_indices = defaultdict(list)
+                for b_idx, t in enumerate(batch_tasks):
+                    task_indices[t].append(b_idx)
 
-            # ============ MAIN VISUALIZATIONS ============
-            # These are the key views the user requested: rec, fg, bg with KPs
-
-            # 1. Full Reconstruction with KPs (pass normalized coords, conversion done internally)
-            fig = log_rgb_voxels(
-                name="rec_with_kp",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                KPx=mu_tot_b0,  # Pass normalized [-1,1] keypoints
-                step=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-            save_or_log_figure(fig, "rec_with_kp", step)
-
-            # 2. Foreground only with KPs
-            fig = log_rgb_voxels(
-                name="fg_with_kp",
-                rgb_vol=fg_only,
-                alpha_vol=None,
-                KPx=mu_tot_b0,  # Pass normalized [-1,1] keypoints
-                step=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-            save_or_log_figure(fig, "fg_with_kp", step)
-
-            # 3. Background only
-            fig = log_rgb_voxels(
-                name="bg_only",
-                rgb_vol=bg_only,
-                alpha_vol=None,
-                KPx=None,
-                step=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-            save_or_log_figure(fig, "bg_only", step)
-
-            # 4. Foreground only (no KPs for comparison)
-            fig = log_rgb_voxels(
-                name="fg_only",
-                rgb_vol=fg_only,
-                alpha_vol=None,
-                KPx=None,
-                step=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-            save_or_log_figure(fig, "fg_only", step)
-
-            # 5. Full rec (no KPs for comparison)
-            fig = log_rgb_voxels(
-                name="rec_only",
-                rgb_vol=rec_vol,
-                alpha_vol=None,
-                KPx=None,
-                step=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-            save_or_log_figure(fig, "rec_only", step)
-
-            # 6. GT voxels
-            fig = log_rgb_voxels(
-                name="gt",
-                rgb_vol=gt_vol,
-                alpha_vol=None,
-                KPx=None,
-                step=None,
-                mode="splat",
-                topk=60000,
-                alpha_thresh=0.05,
-                pad=2.0,
-                show_axes=True,
-            )
-            save_or_log_figure(fig, "gt", step)
+                for task_name, indices in sorted(task_indices.items()):
+                    for j, b_idx in enumerate(indices[:3]):
+                        sample_step = step * 1000 + j
+                        _vis_sample(b_idx, task_name, sample_step)
+            else:
+                _vis_sample(0, "debug", step)
 
             print(f"\n[Step {step}] Visualizations saved/logged successfully.")
             step += 1

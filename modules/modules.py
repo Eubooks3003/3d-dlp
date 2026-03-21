@@ -2567,7 +2567,7 @@ class ObjectDecoderCNN(nn.Module):
 
         # force spatial size to (patch_size)^3
         if y.shape[2:] != (D, H, W):
-            y = F.interpolate(y, size=(D, H, W), mode="trilinear", align_corners=False)
+            y = F.interpolate(y, size=(int(D), int(H), int(W)), mode="trilinear", align_corners=False)
 
         return y
 
