@@ -51,7 +51,7 @@ TASK_SPECIFIC_BOUNDS = {
     "square": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4,"zmin": 0.0, "zmax": 1.6},
     "stack_three": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4,"zmin": 0.2, "zmax": 1.6},
     "threading": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4,"zmin": 0.2, "zmax": 1.6},
-    "kitchen": {"xmin": -0.5, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.9, "zmax": 1.4},
+    "kitchen": {"xmin": -1.1, "xmax": 0.3, "ymin": -0.4, "ymax": 0.4, "zmin": 0.7, "zmax": 1.4},
     "coffee": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
     "coffee_preparation": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.5, "ymax": 0.4, "zmin": 0.2, "zmax": 1.6},
     "mug_cleanup": {"xmin": -0.5, "xmax": 0.4, "ymin": -0.4, "ymax": 0.5, "zmin": 0.2, "zmax": 1.6},

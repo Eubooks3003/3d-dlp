@@ -462,6 +462,8 @@ def main():
                     help="Load voxels from this directory instead of dataset (e.g., saved mimicgen voxels)")
     ap.add_argument("--save-html", action="store_true", help="Save plotly figures as HTML files instead of logging to W&B.")
     ap.add_argument("--output-dir", type=str, default="./debug_output", help="Directory to save HTML outputs.")
+    ap.add_argument("--task", type=str, default=None, help="Focus on a single task (e.g., 'coffee'). Shows --n-samples frames from that task only.")
+    ap.add_argument("--n-samples", type=int, default=3, help="Number of samples per task to visualize (default: 3).")
     args = ap.parse_args()
 
     # Auto-discover checkpoint if directory given or from config directory
@@ -641,7 +643,8 @@ def main():
         )
         save_or_log_figure(fig, f"{prefix}/bg", vis_step)
 
-    samples_per_task = 3
+    samples_per_task = args.n_samples
+    focus_task = args.task  # None = all tasks
 
     with torch.no_grad():
         for batch in loader:
@@ -664,17 +667,25 @@ def main():
 
             if is_multitask:
                 for b_idx, t in enumerate(batch_tasks):
+                    # Skip tasks we don't care about
+                    if focus_task is not None and t != focus_task:
+                        continue
                     if task_sample_count[t] >= samples_per_task:
                         continue
                     j = task_sample_count[t]
                     _vis_sample(model_output, b_idx, t, j)
                     task_sample_count[t] += 1
 
-                # Stop once all tasks have enough samples
-                all_done = all(c >= samples_per_task for c in task_sample_count.values())
-                if all_done:
-                    print(f"[info] Collected {samples_per_task} samples for all "
-                          f"{len(task_sample_count)} tasks, stopping.")
+                # Stop condition
+                if focus_task is not None:
+                    if task_sample_count[focus_task] >= samples_per_task:
+                        print(f"[info] Collected {samples_per_task} samples for '{focus_task}', stopping.")
+                        break
+                else:
+                    all_done = all(c >= samples_per_task for c in task_sample_count.values())
+                    if all_done:
+                        print(f"[info] Collected {samples_per_task} samples for all "
+                              f"{len(task_sample_count)} tasks, stopping.")
                     break
             else:
                 _vis_sample(model_output, 0, "debug", step)
