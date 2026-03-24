@@ -83,6 +83,7 @@ if [[ "$DEBUG" -eq 1 ]]; then
     export WANDB_RESUME="allow"
 
     DEBUG_COUNT=0
+    GLOBAL_STEP=0
     for TASK in "${TASKS[@]}"; do
         H5="${DATA_ROOT}/core/${TASK}.hdf5"
         VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
@@ -111,9 +112,11 @@ if [[ "$DEBUG" -eq 1 ]]; then
             --debug \
             --debug-samples "$DEBUG_SAMPLES" \
             --wandb-project "$WANDB_PROJECT" \
-            --task-name "$TASK"
+            --task-name "$TASK" \
+            --step-offset "$GLOBAL_STEP"
 
         DEBUG_COUNT=$((DEBUG_COUNT + 1))
+        GLOBAL_STEP=$((GLOBAL_STEP + DEBUG_SAMPLES))
     done
 
     if [[ $DEBUG_COUNT -eq 0 ]]; then
