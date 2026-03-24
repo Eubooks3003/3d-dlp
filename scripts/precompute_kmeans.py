@@ -29,17 +29,27 @@ sys.modules['numpy._core.multiarray'] = _core.multiarray
 
 TASKS = [
     "coffee_d0",
+    "coffee_d2",
     "coffee_preparation_d0",
+    "coffee_preparation_d1",
     "hammer_cleanup_d0",
+    "hammer_cleanup_d1",
     "kitchen_d0",
+    "kitchen_d1",
     "mug_cleanup_d0",
+    "mug_cleanup_d1",
     "nut_assembly_d0",
     "pick_place_d0",
     "square_d0",
+    "square_d2",
     "stack_d0",
+    "stack_d1",
     "stack_three_d0",
+    "stack_three_d1",
     "threading_d0",
+    "threading_d2",
     "three_piece_assembly_d0",
+    "three_piece_assembly_d2",
 ]
 
 
@@ -112,10 +122,11 @@ def build_frame_list(data_root, tasks):
 
 
 def build_model(cfg_path, ckpt_path, device):
-    """Build DLP model and return just the prior module."""
+    """Build DLP model and return just the prior module.
+    If ckpt_path is None, uses fresh-init weights (fine for the rgb_km prior
+    which is pure algorithmic k-means with no learned parameters)."""
     from voxel_models import DLP
     from utils.util_func import get_config
-    from utils.log_utils import load_checkpoint
 
     cfg = get_config(cfg_path)
     model = DLP(
@@ -162,7 +173,9 @@ def build_model(cfg_path, ckpt_path, device):
         depth_loss_ratio=cfg.get("depth_loss_ratio", 1.0),
     ).to(device)
     model.eval()
-    _ = load_checkpoint(ckpt_path, model, None, None, map_location=device)
+    if ckpt_path is not None:
+        from utils.log_utils import load_checkpoint
+        _ = load_checkpoint(ckpt_path, model, None, None, map_location=device)
     return model.prior_module
 
 
@@ -251,7 +264,8 @@ def main():
     ap = argparse.ArgumentParser(description="Fast parallel kmeans precomputation")
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--dlp-cfg", required=True)
-    ap.add_argument("--dlp-ckpt", required=True)
+    ap.add_argument("--dlp-ckpt", default=None,
+                    help="DLP checkpoint (optional — prior uses rgb_km which needs no weights)")
     ap.add_argument("--num-gpus", type=int, default=None,
                     help="Number of GPUs (default: all available)")
     ap.add_argument("--workers-per-gpu", type=int, default=2,

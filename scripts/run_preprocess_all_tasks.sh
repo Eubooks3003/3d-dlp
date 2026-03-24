@@ -39,17 +39,27 @@ fi
 
 TASKS=(
     coffee_d0
+    coffee_d2
     coffee_preparation_d0
+    coffee_preparation_d1
     hammer_cleanup_d0
+    hammer_cleanup_d1
     kitchen_d0
+    kitchen_d1
     mug_cleanup_d0
+    mug_cleanup_d1
     nut_assembly_d0
     pick_place_d0
     square_d0
+    square_d2
     stack_d0
+    stack_d1
     stack_three_d0
+    stack_three_d1
     threading_d0
+    threading_d2
     three_piece_assembly_d0
+    three_piece_assembly_d2
 )
 
 mkdir -p "$OUT_DIR"
