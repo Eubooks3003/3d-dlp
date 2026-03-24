@@ -79,11 +79,8 @@ if [[ "$DEBUG" -eq 1 ]]; then
     echo "  Samples: $DEBUG_SAMPLES | wandb project: $WANDB_PROJECT"
     echo "========================================"
 
-    export WANDB_RUN_ID="debug-$(date +%s)"
-    export WANDB_RESUME="allow"
-
-    DEBUG_COUNT=0
-    GLOBAL_STEP=0
+    # Collect valid tasks (H5 + voxel cache both exist)
+    VALID_TASKS=()
     for TASK in "${TASKS[@]}"; do
         H5="${DATA_ROOT}/core/${TASK}.hdf5"
         VOX_CACHE="${DATA_ROOT}/${TASK}/voxel_cache/voxel"
@@ -96,36 +93,31 @@ if [[ "$DEBUG" -eq 1 ]]; then
             echo "[DEBUG SKIP] $TASK: voxel cache not found"
             continue
         fi
-
-        echo ""
-        echo "  ---- $TASK ----"
-        PYTHONPATH=. \
-        python -u scripts/ec_diffuser_voxel_preprocess.py \
-            --h5 "$H5" \
-            --voxel-cache-dir "$VOX_CACHE" \
-            --dlp-cfg "$DLP_CFG" \
-            --dlp-ckpt "$DLP_CKPT" \
-            --out-pkl "/dev/null" \
-            --action-mode "$ACTION_MODE" \
-            --batch "$BATCH" \
-            --device cuda \
-            --debug \
-            --debug-samples "$DEBUG_SAMPLES" \
-            --wandb-project "$WANDB_PROJECT" \
-            --task-name "$TASK" \
-            --step-offset "$GLOBAL_STEP"
-
-        DEBUG_COUNT=$((DEBUG_COUNT + 1))
-        GLOBAL_STEP=$((GLOBAL_STEP + DEBUG_SAMPLES))
+        VALID_TASKS+=("$TASK")
     done
 
-    if [[ $DEBUG_COUNT -eq 0 ]]; then
+    if [[ ${#VALID_TASKS[@]} -eq 0 ]]; then
         echo "ERROR: No task found with both H5 and voxel cache."
         exit 1
     fi
 
+    echo "  Tasks: ${VALID_TASKS[*]}"
     echo ""
-    echo "[DEBUG DONE] $DEBUG_COUNT tasks logged to wandb project '$WANDB_PROJECT'"
+
+    PYTHONPATH=. \
+    python -u scripts/ec_diffuser_voxel_preprocess.py \
+        --dlp-cfg "$DLP_CFG" \
+        --dlp-ckpt "$DLP_CKPT" \
+        --device cuda \
+        --batch "$BATCH" \
+        --debug \
+        --debug-samples "$DEBUG_SAMPLES" \
+        --wandb-project "$WANDB_PROJECT" \
+        --data-root "$DATA_ROOT" \
+        --debug-tasks "${VALID_TASKS[@]}"
+
+    echo ""
+    echo "[DEBUG DONE] ${#VALID_TASKS[@]} tasks logged to wandb project '$WANDB_PROJECT'"
     exit 0
 fi
 

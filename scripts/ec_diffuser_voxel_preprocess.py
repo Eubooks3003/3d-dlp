@@ -239,114 +239,114 @@ def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
     return voxels
 
 
-def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_project: str = "ec-diffuser-debug", num_samples: int = 3, task_name: str = None, step_offset: int = 0):
+def run_debug_mode(model, data_root: str, tasks: list, device: torch.device, wandb_project: str = "ec-diffuser-debug", num_samples: int = 3):
     """
     Run samples through encode->decode and visualize in wandb.
-    Uses cached kmeans (matching the production preprocessing path).
-    Shows GT, reconstruction, and difference for each sample.
+    All tasks are logged in a SINGLE wandb run with task-prefixed keys
+    so they appear as separate dropdowns in the wandb UI.
     """
     import wandb
     from eval.eval_vox import log_rgb_voxels
     from tqdm import tqdm
 
-    # Load voxels from nested cache structure
-    voxels = load_voxels_from_nested_cache(voxel_cache_dir, num_samples=num_samples)
-    if not voxels:
-        raise RuntimeError(f"No voxels found in {voxel_cache_dir}")
+    wandb.init(project=wandb_project, name="debug-dlp-all-tasks")
 
-    print(f"[debug] Loaded {len(voxels)} voxels")
+    global_step = 0
+    for task_name in tasks:
+        voxel_cache_dir = os.path.join(data_root, task_name, "voxel_cache", "voxel")
+        kmeans_cache_dir = os.path.join(data_root, task_name, "voxel_cache", "kmeans_cache")
+        prefix = f"{task_name}/"
 
-    # Resolve kmeans cache dir (sibling of voxel dir)
-    kmeans_cache_dir = os.path.join(os.path.dirname(voxel_cache_dir), "kmeans_cache")
+        voxels = load_voxels_from_nested_cache(voxel_cache_dir, num_samples=num_samples)
+        if not voxels:
+            print(f"[debug] WARNING: no voxels in {voxel_cache_dir}, skipping {task_name}")
+            continue
 
-    # Initialize wandb (resumes existing run if WANDB_RUN_ID/WANDB_RESUME are set)
-    prefix = f"{task_name}/" if task_name else ""
-    wandb.init(project=wandb_project, name=f"debug-dlp-all-tasks")
+        print(f"\n[debug] {task_name}: loaded {len(voxels)} voxels")
 
-    for i, (vox, vox_path) in enumerate(tqdm(voxels, desc=f"Processing {task_name or 'samples'}")):
-        global_step = step_offset + i
-        print(f"\n[debug] Sample {i}: {vox.shape} from {os.path.basename(vox_path)}")
+        for i, (vox, vox_path) in enumerate(tqdm(voxels, desc=f"Processing {task_name}")):
+            print(f"\n[debug] {task_name} sample {i}: {vox.shape} from {os.path.basename(vox_path)}")
 
-        # Log GT voxel
-        log_rgb_voxels(
-            name=f"{prefix}samples/input_{i}",
-            rgb_vol=vox,
-            alpha_vol=None,
-            KPx=None,
-            step=global_step,
-            mode="splat",
-            topk=60000,
-            alpha_thresh=0.05,
-            pad=2.0,
-            show_axes=True,
-        )
+            # Log GT voxel
+            log_rgb_voxels(
+                name=f"{prefix}samples/input_{i}",
+                rgb_vol=vox,
+                alpha_vol=None,
+                KPx=None,
+                step=global_step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
 
-        # Load cached kmeans for this frame (matches production path)
-        # vox_path: .../voxel_cache/voxel/demo_X/frameY_voxels.pt
-        # km_path:  .../voxel_cache/kmeans_cache/demo_X/frameY_kmeans.pt
-        demo_name = os.path.basename(os.path.dirname(vox_path))
-        frame_name = os.path.basename(vox_path).replace("_voxels.pt", "_kmeans.pt")
-        km_path = os.path.join(kmeans_cache_dir, demo_name, frame_name)
+            # Load cached kmeans for this frame (matches production path)
+            demo_name = os.path.basename(os.path.dirname(vox_path))
+            frame_name = os.path.basename(vox_path).replace("_voxels.pt", "_kmeans.pt")
+            km_path = os.path.join(kmeans_cache_dir, demo_name, frame_name)
 
-        meta = None
-        if os.path.exists(km_path):
-            km = torch.load(km_path, map_location="cpu", weights_only=False)
-            meta = {
-                "kmeans_kp": km["kp"].unsqueeze(0).to(device),
-                "kmeans_cov": km["cov"].unsqueeze(0).to(device),
-            }
-            print(f"[debug] Using cached kmeans from {km_path}")
-        else:
-            print(f"[debug] WARNING: no cached kmeans at {km_path}, recomputing")
+            meta = None
+            if os.path.exists(km_path):
+                km = torch.load(km_path, map_location="cpu", weights_only=False)
+                meta = {
+                    "kmeans_kp": km["kp"].unsqueeze(0).to(device),
+                    "kmeans_cov": km["cov"].unsqueeze(0).to(device),
+                }
+                print(f"[debug] Using cached kmeans from {km_path}")
+            else:
+                print(f"[debug] WARNING: no cached kmeans at {km_path}, recomputing")
 
-        # Run through model (with cached kmeans, matching production path)
-        vox_input = vox.unsqueeze(0).to(device)
-        with torch.no_grad():
-            out = model(vox_input, deterministic=True, warmup=False, with_loss=True, meta=meta)
+            # Run through model (with cached kmeans, matching production path)
+            vox_input = vox.unsqueeze(0).to(device)
+            with torch.no_grad():
+                out = model(vox_input, deterministic=True, warmup=False, with_loss=True, meta=meta)
 
-        # Get reconstruction
-        vox_rec = out.get("rec", out.get("reconstruction", None))
-        if vox_rec is None:
-            vox_rec = model.decode(out)
-        vox_rec = vox_rec[0].cpu()
+            # Get reconstruction
+            vox_rec = out.get("rec", out.get("reconstruction", None))
+            if vox_rec is None:
+                vox_rec = model.decode(out)
+            vox_rec = vox_rec[0].cpu()
 
-        # Log reconstruction
-        log_rgb_voxels(
-            name=f"{prefix}samples/rec_{i}",
-            rgb_vol=vox_rec,
-            alpha_vol=None,
-            KPx=None,
-            step=global_step,
-            mode="splat",
-            topk=60000,
-            alpha_thresh=0.05,
-            pad=2.0,
-            show_axes=True,
-        )
+            # Log reconstruction
+            log_rgb_voxels(
+                name=f"{prefix}samples/rec_{i}",
+                rgb_vol=vox_rec,
+                alpha_vol=None,
+                KPx=None,
+                step=global_step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
 
-        # Log difference
-        diff = (vox - vox_rec).abs()
-        diff_scaled = diff / (diff.max() + 1e-8)
-        log_rgb_voxels(
-            name=f"{prefix}samples/diff_{i}",
-            rgb_vol=diff_scaled,
-            alpha_vol=None,
-            KPx=None,
-            step=global_step,
-            mode="splat",
-            topk=60000,
-            alpha_thresh=0.01,
-            pad=2.0,
-            show_axes=True,
-        )
+            # Log difference
+            diff = (vox - vox_rec).abs()
+            diff_scaled = diff / (diff.max() + 1e-8)
+            log_rgb_voxels(
+                name=f"{prefix}samples/diff_{i}",
+                rgb_vol=diff_scaled,
+                alpha_vol=None,
+                KPx=None,
+                step=global_step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.01,
+                pad=2.0,
+                show_axes=True,
+            )
 
-        # Metrics
-        mse = float(((vox - vox_rec) ** 2).mean())
-        print(f"[debug] Sample {i} MSE: {mse:.6f}")
-        wandb.log({f"{prefix}metrics/mse": mse}, step=global_step)
+            # Metrics
+            mse = float(((vox - vox_rec) ** 2).mean())
+            print(f"[debug] {task_name} sample {i} MSE: {mse:.6f}")
+            wandb.log({f"{prefix}metrics/mse": mse}, step=global_step)
+
+            global_step += 1
 
     wandb.finish()
-    print(f"\n[debug] Done! Check wandb project '{wandb_project}'")
+    print(f"\n[debug] Done! {len(tasks)} tasks logged to wandb project '{wandb_project}'")
 
 
 # ----------------------------
@@ -401,9 +401,9 @@ def main():
     )
 
     # Data paths
-    ap.add_argument("--h5", required=True,
+    ap.add_argument("--h5", default=None,
                     help="Path to MimicGen H5 file (for actions and gripper state)")
-    ap.add_argument("--voxel-cache-dir", required=True,
+    ap.add_argument("--voxel-cache-dir", default=None,
                     help="Path to voxel cache directory (e.g., .../voxel_cache_new)")
     ap.add_argument("--max-demos", type=int, default=None,
                     help="Limit number of demos to process")
@@ -425,7 +425,7 @@ def main():
                     help="'absolute': convert to absolute pose, 'relative': use raw delta actions")
 
     # Output
-    ap.add_argument("--out-pkl", required=True,
+    ap.add_argument("--out-pkl", default=None,
                     help="Output pickle file path")
 
     # Debug mode
@@ -435,10 +435,10 @@ def main():
                     help="Number of samples to visualize in debug mode (default: 3)")
     ap.add_argument("--wandb-project", type=str, default="ec-diffuser-debug",
                     help="Wandb project name for debug visualization")
-    ap.add_argument("--task-name", type=str, default=None,
-                    help="Task name prefix for wandb log keys (e.g. 'coffee_d2')")
-    ap.add_argument("--step-offset", type=int, default=0,
-                    help="Global step offset for wandb logging (avoids step collisions across tasks)")
+    ap.add_argument("--data-root", type=str, default=None,
+                    help="Data root for multi-task debug (e.g., .../3D-DLP-mimicgen-data)")
+    ap.add_argument("--debug-tasks", nargs='+', default=None,
+                    help="Task names for multi-task debug mode")
 
     # Distributed processing
     ap.add_argument("--rank", type=int, default=0,
@@ -449,6 +449,25 @@ def main():
     args = ap.parse_args()
 
     device = torch.device(args.device if ("cuda" in args.device and torch.cuda.is_available()) else "cpu")
+
+    # Load DLP model
+    cfg = get_config(args.dlp_cfg)
+    model = build_dlp_from_cfg(cfg, device)
+    _ = load_checkpoint(args.dlp_ckpt, model, None, None, map_location=device)
+    expected_c = int(cfg.get("ch", 3))
+    print(f"[dlp] Loaded model, expected channels: {expected_c}")
+
+    # Debug mode: all tasks in one wandb run, then exit
+    if args.debug:
+        if not args.debug_tasks or not args.data_root:
+            ap.error("--debug requires --data-root and --debug-tasks")
+        run_debug_mode(model, args.data_root, args.debug_tasks, device,
+                       wandb_project=args.wandb_project, num_samples=args.debug_samples)
+        return
+
+    # Normal mode requires these args
+    if not args.h5 or not args.voxel_cache_dir or not args.out_pkl:
+        ap.error("--h5, --voxel-cache-dir, and --out-pkl are required for normal mode")
 
     # Scan voxel cache
     print(f"[voxel] Scanning voxel cache: {args.voxel_cache_dir}")
@@ -474,19 +493,6 @@ def main():
         sample_demo = demos[0]
         sample_frames = sorted(voxel_map[sample_demo].keys())
         print(f"[voxel] Sample: {sample_demo} has {len(sample_frames)} frames (t={sample_frames[0]}..{sample_frames[-1]})")
-
-    # Load DLP model
-    cfg = get_config(args.dlp_cfg)
-    model = build_dlp_from_cfg(cfg, device)
-    _ = load_checkpoint(args.dlp_ckpt, model, None, None, map_location=device)
-    expected_c = int(cfg.get("ch", 3))
-    print(f"[dlp] Loaded model, expected channels: {expected_c}")
-
-    # Debug mode: process samples and exit
-    if args.debug:
-        print(f"[debug] Running debug mode on voxel cache: {args.voxel_cache_dir}")
-        run_debug_mode(model, args.voxel_cache_dir, device, wandb_project=args.wandb_project, num_samples=args.debug_samples, task_name=args.task_name, step_offset=args.step_offset)
-        return  # Exit after debug
 
     # Action converter (only for absolute mode)
     action_converter = None
