@@ -302,18 +302,43 @@ def run_debug_mode(model, data_root: str, tasks: list, device: torch.device, wan
             with torch.no_grad():
                 out = model(vox_input, deterministic=True, warmup=False, with_loss=True, meta=meta)
 
-            # Get reconstruction
+            # Get reconstruction and keypoints
             vox_rec = out.get("rec", out.get("reconstruction", None))
             if vox_rec is None:
                 vox_rec = model.decode(out)
             vox_rec = vox_rec[0].cpu()
 
-            # Log reconstruction
+            # Keypoint positions: z_base + mu_offset = mu_tot [bs, K, 3]
+            mu_tot = out.get("mu_tot", None)
+            if mu_tot is None and "z_base" in out and "mu_offset" in out:
+                mu_tot = out["z_base"] + out["mu_offset"]
+            kp_pos = mu_tot[0].cpu() if mu_tot is not None else None
+
+            obj_on = out.get("obj_on", None)
+            obj_on_vals = obj_on[0].cpu() if obj_on is not None else None
+
+            # Log GT with keypoints
+            log_rgb_voxels(
+                name=f"{prefix}samples/input_kp_{i}",
+                rgb_vol=vox,
+                alpha_vol=None,
+                KPx=kp_pos,
+                obj_on=obj_on_vals,
+                step=global_step,
+                mode="splat",
+                topk=60000,
+                alpha_thresh=0.05,
+                pad=2.0,
+                show_axes=True,
+            )
+
+            # Log reconstruction with keypoints
             log_rgb_voxels(
                 name=f"{prefix}samples/rec_{i}",
                 rgb_vol=vox_rec,
                 alpha_vol=None,
-                KPx=None,
+                KPx=kp_pos,
+                obj_on=obj_on_vals,
                 step=global_step,
                 mode="splat",
                 topk=60000,
