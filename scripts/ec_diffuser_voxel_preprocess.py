@@ -239,7 +239,7 @@ def load_voxels_from_nested_cache(cache_dir: str, num_samples: int = 5):
     return voxels
 
 
-def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_project: str = "ec-diffuser-debug", num_samples: int = 3):
+def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_project: str = "ec-diffuser-debug", num_samples: int = 3, task_name: str = None):
     """
     Run samples through encode->decode and visualize in wandb.
     Uses cached kmeans (matching the production preprocessing path).
@@ -259,15 +259,16 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
     # Resolve kmeans cache dir (sibling of voxel dir)
     kmeans_cache_dir = os.path.join(os.path.dirname(voxel_cache_dir), "kmeans_cache")
 
-    # Initialize wandb
-    wandb.init(project=wandb_project, name=f"debug-dlp-{len(voxels)}-samples")
+    # Initialize wandb (resumes existing run if WANDB_RUN_ID/WANDB_RESUME are set)
+    prefix = f"{task_name}/" if task_name else ""
+    wandb.init(project=wandb_project, name=f"debug-dlp-all-tasks")
 
-    for i, (vox, vox_path) in enumerate(tqdm(voxels, desc="Processing samples")):
+    for i, (vox, vox_path) in enumerate(tqdm(voxels, desc=f"Processing {task_name or 'samples'}")):
         print(f"\n[debug] Sample {i}: {vox.shape} from {os.path.basename(vox_path)}")
 
         # Log GT voxel
         log_rgb_voxels(
-            name=f"samples/input_{i}",
+            name=f"{prefix}samples/input_{i}",
             rgb_vol=vox,
             alpha_vol=None,
             KPx=None,
@@ -310,7 +311,7 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
 
         # Log reconstruction
         log_rgb_voxels(
-            name=f"samples/rec_{i}",
+            name=f"{prefix}samples/rec_{i}",
             rgb_vol=vox_rec,
             alpha_vol=None,
             KPx=None,
@@ -326,7 +327,7 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
         diff = (vox - vox_rec).abs()
         diff_scaled = diff / (diff.max() + 1e-8)
         log_rgb_voxels(
-            name=f"samples/diff_{i}",
+            name=f"{prefix}samples/diff_{i}",
             rgb_vol=diff_scaled,
             alpha_vol=None,
             KPx=None,
@@ -341,7 +342,7 @@ def run_debug_mode(model, voxel_cache_dir: str, device: torch.device, wandb_proj
         # Metrics
         mse = float(((vox - vox_rec) ** 2).mean())
         print(f"[debug] Sample {i} MSE: {mse:.6f}")
-        wandb.log({f"metrics/mse_{i}": mse}, step=i)
+        wandb.log({f"{prefix}metrics/mse_{i}": mse}, step=i)
 
     wandb.finish()
     print(f"\n[debug] Done! Check wandb project '{wandb_project}'")
@@ -433,6 +434,8 @@ def main():
                     help="Number of samples to visualize in debug mode (default: 3)")
     ap.add_argument("--wandb-project", type=str, default="ec-diffuser-debug",
                     help="Wandb project name for debug visualization")
+    ap.add_argument("--task-name", type=str, default=None,
+                    help="Task name prefix for wandb log keys (e.g. 'coffee_d2')")
 
     # Distributed processing
     ap.add_argument("--rank", type=int, default=0,
@@ -479,7 +482,7 @@ def main():
     # Debug mode: process samples and exit
     if args.debug:
         print(f"[debug] Running debug mode on voxel cache: {args.voxel_cache_dir}")
-        run_debug_mode(model, args.voxel_cache_dir, device, wandb_project=args.wandb_project, num_samples=args.debug_samples)
+        run_debug_mode(model, args.voxel_cache_dir, device, wandb_project=args.wandb_project, num_samples=args.debug_samples, task_name=args.task_name)
         return  # Exit after debug
 
     # Action converter (only for absolute mode)

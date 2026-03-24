@@ -346,42 +346,67 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
 
         # Discover tasks if not provided
         if tasks is None:
-            task_dirs = sorted(glob.glob(os.path.join(self.root, "*_d0")))
-            tasks = [os.path.basename(d).replace("_d0", "") for d in task_dirs]
+            # Auto-discover all task folders that have a voxel cache
+            tasks = []
+            for d in sorted(os.listdir(self.root)):
+                full = os.path.join(self.root, d)
+                if not os.path.isdir(full):
+                    continue
+                # Check for voxel cache in either layout
+                if (os.path.isdir(os.path.join(full, "voxel_cache", "voxel")) or
+                        os.path.isdir(os.path.join(full, "core", "voxel_cache"))):
+                    tasks.append(d)
             if len(tasks) == 0:
-                raise RuntimeError(f"No *_d0 task folders found in {self.root}")
+                raise RuntimeError(f"No task folders with voxel caches found in {self.root}")
             print(f"[MimicGenMultiTaskVoxelDataset] Auto-discovered {len(tasks)} tasks: {tasks}")
 
         self.tasks = tasks
         self._task_to_idx = {t: i for i, t in enumerate(tasks)}
 
         # Build cache directories for each task
+        # Supports two layouts:
+        #   1. {root}/{task}/voxel_cache/voxel/  (current, from hdf5_states_to_voxels.py)
+        #   2. {root}/{task}/core/voxel_cache/   (legacy, from preprocess_mimicgen_voxels.py)
         self.task_cache_dirs = {}
         for task in tasks:
             suffix = self.task_cache_suffixes.get(task, self.default_cache_suffix)
             cache_name = f"voxel_cache{suffix}"
-            cache_dir = os.path.join(self.root, f"{task}_d0", "core", cache_name)
-            # Auto-detect voxel/ subdirectory
-            voxel_sub = os.path.join(cache_dir, "voxel")
-            if os.path.isdir(voxel_sub) and glob.glob(os.path.join(voxel_sub, "demo_*")):
-                cache_dir = voxel_sub
-            if not os.path.isdir(cache_dir):
-                print(f"[MimicGenMultiTaskVoxelDataset] Warning: cache not found for {task}: {cache_dir}")
+            cache_dir = None
+            # Try current layout first: {task}/voxel_cache/voxel/
+            candidate = os.path.join(self.root, task, cache_name, "voxel")
+            if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "demo_*")):
+                cache_dir = candidate
+            else:
+                # Try legacy layout: {task}/core/voxel_cache/
+                candidate = os.path.join(self.root, task, "core", cache_name)
+                voxel_sub = os.path.join(candidate, "voxel")
+                if os.path.isdir(voxel_sub) and glob.glob(os.path.join(voxel_sub, "demo_*")):
+                    cache_dir = voxel_sub
+                elif os.path.isdir(candidate):
+                    cache_dir = candidate
+            if cache_dir is None:
+                print(f"[MimicGenMultiTaskVoxelDataset] Warning: cache not found for {task}")
                 continue
             self.task_cache_dirs[task] = cache_dir
 
         if len(self.task_cache_dirs) == 0:
             raise RuntimeError(f"No valid voxel caches found for any task in {self.root}")
 
-        # Per-task kmeans cache dirs (sibling of voxel_cache under core/)
+        # Per-task kmeans cache dirs (sibling of voxel/ under voxel_cache/)
         self.task_kmeans_dirs: Dict[str, str] = {}
         if precompute_kmeans:
             for task in self.task_cache_dirs:
                 suffix = self.task_cache_suffixes.get(task, self.default_cache_suffix)
-                kmeans_name = f"kmeans_cache{suffix}"
-                self.task_kmeans_dirs[task] = os.path.join(
-                    self.root, f"{task}_d0", "core", kmeans_name
-                )
+                # Try current layout: {task}/voxel_cache/kmeans_cache/
+                km_candidate = os.path.join(self.root, task, f"voxel_cache{suffix}", "kmeans_cache")
+                if os.path.isdir(km_candidate):
+                    self.task_kmeans_dirs[task] = km_candidate
+                else:
+                    # Legacy layout: {task}/core/kmeans_cache/
+                    kmeans_name = f"kmeans_cache{suffix}"
+                    self.task_kmeans_dirs[task] = os.path.join(
+                        self.root, task, "core", kmeans_name
+                    )
 
         # Discover all frames from all tasks
         # Format: (task, demo_idx, frame_idx, vox_path, meta_path)

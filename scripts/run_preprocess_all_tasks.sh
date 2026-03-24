@@ -79,6 +79,9 @@ if [[ "$DEBUG" -eq 1 ]]; then
     echo "  Samples: $DEBUG_SAMPLES | wandb project: $WANDB_PROJECT"
     echo "========================================"
 
+    export WANDB_RUN_ID="debug-$(date +%s)"
+    export WANDB_RESUME="allow"
+
     DEBUG_COUNT=0
     for TASK in "${TASKS[@]}"; do
         H5="${DATA_ROOT}/core/${TASK}.hdf5"
@@ -107,7 +110,8 @@ if [[ "$DEBUG" -eq 1 ]]; then
             --device cuda \
             --debug \
             --debug-samples "$DEBUG_SAMPLES" \
-            --wandb-project "$WANDB_PROJECT"
+            --wandb-project "$WANDB_PROJECT" \
+            --task-name "$TASK"
 
         DEBUG_COUNT=$((DEBUG_COUNT + 1))
     done
