@@ -37,7 +37,7 @@ if [[ ! -f "$DLP_CKPT" ]]; then
     exit 1
 fi
 
-TASKS=(
+DEFAULT_TASKS=(
     coffee_d0
     coffee_d2
     coffee_preparation_d0
@@ -61,6 +61,13 @@ TASKS=(
     three_piece_assembly_d0
     three_piece_assembly_d2
 )
+
+# Override with: TASKS="coffee_d2 square_d2" bash run_preprocess_all_tasks.sh
+if [[ -n "${TASKS:-}" ]]; then
+    read -ra TASKS <<< "$TASKS"
+else
+    TASKS=("${DEFAULT_TASKS[@]}")
+fi
 
 mkdir -p "$OUT_DIR"
 cd "$LPWM_DIR"
