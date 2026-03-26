@@ -464,11 +464,16 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
             else:
                 pbar.set_description_str(f'epoch #{epoch}')
 
+            # Average offset magnitude per particle: mean over batch of per-kp L2 norms
+            mu_offset = model_output.get("mu_offset", None)
+            avg_offset = mu_offset.norm(dim=-1).mean().item() if mu_offset is not None else 0.0
+
             pbar.set_postfix(
                 loss=pick('loss'),
                 rec=pick('loss_rec'),
                 KL=pick('kl'),
                 obj_l1=pick('obj_on_l1'),
+                off=f'{avg_offset:.3f}',
             )
 
             iteration += 1
