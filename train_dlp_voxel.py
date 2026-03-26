@@ -214,6 +214,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
 
     # MimicGen specific
     task = config.get("task", None)  # task name for mimicgen_voxel
+    tasks = config.get("tasks", None)  # task list for mimicgen_multitask_voxel
+    task_cache_suffixes = config.get("task_cache_suffixes", None)
     max_demos = config.get("max_demos", None)  # limit number of demos
     cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
     proportion = config.get("proportion", 1.0)
@@ -235,6 +237,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         voxel_mode="occupancy",
         cache_dir=voxel_root,
         task=task,
+        tasks=tasks,
+        task_cache_suffixes=task_cache_suffixes,
         max_demos=max_demos,
         cache_suffix=cache_suffix,
         proportion=proportion,
@@ -251,6 +255,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         voxel_mode="occupancy",
         cache_dir=voxel_root,
         task=task,
+        tasks=tasks,
+        task_cache_suffixes=task_cache_suffixes,
         max_demos=max_demos,
         cache_suffix=cache_suffix,
         proportion=proportion,
