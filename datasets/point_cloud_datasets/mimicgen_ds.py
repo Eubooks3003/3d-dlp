@@ -3,6 +3,7 @@
 import os
 import glob
 import json
+import random
 from typing import Dict, Optional, List, Tuple
 
 import numpy as np
@@ -112,7 +113,8 @@ class MimicGenVoxelDataset(Dataset):
             raise ValueError(f"proportion must be in (0,1], got {proportion}")
         n_total = len(all_frames)
         n_keep = max(1, int(round(n_total * proportion)))
-        all_frames = all_frames[:n_keep]
+        rng = random.Random(seed)
+        all_frames = sorted(rng.sample(all_frames, n_keep))
 
         # ------- internal train/val/test split via demo indices -------
         # Split by demo to avoid data leakage between train/val/test
@@ -425,10 +427,11 @@ class MimicGenMultiTaskVoxelDataset(Dataset):
             for f in all_frames:
                 by_task.setdefault(f[0], []).append(f)
             all_frames = []
+            rng = random.Random(seed)
             for t in sorted(by_task):
                 frames_t = by_task[t]
                 n_keep = max(1, int(round(len(frames_t) * self.proportion)))
-                all_frames.extend(frames_t[:n_keep])
+                all_frames.extend(sorted(rng.sample(frames_t, n_keep)))
                 print(f"  - {t}: kept {n_keep}/{len(frames_t)} frames ({self.proportion:.0%})")
 
         print(f"[MimicGenMultiTaskVoxelDataset] Total: {len(all_frames)} frames across {len(self.task_cache_dirs)} tasks")
