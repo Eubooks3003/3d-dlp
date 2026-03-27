@@ -474,7 +474,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 KL=pick('kl'),
                 obj_l1=pick('obj_on_l1'),
                 off=f'{avg_offset:.3f}',
-                bg_fg=f'{pick("bg_on_fg"):.2f}',   # 1.0=bg handles all fg (collapse), ~0=particles handle fg
+                fg_e=f'{pick("fg_mse"):.3f}',        # MSE on fg voxels only (should decrease)
+                bg_m=f'{pick("bg_mag"):.4f}',        # bg decoder output magnitude (-1=missing, 0=dead)
                 r_kl=f'{pick("rec_kl_ratio"):.0f}', # rec/KL ratio, >100 means KL is negligible
                 psnr=f'{pick("psnr"):.1f}',
             )

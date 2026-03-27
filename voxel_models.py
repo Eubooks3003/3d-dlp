@@ -2723,13 +2723,16 @@ class DLP(nn.Module):
             obj_on_l1 = obj_on.view(obj_on.shape[0], -1).sum(-1).mean()
             # avg_offset: average L2 norm of offset per keypoint
             avg_offset = mu_offset.norm(dim=-1).mean()
-            # bg_on_fg: mean bg_mask over fg voxels (1.0 = bg handles all fg = particles collapsed)
-            if bg_mask is not None:
-                fg_voxels = occ_mask > 0.5  # [B*T,1,D,H,W]
-                n_fg = fg_voxels.float().sum().clamp_min(1.0)
-                bg_on_fg = (bg_mask * fg_voxels.float()).sum() / n_fg
+            # fg_mse: mean squared error on GT foreground voxels only
+            # tracks whether particles are actually reconstructing objects well
+            fg_mask_b = occ_mask.expand_as(per_voxel_err)  # [B*T,3,D,H,W]
+            n_fg_els = fg_mask_b.sum().clamp_min(1.0)
+            fg_mse = (per_voxel_err * fg_mask_b).sum() / n_fg_els
+            # bg_mag: mean abs of bg decoder output (0 = bg is dead/shutdown)
+            if bg_rec_raw is not None:
+                bg_mag = bg_rec_raw[:, :3].abs().mean()
             else:
-                bg_on_fg = torch.tensor(-1.0)
+                bg_mag = torch.tensor(-1.0)  # -1 signals bg_rec not in model output
             # rec/kl ratio: how much reconstruction dominates KL (>100 = KL is negligible)
             rec_kl_ratio = (beta_rec * loss_rec) / (beta_kl * loss_kl_static + 1e-8)
 
@@ -2753,7 +2756,8 @@ class DLP(nn.Module):
             'loss_kl_context': torch.tensor(0.0, device=x.device),
             'loss_obj_reg': loss_obj_reg,
             'psnr': psnr,
-            'bg_on_fg': bg_on_fg,
+            'fg_mse': fg_mse,
+            'bg_mag': bg_mag,
             'rec_kl_ratio': rec_kl_ratio,
         }
 
