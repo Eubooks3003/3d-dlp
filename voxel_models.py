@@ -2443,16 +2443,17 @@ class DLP(nn.Module):
         else:  # "mse"
             per_voxel_err = (pred_rgb - x_flat) ** 2         # [B*T,3,D,H,W]
 
-        # --------- (A) GLOBAL LOSS (w/ bg_mask weighting, same as before) ----------
-        if bg_mask is not None:
-            # bg_mask ≈ 1 where background dominates; 0 where objects
-            w_global = fg_weight * (1.0 - bg_mask) + bg_weight * bg_mask   # [B*T,1,D,H,W]
-        else:
-            # uniform weights
-            w_global = pred_rgb.new_ones(
-                pred_rgb.shape[0], 1,
-                pred_rgb.shape[2], pred_rgb.shape[3], pred_rgb.shape[4]
-            )   # [B*T,1,D,H,W]
+        # --------- GT occupancy mask from x (foreground region) ----------
+        # Use the same |x| magnitude heuristic as AE, but in 3D
+        mag = x_flat.abs().mean(dim=1, keepdim=True)                # [B*T,1,D,H,W]
+        occ_mask = (mag > occ_from_x_thresh).float()                # 1 = "object", 0 = background
+
+        # --------- (A) GLOBAL LOSS (w/ GT occ_mask weighting) ----------
+        # Use GT occupancy instead of model bg_mask to avoid feedback loop:
+        # when particles turn off, model bg_mask -> 1 everywhere, which would
+        # drop fg weight from 5.0 to 0.1 and suppress the gradient signal
+        # that particles need to recover.
+        w_global = fg_weight * occ_mask + bg_weight * (1.0 - occ_mask)   # [B*T,1,D,H,W]
 
         # broadcast to channels
         w_global = w_global.expand(-1, pred_rgb.shape[1], -1, -1, -1)      # [B*T,3,D,H,W]
@@ -2460,11 +2461,6 @@ class DLP(nn.Module):
         err_map_global = per_voxel_err * w_global                          # [B*T,3,D,H,W]
         spatial_dims = tuple(range(1, err_map_global.dim()))               # sum over C,D,H,W
         loss_rec_global = err_map_global.sum(dim=spatial_dims).mean()      # scalar
-
-        # --------- (B) GT occupancy mask from x (foreground region) ----------
-        # Use the same |x| magnitude heuristic as AE, but in 3D
-        mag = x_flat.abs().mean(dim=1, keepdim=True)                # [B*T,1,D,H,W]
-        occ_mask = (mag > occ_from_x_thresh).float()                # 1 = "object", 0 = background
 
         
 
