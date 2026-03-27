@@ -2427,7 +2427,7 @@ class DLP(nn.Module):
         rec_rgb         = model_output['rec']                  # [B*T,3,D,H,W] (already squashed to [-1,1] or [0,1])
         alpha_masks     = model_output.get('alpha_masks', None)   # [B*T,N,1,D,H,W] in [0,1]
         bg_mask         = model_output.get('bg_mask', None)       # [B*T,1,D,H,W]
-        bg_rec_raw      = model_output.get('bg_rec', None)        # [B*T,C_bg,D,H,W] (pre-activation)
+        bg_rec_raw      = model_output.get('bg', None)             # [B*T,C_bg,D,H,W] (key is 'bg' in output_dict)
         rgb_obj         = model_output.get('rgb_obj', None)    
 
         # --------- flatten time ----------
