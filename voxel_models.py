@@ -2507,6 +2507,10 @@ class DLP(nn.Module):
         lambda_bg_zero = 0.0
         loss_rec = loss_rec + lambda_bg_zero * loss_bg_zero
 
+        # normalize reconstruction to match 2D image-model scale:
+        # 3D sums over D*H*W (64^3) vs 2D over H*W (64^2) — factor-of-D difference
+        loss_rec = loss_rec / pred_rgb.shape[2]  # divide by depth dim
+
         # --------- per-particle local RGB loss (optional, supervised mask, in-loss) ----------
         loss_local = torch.tensor(0.0, device=x.device)
         lambda_local = 0.05  # start at 0.01–0.05 and tune
@@ -2719,6 +2723,16 @@ class DLP(nn.Module):
             obj_on_l1 = obj_on.view(obj_on.shape[0], -1).sum(-1).mean()
             # avg_offset: average L2 norm of offset per keypoint
             avg_offset = mu_offset.norm(dim=-1).mean()
+            # bg activity: mean absolute value of bg reconstruction (0 = bg is dead)
+            bg_act = bg_rec_raw[:, :3].abs().mean() if bg_rec_raw is not None else torch.tensor(0.0)
+            # fg coverage: fraction of fg voxels where particles have alpha > 0.1
+            if alpha_masks is not None:
+                alpha_sum = alpha_masks.sum(dim=1).squeeze(1)  # [B*T,D,H,W]
+                fg_covered = ((alpha_sum > 0.1) & (occ_mask.squeeze(1) > 0.5)).float().sum()
+                fg_total = (occ_mask > 0.5).float().sum().clamp_min(1.0)
+                fg_cov = fg_covered / fg_total
+            else:
+                fg_cov = torch.tensor(0.0)
 
         return {
             'loss': loss,
@@ -2740,6 +2754,8 @@ class DLP(nn.Module):
             'loss_kl_context': torch.tensor(0.0, device=x.device),
             'loss_obj_reg': loss_obj_reg,
             'psnr': psnr,
+            'bg_act': bg_act,
+            'fg_cov': fg_cov,
         }
 
 

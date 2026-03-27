@@ -474,6 +474,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                 KL=pick('kl'),
                 obj_l1=pick('obj_on_l1'),
                 off=f'{avg_offset:.3f}',
+                bg=f'{pick("bg_act"):.3f}',       # bg dead if ~0
+                fg_cov=f'{pick("fg_cov"):.2f}',   # fraction of fg voxels covered by particles
+                psnr=f'{pick("psnr"):.1f}',
             )
 
             iteration += 1
