@@ -89,7 +89,7 @@ def load_voxel_rgb(path):
     return vox[:3].contiguous()                           # drop occupancy channel
 
 
-def build_frame_list(data_root, splits, tasks, frame_stride, max_per_episode=None):
+def build_frame_list(data_root, splits, tasks, frame_stride, max_per_episode=None, ignore_cache=False):
     """
     Walk the RLBench layout, return a flat work list of
       (split, task, episode, frame_idx, vox_path, km_path)
@@ -136,7 +136,7 @@ def build_frame_list(data_root, splits, tasks, frame_stride, max_per_episode=Non
                     kept += 1
                     task_total += 1
                     km_fname = f"{frame_idx:06d}_kmeans.pt"
-                    if km_fname in km_existing:
+                    if km_fname in km_existing and not ignore_cache:
                         cached += 1
                         continue
                     km_path = os.path.join(km_dir, km_fname)
@@ -319,9 +319,7 @@ def run_debug(work, cfg_path, ckpt_path, max_frames=8, per_task=1,
             kp, cov = prior.encode_prior(vox) if hasattr(prior, "encode_prior") else prior(vox)
         print(f"  kp {tuple(kp.shape)}  cov {tuple(cov.shape)}")
         print(f"  kp[0,:3]={kp[0, :3].cpu().tolist()}")
-        os.makedirs(os.path.dirname(km), exist_ok=True)
-        torch.save({"kp": kp[0].cpu(), "cov": cov[0].cpu()}, km)
-        print(f"  saved -> {km}")
+        print(f"  [debug] skipping save (viz only)")
 
         if use_wandb:
             # rgb volume at [3,D,H,W], KPx at [K,3] in [-1,1] global space (x,y,z)
@@ -392,6 +390,7 @@ def main():
         args.data_root, splits, tasks,
         frame_stride=args.frame_stride,
         max_per_episode=args.max_per_episode,
+        ignore_cache=args.debug,
     )
     print(f"\nTotal: {len(work)} to compute, {cached} already cached")
     if not work:
