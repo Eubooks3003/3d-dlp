@@ -3735,7 +3735,7 @@ class DLPPrior(nn.Module):
 
         # TODO: Make this configurable values
         rgbk_feat_mode="lab"     # {"lab","ilr"}
-        rgbk_append_xyz=False
+        rgbk_append_xyz=True
         rgbk_saliency="L"        # {"L","alpha","rgbnorm"}
         rgbk_keep_top=80_000
         rgbk_sample_m=50_000

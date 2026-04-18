@@ -27,14 +27,12 @@ Usage:
     PYTHONPATH=. python scripts/precompute_kmeans_rlbench.py \
         --data-root /home/ubuntu/tal-lpwm-neurips-2026/data/rlbench \
         --dlp-cfg  configs/rlbench_multitask.json \
-        --frame-stride 5 \
-        --debug
+        --debug --wandb-project rlbench-kmeans-debug
 
-    # Full run
+    # Full run (every frame — training can then use any stride)
     PYTHONPATH=. python scripts/precompute_kmeans_rlbench.py \
         --data-root /home/ubuntu/tal-lpwm-neurips-2026/data/rlbench \
         --dlp-cfg  configs/rlbench_multitask.json \
-        --frame-stride 5 \
         --workers-per-gpu 4
 """
 import os
@@ -357,8 +355,9 @@ def main():
                     help=f"subset of tasks (default: {DEFAULT_TASKS})")
     ap.add_argument("--splits", nargs="*", default=None,
                     help=f"filesystem splits (default: {DEFAULT_SPLITS})")
-    ap.add_argument("--frame-stride", type=int, default=5,
-                    help="keep every Nth frame per episode (match training config)")
+    ap.add_argument("--frame-stride", type=int, default=1,
+                    help="keep every Nth frame per episode (default 1 = all frames; "
+                         "precompute is independent of training stride)")
     ap.add_argument("--max-per-episode", type=int, default=None,
                     help="optional cap on frames per episode (after stride)")
     ap.add_argument("--num-gpus", type=int, default=None,
