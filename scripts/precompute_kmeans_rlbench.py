@@ -273,14 +273,43 @@ def worker_fn(worker_id, gpu_id, work_items, cfg_path, ckpt_path, counter_file, 
             save_future.result()
 
 
-def run_debug(work, cfg_path, ckpt_path, max_frames=8):
-    """Sequential single-GPU debug: process up to max_frames with detailed prints."""
+def _select_debug_frames(work, per_task=1):
+    """Take the first `per_task` frames from each unique (split, task) pair in `work`."""
+    seen, out = {}, []
+    for item in work:
+        split, task = item[0], item[1]
+        k = (split, task)
+        if seen.get(k, 0) >= per_task:
+            continue
+        seen[k] = seen.get(k, 0) + 1
+        out.append(item)
+    return out
+
+
+def run_debug(work, cfg_path, ckpt_path, max_frames=8, per_task=1,
+              wandb_project=None, wandb_run=None):
+    """Sequential single-GPU debug: process a few frames with verbose prints.
+    If wandb_project is given, log each frame's 3D plot (voxels + keypoints) to wandb.
+    """
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"[debug] device={device}, processing up to {max_frames} frames")
+    print(f"[debug] device={device}, per_task={per_task}, max_frames={max_frames}")
     prior = build_prior(cfg_path, ckpt_path, device)
 
-    subset = work[:max_frames]
+    # pick 1 (or per_task) frame(s) per (split, task), capped at max_frames
+    subset = _select_debug_frames(work, per_task=per_task)[:max_frames]
     print(f"[debug] frames to process: {len(subset)}")
+
+    use_wandb = wandb_project is not None
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run or "precompute_kmeans_rlbench_debug",
+            job_type="precompute_kmeans_debug",
+            config={"cfg": cfg_path, "ckpt": ckpt_path, "per_task": per_task},
+        )
+        from eval.eval_vox import log_rgb_voxels
+
     for i, (split, task, ep, frame, vp, km) in enumerate(subset):
         print(f"[debug {i+1}/{len(subset)}] {split}/{task}/ep{ep}/frame{frame}")
         print(f"  vox: {vp}")
@@ -294,7 +323,23 @@ def run_debug(work, cfg_path, ckpt_path, max_frames=8):
         print(f"  kp[0,:3]={kp[0, :3].cpu().tolist()}")
         os.makedirs(os.path.dirname(km), exist_ok=True)
         torch.save({"kp": kp[0].cpu(), "cov": cov[0].cpu()}, km)
-        print(f"  saved -> {km}\n")
+        print(f"  saved -> {km}")
+
+        if use_wandb:
+            # rgb volume at [3,D,H,W], KPx at [K,3] in [-1,1] global space (x,y,z)
+            name = f"debug/{split}/{task}/ep{ep}/frame{frame}"
+            log_rgb_voxels(
+                name=name,
+                rgb_vol=vox[0].detach().cpu(),
+                KPx=kp[0].detach().cpu(),
+                step=i,
+            )
+            print(f"  [wandb] logged '{name}' at step {i}")
+        print()
+
+    if use_wandb:
+        import wandb
+        wandb.finish()
     print("[debug] done")
 
 
@@ -322,8 +367,14 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--debug", action="store_true",
                     help="process a few frames sequentially on GPU 0, verbose output, then exit")
-    ap.add_argument("--debug-frames", type=int, default=8,
-                    help="number of frames to process in debug mode")
+    ap.add_argument("--debug-frames", type=int, default=10,
+                    help="max frames to process in debug mode (default 10 = one per task)")
+    ap.add_argument("--debug-per-task", type=int, default=1,
+                    help="frames per (split,task) pair in debug mode (default 1)")
+    ap.add_argument("--wandb-project", default=None,
+                    help="if set, debug mode logs 3D plots (voxels + kp) to this wandb project")
+    ap.add_argument("--wandb-run", default=None,
+                    help="optional wandb run name (default: precompute_kmeans_rlbench_debug)")
     args = ap.parse_args()
 
     tasks = args.tasks if args.tasks else DEFAULT_TASKS
@@ -349,7 +400,13 @@ def main():
         return
 
     if args.debug:
-        run_debug(work, args.dlp_cfg, args.dlp_ckpt, max_frames=args.debug_frames)
+        run_debug(
+            work, args.dlp_cfg, args.dlp_ckpt,
+            max_frames=args.debug_frames,
+            per_task=args.debug_per_task,
+            wandb_project=args.wandb_project,
+            wandb_run=args.wandb_run,
+        )
         return
 
     num_gpus = args.num_gpus or torch.cuda.device_count()
