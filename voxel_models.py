@@ -1119,7 +1119,7 @@ class DLP(nn.Module):
     def forward(self, x, deterministic=False, warmup=False, with_loss=False, beta_kl=0.1, beta_dyn=0.1,
                 beta_rec=1.0, kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
                 balance=0.5, beta_dyn_rec=1.0, num_static=None, actions=None, actions_mask=None, lang_embed=None,
-                beta_obj=0.0, done_mask=None, x_goal=None, meta=None):
+                beta_obj=0.0, done_mask=None, x_goal=None, meta=None, gt_occ_mask=None):
         if len(x.shape) == 5:
             # x: [bs, ch, h, w, l]
             batch_size = x.size(0)
@@ -1366,7 +1366,8 @@ class DLP(nn.Module):
                                        beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
                                        dynamic_discount=dynamic_discount, recon_loss_type=recon_loss_type,
                                        recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec,
-                                       num_static=num_static, beta_obj=beta_obj, done_mask=done_mask)
+                                       num_static=num_static, beta_obj=beta_obj, done_mask=done_mask,
+                                       gt_occ_mask=gt_occ_mask)
             output_dict['loss_dict'] = loss_dict
         else:
             output_dict['loss_dict'] = None
@@ -1376,7 +1377,7 @@ class DLP(nn.Module):
     def calc_elbo(self, x, model_output, warmup=False, beta_kl=0.1, beta_dyn=0.1, beta_rec=1.0,
                   kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None, balance=0.5,
                   beta_dyn_rec=1.0, num_static=1, use_kl_mask=True, apply_mask_on_obj_on=False, beta_obj=0.0,
-                  done_mask=None):
+                  done_mask=None, gt_occ_mask=None):
         if self.is_dynamics_model:
             return self.calc_dyn_elbo(x, model_output, warmup, beta_kl, beta_dyn, beta_rec,
                                       kl_balance, dynamic_discount, recon_loss_type,
@@ -1401,6 +1402,7 @@ class DLP(nn.Module):
                 recon_loss_type=recon_loss_type,
                 use_kl_mask=use_kl_mask,
                 apply_mask_on_obj_on=apply_mask_on_obj_on,
+                gt_occ_mask=gt_occ_mask,
             )
 
     def calc_dyn_elbo(self, x, model_output, warmup=False, beta_kl=0.1, beta_dyn=0.1, beta_rec=1.0,
@@ -2378,8 +2380,8 @@ class DLP(nn.Module):
         recon_loss_type: str = "mse",         # {"mse","l1"}
         fg_weight: float = 1.0,               # weight on foreground voxels
         bg_weight: float = 1.0,               # weight on background voxels
-        occ_from_x_thresh: float = 0.05,      # threshold on |x| to treat a voxel as foreground (if use_x_occ_as_mask)
-        lambda_color: float = 500.0,  
+        occ_from_x_thresh: float = 0.05,      # threshold on |x| (used when gt_occ_mask is None)
+        lambda_color: float = 500.0,
         # regularizers / aux
         alpha_sparsity_weight: float = 1e-3,  # L1 on per-object α volume
         alpha_entropy_weight: float = 0.0,    # encourage crisp α (optional)
@@ -2388,6 +2390,8 @@ class DLP(nn.Module):
         # KL masking
         use_kl_mask: bool = True,
         apply_mask_on_obj_on: bool = False,
+        # GT occupancy (preferred over thresholding when provided)
+        gt_occ_mask=None,                      # [B,D,H,W] or [B,1,D,H,W] bool/float — GT occupancy
     ):
         """
         ELBO for RGB voxel reconstruction (no depth):
@@ -2443,10 +2447,23 @@ class DLP(nn.Module):
         else:  # "mse"
             per_voxel_err = (pred_rgb - x_flat) ** 2         # [B*T,3,D,H,W]
 
-        # --------- GT occupancy mask from x (foreground region) ----------
-        # Use the same |x| magnitude heuristic as AE, but in 3D
-        mag = x_flat.abs().mean(dim=1, keepdim=True)                # [B*T,1,D,H,W]
-        occ_mask = (mag > occ_from_x_thresh).float()                # 1 = "object", 0 = background
+        # --------- GT occupancy mask (foreground region) ----------
+        if gt_occ_mask is not None:
+            # Use ground-truth occupancy channel (e.g., from RGBO data).
+            occ_mask = gt_occ_mask.to(dtype=x_flat.dtype, device=x_flat.device)
+            # accept [B,D,H,W], [B,1,D,H,W], or already-flattened [B*T,1,D,H,W]
+            if occ_mask.dim() == 4:
+                occ_mask = occ_mask.unsqueeze(1)                          # [B,1,D,H,W]
+            if occ_mask.dim() == 5 and occ_mask.shape[0] != x_flat.shape[0]:
+                # [B,1,D,H,W] with T>1 → expand across time then fold
+                B_in = occ_mask.shape[0]
+                T_in = x_flat.shape[0] // B_in
+                occ_mask = occ_mask.unsqueeze(1).expand(B_in, T_in, *occ_mask.shape[1:])
+                occ_mask = occ_mask.reshape(-1, *occ_mask.shape[2:])      # [B*T,1,D,H,W]
+        else:
+            # Fallback: threshold |x| magnitude heuristic.
+            mag = x_flat.abs().mean(dim=1, keepdim=True)                  # [B*T,1,D,H,W]
+            occ_mask = (mag > occ_from_x_thresh).float()                  # 1 = "object", 0 = background
 
         # --------- (A) GLOBAL LOSS (w/ GT occ_mask weighting) ----------
         # Use GT occupancy instead of model bg_mask to avoid feedback loop:

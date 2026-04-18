@@ -2,12 +2,15 @@
 
 import os
 import glob
-from typing import Dict, List, Optional
+import json
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 import open3d as o3d
+
+from datasets.voxelize_ds_wrapper import load_voxel
 
 
 class RLBenchPointCloudDataset(Dataset):
@@ -282,3 +285,264 @@ class RLBenchPointCloudDataset(Dataset):
             "frame": frame_idx,
         }
         return sample
+
+
+class RLBenchMultiTaskVoxelDataset(Dataset):
+    """
+    Multi-task RLBench voxel dataset — reads per-episode voxel caches produced
+    by the preprocess_rlbench_rgbo_all pipeline.
+
+    Cache structure:
+        <root>/
+          <split_dir>/                     # e.g. train_data, test_data
+            <task>/
+              all_variations/
+                episodes/
+                  episode<N>/
+                    voxel_cache/
+                      manifest.json
+                      000000_voxels.pt      # [4,D,H,W] RGBO (compressed sparse ok)
+                      000000_meta.pt
+                      000000_extras.pt
+                      ...
+                    kmeans_cache/           # (optional, populated at train start)
+                      000000_kmeans.pt
+                      ...
+
+    Per sample:
+        {
+          "voxels":   [3,D,H,W] float  (RGB only — channel 3 = occupancy is split out as fg_mask)
+          "fg_mask":  [D,H,W]   bool   (GT occupancy from the RGBO 4th channel)
+          "meta":     dict (pmin/pmax/voxel_size from preprocess, + kmeans if cached)
+          "id": "<task>_ep<N>_frame<F>",
+          "task": str, "task_idx": int,
+          "split_dir": str, "episode": int, "frame": int,
+          "voxels_path": str,
+        }
+
+    Train/val/test split is internal, by (task, episode) to avoid leakage —
+    frames within the same episode stay together. The filesystem split
+    directories (train_data/test_data) are merged and re-split.
+
+    Args:
+        root: data root (e.g. /home/ellina/Desktop/data/rlbench)
+        tasks: list of task names; if None, auto-discovers all task dirs with voxel caches
+        splits: list of filesystem split dirs to pull from; if None, auto-discovers (typically train_data+test_data)
+        split: internal "train" | "val" | "test"
+        frame_stride: keep only every Nth frame per episode (default 1 = all)
+        max_frames_per_episode: optional cap on frames per episode (applied after stride)
+        train_ratio / val_ratio / seed / proportion: standard split knobs
+        precompute_kmeans: enable get_kmeans_path() so train_dlp_voxel.py caches per frame
+    """
+
+    def __init__(
+        self,
+        root: str,
+        tasks: Optional[List[str]] = None,
+        splits: Optional[List[str]] = None,
+        split: str = "train",
+        frame_stride: int = 1,
+        max_frames_per_episode: Optional[int] = None,
+        train_ratio: float = 0.8,
+        val_ratio: float = 0.1,
+        seed: int = 42,
+        proportion: float = 1.0,
+        device: Optional[torch.device] = None,
+        precompute_kmeans: bool = False,
+        kmeans_cache_dir: Optional[str] = None,
+    ):
+        self.root = os.path.abspath(root)
+        self.split = split
+        self.device = device
+        self.precompute_kmeans = precompute_kmeans
+        self.kmeans_cache_dir = kmeans_cache_dir
+        self.frame_stride = max(1, int(frame_stride))
+        self.max_frames_per_episode = max_frames_per_episode
+        self.proportion = float(proportion)
+        if not (0.0 < self.proportion <= 1.0):
+            raise ValueError(f"proportion must be in (0,1], got {self.proportion}")
+
+        if splits is None:
+            splits = sorted(
+                os.path.basename(d) for d in glob.glob(os.path.join(self.root, "*"))
+                if os.path.isdir(d)
+            )
+            if len(splits) == 0:
+                raise RuntimeError(f"No split dirs under {self.root}")
+        self.splits_list = splits
+
+        if tasks is None:
+            discovered = set()
+            for s in splits:
+                for d in glob.glob(os.path.join(self.root, s, "*")):
+                    if os.path.isdir(d):
+                        discovered.add(os.path.basename(d))
+            tasks = sorted(discovered)
+            if len(tasks) == 0:
+                raise RuntimeError(f"No tasks under {self.root}/{{splits}}")
+            print(f"[RLBenchMultiTaskVoxelDataset] Auto-discovered {len(tasks)} tasks: {tasks}")
+        self.tasks = tasks
+        self._task_to_idx = {t: i for i, t in enumerate(tasks)}
+
+        all_frames: List[Tuple[str, str, int, int, str, str]] = []
+        for split_dir in splits:
+            for task in tasks:
+                episodes_root = os.path.join(
+                    self.root, split_dir, task, "all_variations", "episodes"
+                )
+                if not os.path.isdir(episodes_root):
+                    continue
+
+                episode_dirs = sorted(
+                    glob.glob(os.path.join(episodes_root, "episode*")),
+                    key=lambda p: int(os.path.basename(p).replace("episode", ""))
+                )
+                for ep_dir in episode_dirs:
+                    ep_idx = int(os.path.basename(ep_dir).replace("episode", ""))
+                    cache_dir = os.path.join(ep_dir, "voxel_cache")
+                    if not os.path.isdir(cache_dir):
+                        continue
+
+                    vox_files = sorted(glob.glob(os.path.join(cache_dir, "*_voxels.pt")))
+                    kept = 0
+                    for vp in vox_files:
+                        stem = os.path.basename(vp).replace("_voxels.pt", "")
+                        try:
+                            frame_idx = int(stem)
+                        except ValueError:
+                            continue
+                        if frame_idx % self.frame_stride != 0:
+                            continue
+                        if self.max_frames_per_episode is not None and kept >= self.max_frames_per_episode:
+                            break
+                        meta_path = os.path.join(cache_dir, f"{stem}_meta.pt")
+                        all_frames.append(
+                            (split_dir, task, ep_idx, frame_idx, vp, meta_path)
+                        )
+                        kept += 1
+
+        if len(all_frames) == 0:
+            raise RuntimeError(
+                f"No voxel frames found under {self.root} "
+                f"(splits={splits}, tasks={tasks}, stride={self.frame_stride})"
+            )
+
+        # optional per-task proportion downsample (before split)
+        if self.proportion < 1.0:
+            by_task: Dict[str, list] = {}
+            for f in all_frames:
+                by_task.setdefault(f[1], []).append(f)
+            rng = np.random.RandomState(seed)
+            all_frames = []
+            for t in sorted(by_task):
+                ft = by_task[t]
+                n_keep = max(1, int(round(len(ft) * self.proportion)))
+                idx_keep = sorted(rng.choice(len(ft), size=n_keep, replace=False).tolist())
+                all_frames.extend(ft[i] for i in idx_keep)
+                print(f"  - {t}: kept {n_keep}/{len(ft)} frames ({self.proportion:.0%})")
+
+        # group by (task, split_dir, episode) so a whole episode lands in one split
+        ep_groups: Dict[Tuple[str, str, int], list] = {}
+        for f in all_frames:
+            split_dir, task, ep_idx = f[0], f[1], f[2]
+            ep_groups.setdefault((task, split_dir, ep_idx), []).append(f)
+
+        ep_keys = sorted(ep_groups.keys())
+        rng = np.random.RandomState(seed)
+        shuffled = ep_keys.copy()
+        rng.shuffle(shuffled)
+
+        train_ratio = float(train_ratio)
+        val_ratio = float(val_ratio)
+        if train_ratio + val_ratio > 1.0 + 1e-6:
+            raise ValueError(f"train_ratio+val_ratio must be <= 1, got {train_ratio+val_ratio}")
+        N = len(shuffled)
+        n_train = min(int(round(train_ratio * N)), N)
+        n_val = min(int(round(val_ratio * N)), max(0, N - n_train))
+
+        split_l = split.lower()
+        if split_l == "train":
+            chosen = set(shuffled[:n_train])
+        elif split_l == "val":
+            chosen = set(shuffled[n_train:n_train + n_val])
+        elif split_l == "test":
+            chosen = set(shuffled[n_train + n_val:])
+        else:
+            raise ValueError(f"Unknown split '{split}'")
+
+        self.items: List[Tuple[str, str, int, int, str, str]] = []
+        for k in sorted(chosen):
+            self.items.extend(ep_groups[k])
+        if len(self.items) == 0:
+            raise RuntimeError(f"No frames assigned to split '{split}' (episodes={N})")
+
+        task_counts: Dict[str, int] = {}
+        for f in self.items:
+            task_counts[f[1]] = task_counts.get(f[1], 0) + 1
+        print(f"[RLBenchMultiTaskVoxelDataset] Split '{split}': {len(self.items)} frames from {len(chosen)} episodes")
+        for t, c in sorted(task_counts.items()):
+            print(f"  - {t}: {c} frames")
+
+    # ------------- API -------------
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def get_kmeans_path(self, idx: int) -> Optional[str]:
+        split_dir, task, ep_idx, frame_idx, _, _ = self.items[idx]
+        if self.precompute_kmeans:
+            ep_dir = os.path.join(
+                self.root, split_dir, task, "all_variations", "episodes",
+                f"episode{ep_idx}"
+            )
+            return os.path.join(ep_dir, "kmeans_cache", f"{frame_idx:06d}_kmeans.pt")
+        if self.kmeans_cache_dir is not None:
+            return os.path.join(self.kmeans_cache_dir, f"{idx:06d}_kmeans.pt")
+        return None
+
+    def _load_kmeans_into_meta(self, idx: int, meta: dict):
+        km_path = self.get_kmeans_path(idx)
+        if km_path is not None and os.path.exists(km_path):
+            km = torch.load(km_path, map_location="cpu")
+            meta["kmeans_kp"] = km["kp"]
+            meta["kmeans_cov"] = km["cov"]
+
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        split_dir, task, ep_idx, frame_idx, vox_path, meta_path = self.items[idx]
+
+        # [4,D,H,W] RGBO (compressed sparse handled by load_voxel)
+        vox = load_voxel(vox_path).float()
+        if vox.dim() != 4 or vox.shape[0] < 4:
+            raise RuntimeError(
+                f"Expected [4,D,H,W] RGBO voxel at {vox_path}, got {tuple(vox.shape)}"
+            )
+        rgb = vox[:3].contiguous()                        # [3,D,H,W]
+        fg_mask = (vox[3] > 0).to(torch.bool).contiguous()  # [D,H,W] GT occupancy
+
+        try:
+            meta = torch.load(meta_path)
+        except FileNotFoundError:
+            meta = {}
+
+        if self.device is not None:
+            rgb = rgb.to(self.device, non_blocking=True)
+            fg_mask = fg_mask.to(self.device, non_blocking=True)
+            meta = {
+                k: (v.to(self.device) if torch.is_tensor(v) else v)
+                for k, v in meta.items()
+            }
+
+        self._load_kmeans_into_meta(idx, meta)
+
+        return {
+            "voxels": rgb,
+            "fg_mask": fg_mask,
+            "meta": meta,
+            "id": f"{task}_ep{ep_idx}_frame{frame_idx}",
+            "task": task,
+            "task_idx": self._task_to_idx[task],
+            "split_dir": split_dir,
+            "episode": ep_idx,
+            "frame": frame_idx,
+            "voxels_path": vox_path,
+        }

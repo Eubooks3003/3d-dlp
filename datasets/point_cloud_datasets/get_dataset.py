@@ -40,6 +40,10 @@ def get_point_cloud_dataset(
     val_ratio: float = 0.1,
     seed: int = 42,
     proportion: float = 1.0,
+    # --- rlbench multi-task voxel specific ---
+    rlbench_splits: Optional[List[str]] = None,     # filesystem split dirs, e.g. ["train_data","test_data"]
+    frame_stride: int = 1,                          # keep every Nth frame per episode
+    max_frames_per_episode: Optional[int] = None,   # optional cap on frames per episode (after stride)
 ):
     """
     Generic getter for point-cloud datasets.
@@ -79,6 +83,26 @@ def get_point_cloud_dataset(
             seed=seed,
             max_demos=max_demos,
             cache_suffix=cache_suffix,
+            device=device,
+            precompute_kmeans=precompute_kmeans,
+            kmeans_cache_dir=kmeans_cache_dir,
+        )
+
+    # --- RLBench MULTI-TASK precomputed voxel cache (per-episode voxel_cache/) ---
+    if ds_key in ("rlbench_multitask_voxel", "rlbench_voxel"):
+        from datasets.point_cloud_datasets.rlbench_ds import RLBenchMultiTaskVoxelDataset
+
+        return RLBenchMultiTaskVoxelDataset(
+            root=root,
+            tasks=tasks,
+            splits=rlbench_splits,
+            split=mode,
+            frame_stride=frame_stride,
+            max_frames_per_episode=max_frames_per_episode,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            seed=seed,
+            proportion=proportion,
             device=device,
             precompute_kmeans=precompute_kmeans,
             kmeans_cache_dir=kmeans_cache_dir,

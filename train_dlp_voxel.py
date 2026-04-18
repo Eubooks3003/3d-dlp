@@ -220,6 +220,11 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
     cache_suffix = config.get("cache_suffix", "")  # e.g., "_debug" for voxel_cache_debug
     proportion = config.get("proportion", 1.0)
 
+    # RLBench multi-task voxel specific
+    rlbench_splits = config.get("rlbench_splits", None)            # e.g. ["train_data","test_data"]
+    frame_stride = int(config.get("frame_stride", 1))              # sample every Nth frame per episode
+    max_frames_per_episode = config.get("max_frames_per_episode", None)
+
     # -------------------------------------------------
     # KMEANS CACHING
     # -------------------------------------------------
@@ -244,6 +249,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         proportion=proportion,
         precompute_kmeans=precompute_kmeans,
         kmeans_cache_dir=kmeans_train_dir,
+        rlbench_splits=rlbench_splits,
+        frame_stride=frame_stride,
+        max_frames_per_episode=max_frames_per_episode,
     )
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
@@ -262,6 +270,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         proportion=proportion,
         precompute_kmeans=precompute_kmeans,
         kmeans_cache_dir=kmeans_val_dir,
+        rlbench_splits=rlbench_splits,
+        frame_stride=frame_stride,
+        max_frames_per_episode=max_frames_per_episode,
     )
 
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
@@ -433,6 +444,9 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
         for batch in pbar:
             vox = batch["voxels"].to(device)
             meta = batch.get("meta", None)
+            gt_occ_mask = batch.get("fg_mask", None)
+            if gt_occ_mask is not None:
+                gt_occ_mask = gt_occ_mask.to(device)
 
             warmup = (epoch < warmup_epoch)
             # forward pass
@@ -442,7 +456,8 @@ def train_dlp_pc(config_path='./configs/shapes.json'):
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
                                  beta_obj=beta_obj,
-                                 meta=meta)
+                                 meta=meta,
+                                 gt_occ_mask=gt_occ_mask)
 
             # Compute & backprop
             all_losses = model_output['loss_dict']
