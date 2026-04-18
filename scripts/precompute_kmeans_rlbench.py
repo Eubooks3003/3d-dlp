@@ -362,6 +362,8 @@ def main():
                     help="number of GPUs (default: all available)")
     ap.add_argument("--workers-per-gpu", type=int, default=2)
     ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--overwrite", action="store_true",
+                    help="recompute even if kmeans_cache file already exists")
     ap.add_argument("--debug", action="store_true",
                     help="process a few frames sequentially on GPU 0, verbose output, then exit")
     ap.add_argument("--debug-frames", type=int, default=10,
@@ -390,7 +392,7 @@ def main():
         args.data_root, splits, tasks,
         frame_stride=args.frame_stride,
         max_per_episode=args.max_per_episode,
-        ignore_cache=args.debug,
+        ignore_cache=args.debug or args.overwrite,
     )
     print(f"\nTotal: {len(work)} to compute, {cached} already cached")
     if not work:
