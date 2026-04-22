@@ -248,6 +248,126 @@ def pack_tokens_k24(out: dict) -> tuple:
 
 
 # ----------------------------
+# Debug: encode/decode a few frames per task, log to wandb
+# ----------------------------
+def run_debug_mode(model, root, split, tasks, device,
+                   wandb_project="rlbench-dlp-debug", num_samples=3):
+    """Sample a few frames from each task's first episode, run encode->decode,
+    and log GT + reconstruction + keypoints + diff to a single wandb run.
+
+    Mirrors the mimicgen debug mode but walks the RLBench layout:
+      <root>/<split>/<task>/all_variations/episodes/episode0/voxel_cache/NNNNNN_voxels.pt
+      <root>/<split>/<task>/all_variations/episodes/episode0/kmeans_cache/NNNNNN_kmeans.pt
+    """
+    import wandb
+    from eval.eval_vox import log_rgb_voxels
+
+    wandb.init(project=wandb_project, name=f"debug-rlbench-{split}")
+    global_step = 0
+
+    for task_name in tasks:
+        try:
+            eps = discover_episodes(root, split, task_name)
+        except RuntimeError as e:
+            print(f"[debug] {task_name}: {e} — skipping")
+            continue
+        if not eps:
+            print(f"[debug] {task_name}: no episodes found — skipping")
+            continue
+        ep_idx, ep_dir = eps[0]
+
+        vox_dir = os.path.join(ep_dir, "voxel_cache")
+        km_dir = os.path.join(ep_dir, "kmeans_cache")
+        vmap = scan_episode_voxels(vox_dir)
+        if not vmap:
+            print(f"[debug] {task_name}: no voxels in {vox_dir} — skipping")
+            continue
+
+        frames = sorted(vmap.keys())
+        if num_samples >= len(frames):
+            picked = frames
+        else:
+            picked = [frames[i]
+                      for i in np.linspace(0, len(frames) - 1, num_samples).astype(int)]
+
+        prefix = f"{task_name}/"
+        print(f"\n[debug] {task_name}: ep{ep_idx}, frames {picked}")
+
+        for i, tt in enumerate(picked):
+            vox = _load_voxel_any(vmap[tt])  # [C, D, H, W]
+
+            km_path = os.path.join(km_dir, f"{tt:06d}_kmeans.pt")
+            if os.path.exists(km_path):
+                km = torch.load(km_path, map_location="cpu", weights_only=False)
+                meta = {
+                    "kmeans_kp": km["kp"].unsqueeze(0).to(device),
+                    "kmeans_cov": km["cov"].unsqueeze(0).to(device),
+                }
+                print(f"[debug] {task_name} f{tt}: using cached kmeans")
+            else:
+                meta = None
+                print(f"[debug] {task_name} f{tt}: no cached kmeans at {km_path}, recomputing")
+
+            vox_input = vox.unsqueeze(0).to(device)
+            with torch.no_grad():
+                out = model(vox_input, deterministic=True, warmup=False,
+                            with_loss=True, meta=meta)
+
+            vox_rec = out.get("rec", out.get("reconstruction", None))
+            if vox_rec is None and hasattr(model, "decode"):
+                vox_rec = model.decode(out)
+            vox_rec = vox_rec[0].cpu()
+
+            # Keypoint positions: prefer mu_tot, fall back to z_base + mu_offset
+            mu_tot = out.get("mu_tot", None)
+            if mu_tot is None and "z_base" in out and "mu_offset" in out:
+                mu_tot = out["z_base"] + out["mu_offset"]
+            kp_pos = mu_tot[0].cpu() if mu_tot is not None else None
+
+            obj_on = out.get("obj_on", None)
+            obj_on_vals = obj_on[0].cpu() if obj_on is not None else None
+
+            # GT voxel
+            log_rgb_voxels(
+                name=f"{prefix}samples/input_{i}",
+                rgb_vol=vox, alpha_vol=None, KPx=None,
+                step=global_step, mode="splat", topk=60000,
+                alpha_thresh=0.05, pad=2.0, show_axes=True,
+            )
+            # GT + keypoints overlay
+            log_rgb_voxels(
+                name=f"{prefix}samples/input_kp_{i}",
+                rgb_vol=vox, alpha_vol=None, KPx=kp_pos, obj_on=obj_on_vals,
+                step=global_step, mode="splat", topk=60000,
+                alpha_thresh=0.05, pad=2.0, show_axes=True,
+            )
+            # Reconstruction + keypoints
+            log_rgb_voxels(
+                name=f"{prefix}samples/rec_{i}",
+                rgb_vol=vox_rec, alpha_vol=None, KPx=kp_pos, obj_on=obj_on_vals,
+                step=global_step, mode="splat", topk=60000,
+                alpha_thresh=0.05, pad=2.0, show_axes=True,
+            )
+            # |GT - Rec|
+            diff = (vox - vox_rec).abs()
+            diff_scaled = diff / (diff.max() + 1e-8)
+            log_rgb_voxels(
+                name=f"{prefix}samples/diff_{i}",
+                rgb_vol=diff_scaled, alpha_vol=None, KPx=None,
+                step=global_step, mode="splat", topk=60000,
+                alpha_thresh=0.01, pad=2.0, show_axes=True,
+            )
+
+            mse = float(((vox - vox_rec) ** 2).mean())
+            print(f"[debug] {task_name} f{tt} MSE: {mse:.6f}")
+            wandb.log({f"{prefix}metrics/mse": mse}, step=global_step)
+            global_step += 1
+
+    wandb.finish()
+    print(f"\n[debug] Done! {len(tasks)} task(s) logged to wandb project '{wandb_project}'")
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def main():
@@ -259,8 +379,8 @@ def main():
                     help="RLBench root (e.g. /home/ellina/Desktop/data/rlbench)")
     ap.add_argument("--split", default="train_data",
                     help="Split folder name under root (e.g. train_data, test_data)")
-    ap.add_argument("--task", required=True,
-                    help="Task name (e.g. close_jar)")
+    ap.add_argument("--task", default=None,
+                    help="Task name (e.g. close_jar). Required unless --debug.")
     ap.add_argument("--max-demos", type=int, default=None)
     ap.add_argument("--max-frames", type=int, default=None)
 
@@ -271,11 +391,22 @@ def main():
     ap.add_argument("--batch", type=int, default=8)
 
     # Output
-    ap.add_argument("--out-pkl", required=True)
+    ap.add_argument("--out-pkl", default=None,
+                    help="Output pickle path. Required unless --debug.")
 
     # Distributed
     ap.add_argument("--rank", type=int, default=0)
     ap.add_argument("--world-size", type=int, default=1)
+
+    # Debug: encode/decode a few frames per task, log to wandb (no pickle written)
+    ap.add_argument("--debug", action="store_true",
+                    help="Debug mode: encode/decode a few frames per task and log to wandb.")
+    ap.add_argument("--debug-samples", type=int, default=3,
+                    help="Frames per task to visualize in debug mode.")
+    ap.add_argument("--debug-tasks", nargs="+", default=None,
+                    help="Task names for debug mode (defaults to [--task] if set).")
+    ap.add_argument("--wandb-project", type=str, default="rlbench-dlp-debug",
+                    help="Wandb project name for debug visualization.")
 
     args = ap.parse_args()
 
@@ -287,6 +418,22 @@ def main():
     _ = load_checkpoint(args.dlp_ckpt, model, None, None, map_location=device)
     expected_c = int(cfg.get("ch", 3))
     print(f"[dlp] Loaded model, expected channels: {expected_c}")
+
+    # Debug mode: visualize a handful of frames per task, then exit.
+    if args.debug:
+        tasks = args.debug_tasks or ([args.task] if args.task else None)
+        if not tasks:
+            ap.error("--debug requires --debug-tasks (or --task)")
+        run_debug_mode(
+            model, args.root, args.split, tasks, device,
+            wandb_project=args.wandb_project, num_samples=args.debug_samples,
+        )
+        return
+
+    if not args.task:
+        ap.error("--task is required (unless --debug)")
+    if not args.out_pkl:
+        ap.error("--out-pkl is required (unless --debug)")
 
     # Discover episodes
     episodes = discover_episodes(args.root, args.split, args.task)
