@@ -62,19 +62,39 @@ class _RLBenchStub:
     pass
 
 
+class _StubDemo(list):
+    """rlbench.demo.Demo is a list subclass; match that so unpickling works."""
+    pass
+
+
 class _RLBenchUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        if module.startswith("rlbench"):
+        if module == "rlbench.demo" and name == "Demo":
+            return _StubDemo
+        if module.startswith("rlbench") or module.startswith("pyrep"):
             return type(name, (_RLBenchStub,), {})
         return super().find_class(module, name)
 
 
 def load_demo(pkl_path: str):
-    """Unpickle low_dim_obs.pkl to a list-like of Observation stubs."""
+    """Unpickle low_dim_obs.pkl to a list of Observation stubs.
+
+    rlbench.demo.Demo is a list subclass, but the observations live on the
+    ._observations attribute, NOT in the list contents. Check that first.
+    """
     with open(pkl_path, "rb") as f:
         demo = _RLBenchUnpickler(f).load()
-    # Demo is a list-subclass in rlbench; iterate as a plain sequence.
-    return list(demo)
+    if hasattr(demo, "_observations") and len(demo._observations) > 0:
+        return list(demo._observations)
+    if hasattr(demo, "observations") and len(demo.observations) > 0:
+        return list(demo.observations)
+    if isinstance(demo, list) and len(demo) > 0:
+        return list(demo)
+    raise RuntimeError(
+        f"Unrecognized / empty low_dim_obs at {pkl_path}. "
+        f"type={type(demo).__name__} "
+        f"attrs={sorted(vars(demo).keys()) if hasattr(demo, '__dict__') else 'N/A'}"
+    )
 
 
 # ----------------------------
