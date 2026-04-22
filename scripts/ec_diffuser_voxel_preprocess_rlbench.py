@@ -250,7 +250,7 @@ def pack_tokens_k24(out: dict) -> tuple:
 # ----------------------------
 # Debug: encode/decode a few frames per task, log to wandb
 # ----------------------------
-def run_debug_mode(model, root, split, tasks, device,
+def run_debug_mode(model, root, split, tasks, device, expected_c,
                    wandb_project="rlbench-dlp-debug", num_samples=3):
     """Sample a few frames from each task's first episode, run encode->decode,
     and log GT + reconstruction + keypoints + diff to a single wandb run.
@@ -294,7 +294,10 @@ def run_debug_mode(model, root, split, tasks, device,
         print(f"\n[debug] {task_name}: ep{ep_idx}, frames {picked}")
 
         for i, tt in enumerate(picked):
-            vox = _load_voxel_any(vmap[tt])  # [C, D, H, W]
+            vox = _load_voxel_any(vmap[tt])  # [C, D, H, W], typically RGBO (C=4)
+            # The DLP is trained on RGB-only (ch=3); slice off occupancy.
+            if vox.shape[0] > expected_c:
+                vox = vox[:expected_c].contiguous()
 
             km_path = os.path.join(km_dir, f"{tt:06d}_kmeans.pt")
             if os.path.exists(km_path):
@@ -425,7 +428,7 @@ def main():
         if not tasks:
             ap.error("--debug requires --debug-tasks (or --task)")
         run_debug_mode(
-            model, args.root, args.split, tasks, device,
+            model, args.root, args.split, tasks, device, expected_c,
             wandb_project=args.wandb_project, num_samples=args.debug_samples,
         )
         return
@@ -591,7 +594,10 @@ def main():
                 if bi + 1 < len(batches):
                     pending = io_pool.submit(_prefetch_batch, batches[bi + 1])
 
-                if vox.shape[1] != expected_c:
+                # DLP trained on RGB-only; if voxels are RGBO, drop occupancy.
+                if vox.shape[1] > expected_c:
+                    vox = vox[:, :expected_c].contiguous()
+                elif vox.shape[1] != expected_c:
                     raise RuntimeError(f"Channel mismatch: got C={vox.shape[1]} expected C={expected_c}")
 
                 with torch.no_grad():
