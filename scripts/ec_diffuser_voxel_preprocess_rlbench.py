@@ -315,7 +315,8 @@ def pack_tokens_k24(out: dict) -> tuple:
 # Debug: encode/decode a few frames per task, log to wandb
 # ----------------------------
 def run_debug_mode(model, root, split, tasks, device, expected_c,
-                   wandb_project="rlbench-dlp-debug", num_samples=3):
+                   wandb_project="rlbench-dlp-debug", num_samples=3,
+                   use_keyposes=False, stopping_delta=0.1):
     """Sample a few frames from each task's first episode, run encode->decode,
     and log GT + reconstruction + keypoints + diff to a single wandb run.
 
@@ -348,16 +349,37 @@ def run_debug_mode(model, root, split, tasks, device, expected_c,
             continue
 
         frames = sorted(vmap.keys())
-        if num_samples >= len(frames):
+        if use_keyposes:
+            try:
+                demo = load_demo(os.path.join(ep_dir, "low_dim_obs.pkl"))
+                kps_full = keypoint_discovery(demo, stopping_delta)
+            except Exception as e:
+                print(f"[debug] {task_name}: keypose discovery failed ({e}); "
+                      f"falling back to evenly-spaced frames")
+                kps_full = []
+            vox_set = set(frames)
+            picked = [k for k in kps_full if k in vox_set]
+            if not picked:
+                print(f"[debug] {task_name}: no keypose has a matching voxel frame; "
+                      f"falling back to evenly-spaced frames")
+                picked = [frames[i]
+                          for i in np.linspace(0, len(frames) - 1, num_samples).astype(int)]
+                kp_ords = list(range(len(picked)))
+            else:
+                kp_ords = list(range(len(picked)))
+        elif num_samples >= len(frames):
             picked = frames
+            kp_ords = list(range(len(picked)))
         else:
             picked = [frames[i]
                       for i in np.linspace(0, len(frames) - 1, num_samples).astype(int)]
+            kp_ords = list(range(len(picked)))
 
         prefix = f"{task_name}/"
-        print(f"\n[debug] {task_name}: ep{ep_idx}, frames {picked}")
+        print(f"\n[debug] {task_name}: ep{ep_idx}, "
+              f"{'keyposes' if use_keyposes else 'frames'}={picked}")
 
-        for i, tt in enumerate(picked):
+        for i, tt in zip(kp_ords, picked):
             vox = _load_voxel_any(vmap[tt])  # [C, D, H, W], typically RGBO (C=4)
             # The DLP is trained on RGB-only (ch=3); slice off occupancy.
             if vox.shape[0] > expected_c:
@@ -473,6 +495,10 @@ def main():
                     help="Debug mode: encode/decode a few frames per task and log to wandb.")
     ap.add_argument("--debug-samples", type=int, default=3,
                     help="Frames per task to visualize in debug mode.")
+    ap.add_argument("--debug-keyposes", action="store_true",
+                    help="In --debug mode, sample frames at keypose indices "
+                         "(via keypoint_discovery + --stopping-delta) instead "
+                         "of evenly across the episode.")
     ap.add_argument("--debug-tasks", nargs="+", default=None,
                     help="Task names for debug mode (defaults to [--task] if set).")
     ap.add_argument("--wandb-project", type=str, default="rlbench-dlp-debug",
@@ -497,6 +523,7 @@ def main():
         run_debug_mode(
             model, args.root, args.split, tasks, device, expected_c,
             wandb_project=args.wandb_project, num_samples=args.debug_samples,
+            use_keyposes=args.debug_keyposes, stopping_delta=args.stopping_delta,
         )
         return
 
