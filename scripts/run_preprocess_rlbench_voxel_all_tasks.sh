@@ -33,6 +33,10 @@
 #   bash scripts/run_preprocess_rlbench_voxel_all_tasks.sh --debug
 #   bash scripts/run_preprocess_rlbench_voxel_all_tasks.sh --debug 5
 #   bash scripts/run_preprocess_rlbench_voxel_all_tasks.sh --debug 5 my-wandb-project
+#   DEBUG_KEYPOSES=1 bash scripts/run_preprocess_rlbench_voxel_all_tasks.sh --debug
+#       (sample frames at keypose indices instead of evenly across the episode)
+#   STOPPING_DELTA=0.05 bash scripts/run_preprocess_rlbench_voxel_all_tasks.sh
+#       (joint-velocity threshold for keypose stopped-detection; default 0.1)
 
 set -e
 
@@ -45,6 +49,8 @@ if [[ "${1:-}" == "--debug" ]]; then
     if [[ -n "${2:-}" ]]; then DEBUG_SAMPLES="$2"; fi
     if [[ -n "${3:-}" ]]; then WANDB_PROJECT="$3"; fi
 fi
+DEBUG_KEYPOSES="${DEBUG_KEYPOSES:-0}"
+STOPPING_DELTA="${STOPPING_DELTA:-0.1}"
 # ----------------------------------------
 
 ROOT="${ROOT:-/home/ubuntu/tal-lpwm-neurips-2026/data/rlbench}"
@@ -98,18 +104,24 @@ if [[ "$DEBUG" -eq 1 ]]; then
     echo "========================================"
     echo "  DEBUG MODE — encode/decode sanity check"
     echo "  Samples/task: $DEBUG_SAMPLES | wandb project: $WANDB_PROJECT"
+    echo "  keyposes=$DEBUG_KEYPOSES stopping_delta=$STOPPING_DELTA"
     echo "========================================"
 
-    PYTHONPATH=. python -u scripts/ec_diffuser_voxel_preprocess_rlbench.py \
-        --root "$ROOT" \
-        --split "$SPLIT" \
-        --dlp-cfg  "$DLP_CFG" \
-        --dlp-ckpt "$DLP_CKPT" \
-        --device cuda \
-        --debug \
-        --debug-samples "$DEBUG_SAMPLES" \
-        --wandb-project "$WANDB_PROJECT" \
-        --debug-tasks $TASKS
+    DBG_ARGS=(--root "$ROOT"
+              --split "$SPLIT"
+              --dlp-cfg  "$DLP_CFG"
+              --dlp-ckpt "$DLP_CKPT"
+              --device cuda
+              --debug
+              --debug-samples "$DEBUG_SAMPLES"
+              --wandb-project "$WANDB_PROJECT"
+              --stopping-delta "$STOPPING_DELTA"
+              --debug-tasks $TASKS)
+    if [[ "$DEBUG_KEYPOSES" -eq 1 ]]; then
+        DBG_ARGS+=(--debug-keyposes)
+    fi
+
+    PYTHONPATH=. python -u scripts/ec_diffuser_voxel_preprocess_rlbench.py "${DBG_ARGS[@]}"
 
     echo ""
     echo "[DEBUG DONE] Check wandb project '$WANDB_PROJECT'"
@@ -145,7 +157,8 @@ for task in $TASKS; do
           --dlp-cfg  "$TASK_DIR/dlp_config.json"
           --dlp-ckpt "$TASK_DIR/dlp_ckpt.pt"
           --out-pkl  "$OUT_PKL"
-          --batch    "$BATCH")
+          --batch    "$BATCH"
+          --stopping-delta "$STOPPING_DELTA")
     if [[ -n "$MAX_DEMOS" ]]; then
         ARGS+=(--max-demos "$MAX_DEMOS")
     fi
