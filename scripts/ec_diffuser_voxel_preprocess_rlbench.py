@@ -151,6 +151,50 @@ def extract_gripper_and_actions(demo: list) -> tuple:
 
 
 # ----------------------------
+# Keypose / keyframe discovery
+# Direct port of 3D Diffuser Actor's keypoint_discovery
+# (utils_with_rlbench.py:766-808). Uses per-frame joint_velocities
+# (available on the unpickled rlbench Observation stubs) plus gripper-open
+# transitions to identify decision-point frames.
+# ----------------------------
+def _is_stopped_kp(obs_list, i, stopped_buffer, delta):
+    next_is_not_final = (i == len(obs_list) - 2)
+    gripper_state_no_change = i < (len(obs_list) - 2) and (
+        obs_list[i].gripper_open == obs_list[i + 1].gripper_open
+        and obs_list[i].gripper_open == obs_list[max(0, i - 1)].gripper_open
+        and obs_list[max(0, i - 2)].gripper_open == obs_list[max(0, i - 1)].gripper_open
+    )
+    jv = np.asarray(obs_list[i].joint_velocities, dtype=np.float32)
+    small_delta = np.allclose(jv, 0, atol=delta)
+    return (
+        stopped_buffer <= 0
+        and small_delta
+        and (not next_is_not_final)
+        and gripper_state_no_change
+    )
+
+
+def keypoint_discovery(obs_list, stopping_delta: float = 0.1):
+    """Return list of per-frame keypose indices for one episode."""
+    episode_keypoints = []
+    prev_gripper_open = obs_list[0].gripper_open
+    stopped_buffer = 0
+    for i in range(len(obs_list)):
+        stopped = _is_stopped_kp(obs_list, i, stopped_buffer, stopping_delta)
+        stopped_buffer = 4 if stopped else stopped_buffer - 1
+        last = (i == len(obs_list) - 1)
+        if i != 0 and (obs_list[i].gripper_open != prev_gripper_open or last or stopped):
+            episode_keypoints.append(i)
+        prev_gripper_open = obs_list[i].gripper_open
+    if (
+        len(episode_keypoints) > 1
+        and (episode_keypoints[-1] - 1) == episode_keypoints[-2]
+    ):
+        episode_keypoints.pop(-2)
+    return episode_keypoints
+
+
+# ----------------------------
 # Voxel cache loading (RLBench naming: 000000_voxels.pt)
 # ----------------------------
 def _load_voxel_any(path: str) -> torch.Tensor:
@@ -406,6 +450,9 @@ def main():
                     help="Task name (e.g. close_jar). Required unless --debug.")
     ap.add_argument("--max-demos", type=int, default=None)
     ap.add_argument("--max-frames", type=int, default=None)
+    ap.add_argument("--stopping-delta", type=float, default=0.1,
+                    help="Joint-velocity threshold for keypose stopped-detection "
+                         "(matches 3D Diffuser Actor's default).")
 
     # DLP model
     ap.add_argument("--dlp-cfg", required=True, help="Path to DLP config JSON")
@@ -557,6 +604,7 @@ def main():
     demo_indices = []
     ep_language = []
     ep_variation = []
+    ep_keyposes = []
     total_written = 0
 
     pbar = tqdm(episodes, desc=f"Rank {args.rank}", unit="ep")
@@ -569,6 +617,10 @@ def main():
         demo = load_demo(os.path.join(ep_dir, "low_dim_obs.pkl"))
         gripper_full, actions_full = extract_gripper_and_actions(demo)
         T_demo = gripper_full.shape[0]
+
+        # Keypose discovery (3DDA-style). Uses joint_velocities + gripper_open
+        # transitions on the full demo; later clipped to actual stored length L.
+        kps_full = keypoint_discovery(demo, args.stopping_delta)
 
         # Language + variation
         with open(os.path.join(ep_dir, "variation_descriptions.pkl"), "rb") as f:
@@ -655,6 +707,13 @@ def main():
         ep_language.append(lang)
         ep_variation.append(varnum)
 
+        # Clip keyposes to the stored frame range [0, L). Always include L-1
+        # as the final keypose so trajectories terminate at the last stored frame.
+        kps = [int(k) for k in kps_full if k < L]
+        if len(kps) == 0 or kps[-1] != L - 1:
+            kps.append(L - 1)
+        ep_keyposes.append(kps)
+
         pbar.set_postfix(frames=L, total=total_written)
 
         if args.max_frames is not None and total_written >= args.max_frames:
@@ -698,6 +757,18 @@ def main():
 
     path_lengths_arr = np.asarray(path_lengths, dtype=np.int32)
 
+    # Pack keypose indices into (E, max_kp) with -1 sentinel for padding.
+    n_keyposes_arr = np.asarray([len(k) for k in ep_keyposes], dtype=np.int32)
+    max_kp = int(n_keyposes_arr.max()) if len(n_keyposes_arr) else 0
+    keypose_indices_arr = np.full((len(ep_keyposes), max(max_kp, 1)), -1, dtype=np.int32)
+    for ei, kps in enumerate(ep_keyposes):
+        keypose_indices_arr[ei, :len(kps)] = np.asarray(kps, dtype=np.int32)
+    if len(n_keyposes_arr):
+        kp_counts = n_keyposes_arr
+        print(f"[keyposes] task={args.task} stopping_delta={args.stopping_delta} "
+              f"min={int(kp_counts.min())} median={int(np.median(kp_counts))} "
+              f"max={int(kp_counts.max())} mean={float(kp_counts.mean()):.1f}")
+
     paths_dict = {
         "meta": {
             "K": K, "Dtok": Dtok, "A": A, "G": G, "BG": BG, "Tmax": Tmax,
@@ -711,6 +782,8 @@ def main():
             "split": args.split,
             "root": args.root,
             "demo_indices": np.asarray(demo_indices, dtype=np.int32),
+            "stopping_delta": float(args.stopping_delta),
+            "keypose_format": "(E, max_kp) int32, -1 = padding; n_keyposes gives true count",
         },
         "observations": observations,
         "actions": actions,
@@ -726,6 +799,8 @@ def main():
         # RLBench-specific new fields:
         "language": ep_language,                                  # list[list[str]] len E
         "variation_number": np.asarray(ep_variation, dtype=np.int32),  # (E,)
+        "keypose_indices": keypose_indices_arr,                   # (E, max_kp) int32, -1 = pad
+        "n_keyposes": n_keyposes_arr,                             # (E,) int32
     }
 
     out_pkl = args.out_pkl

@@ -52,7 +52,7 @@ SPLIT="${SPLIT:-train_data}"
 LPWM_DIR="${LPWM_DIR:-/home/ubuntu/tal-lpwm-neurips-2026/ellina/lpwm-dev}"
 DLP_CFG="${DLP_CFG:-${LPWM_DIR}/logs/180426_223153_rlbench_multitask/hparams.json}"
 DLP_CKPT="${DLP_CKPT:-${LPWM_DIR}/logs/180426_223153_rlbench_multitask/saves/best.pt}"
-OUT_DIR="${OUT_DIR:-${ROOT}/preprocessed_voxel_tokens}"
+OUT_DIR="${OUT_DIR:-${ROOT}/preprocessed_voxel_tokens_with_keyposes}"
 BATCH="${BATCH:-8}"
 MAX_DEMOS="${MAX_DEMOS:-}"   # blank = all episodes
 NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
