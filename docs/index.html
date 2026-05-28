@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta name="title" content="3D-DLP: Self-supervised 3D Object-centric Scene Representation Learning">
+  <meta name="description" content="3D-DLP decomposes RGB-D or voxel scenes into a set of interpretable 3D latent particles via self-supervised reconstruction, enabling controllable scene editing and improving downstream robotic manipulation.">
+  <meta name="keywords" content="object-centric learning, 3D representation learning, RGB-D, point clouds, robot learning, deep latent particles, ICML 2026">
+  <meta name="author" content="Ellina Zhang, Madhavan Iyengar, Amir Zadeh, Chuan Li, David Held, Deepak Pathak, Tal Daniel">
+  <meta name="robots" content="index, follow">
+  <meta name="language" content="English">
+
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Carnegie Mellon University">
+  <meta property="og:title" content="3D-DLP: Self-supervised 3D Object-centric Scene Representation Learning">
+  <meta property="og:description" content="3D-DLP decomposes RGB-D or voxel scenes into a set of interpretable 3D latent particles via self-supervised reconstruction.">
+  <meta property="og:url" content="https://eubooks3003.github.io/3d-dlp/">
+  <meta property="og:image" content="https://eubooks3003.github.io/3d-dlp/static/images/social_preview.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="3D-DLP teaser">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="3D-DLP: Self-supervised 3D Object-centric Scene Representation Learning">
+  <meta name="twitter:description" content="3D-DLP decomposes RGB-D or voxel scenes into a set of interpretable 3D latent particles via self-supervised reconstruction.">
+  <meta name="twitter:image" content="https://eubooks3003.github.io/3d-dlp/static/images/social_preview.png">
+
+  <meta name="citation_title" content="3D-DLP: Self-supervised 3D Object-centric Scene Representation Learning">
+  <meta name="citation_author" content="Zhang, Ellina">
+  <meta name="citation_author" content="Iyengar, Madhavan">
+  <meta name="citation_author" content="Zadeh, Amir">
+  <meta name="citation_author" content="Li, Chuan">
+  <meta name="citation_author" content="Held, David">
+  <meta name="citation_author" content="Pathak, Deepak">
+  <meta name="citation_author" content="Daniel, Tal">
+  <meta name="citation_publication_date" content="2026">
+  <meta name="citation_conference_title" content="International Conference on Machine Learning (ICML)">
+
+  <meta name="theme-color" content="#2563eb">
+
+  <title>3D-DLP: Self-supervised 3D Object-centric Scene Representation Learning</title>
+
+  <link rel="icon" type="image/x-icon" href="static/images/favicon.ico">
+
+  <link rel="stylesheet" href="static/css/bulma.min.css">
+  <link rel="stylesheet" href="static/css/index.css">
+  <link rel="preload" href="static/css/bulma-carousel.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="static/css/bulma-slider.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="static/css/fontawesome.all.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <noscript>
+    <link rel="stylesheet" href="static/css/bulma-carousel.min.css">
+    <link rel="stylesheet" href="static/css/bulma-slider.min.css">
+    <link rel="stylesheet" href="static/css/fontawesome.all.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  </noscript>
+
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <script defer src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="static/js/fontawesome.all.min.js"></script>
+  <script defer src="static/js/bulma-carousel.min.js"></script>
+  <script defer src="static/js/bulma-slider.min.js"></script>
+  <script defer src="static/js/index.js"></script>
+</head>
+<body>
+
+  <button class="scroll-to-top" onclick="scrollToTop()" title="Scroll to top" aria-label="Scroll to top">
+    <i class="fas fa-chevron-up"></i>
+  </button>
+
+  <main id="main-content">
+  <section class="hero">
+    <div class="hero-body">
+      <div class="container is-max-desktop">
+        <div class="columns is-centered">
+          <div class="column has-text-centered">
+            <h1 class="title is-1 publication-title">3D-DLP: Self-supervised 3D Object-centric<br>Scene Representation Learning</h1>
+            <div class="is-size-5 publication-authors">
+              <span class="author-block"><a href="https://eubooks3003.github.io" target="_blank">Ellina Zhang</a><sup>1</sup>,</span>
+              <span class="author-block"><a href="#" target="_blank">Madhavan Iyengar</a><sup>1</sup>,</span>
+              <span class="author-block"><a href="#" target="_blank">Amir Zadeh</a><sup>2</sup>,</span>
+              <span class="author-block"><a href="#" target="_blank">Chuan Li</a><sup>2</sup>,</span>
+              <span class="author-block"><a href="https://davheld.github.io/" target="_blank">David Held</a><sup>1</sup>,</span>
+              <span class="author-block"><a href="https://www.cs.cmu.edu/~dpathak/" target="_blank">Deepak Pathak</a><sup>1</sup>,</span>
+              <span class="author-block"><a href="https://taldatech.github.io" target="_blank">Tal Daniel</a><sup>1</sup></span>
+            </div>
+
+            <div class="is-size-5 publication-authors">
+              <span class="author-block"><sup>1</sup>Carnegie Mellon University &nbsp;&nbsp; <sup>2</sup>Lambda AI</span><br>
+              <span class="author-block"><strong>ICML 2026</strong></span>
+            </div>
+
+            <div class="column has-text-centered">
+              <div class="publication-links">
+                <!-- TODO: arXiv link once posted -->
+                <span class="link-block">
+                  <a href="#" target="_blank" class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon"><i class="fas fa-file-pdf"></i></span>
+                    <span>Paper</span>
+                  </a>
+                </span>
+                <span class="link-block">
+                  <a href="https://github.com/Eubooks3003/3d-dlp" target="_blank" class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon"><i class="fab fa-github"></i></span>
+                    <span>Code</span>
+                  </a>
+                </span>
+                <!-- TODO: arXiv link once posted -->
+                <span class="link-block">
+                  <a href="#" target="_blank" class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon"><i class="ai ai-arxiv"></i></span>
+                    <span>arXiv</span>
+                  </a>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TODO: Add a teaser figure or video here. Place file at static/images/teaser.png or static/videos/teaser.mp4 and uncomment.
+  <section class="hero teaser">
+    <div class="container is-max-desktop">
+      <div class="hero-body">
+        <img src="static/images/teaser.png" alt="3D-DLP overview" />
+        <h2 class="subtitle has-text-centered">
+          3D-DLP decomposes a 3D scene into a set of interpretable latent particles, each capturing a distinct entity.
+        </h2>
+      </div>
+    </div>
+  </section>
+  -->
+
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered has-text-centered">
+        <div class="column is-four-fifths">
+          <h2 class="title is-3">Abstract</h2>
+          <div class="content has-text-justified">
+            <p>
+              We introduce <strong>3D-DLP</strong>, a self-supervised object-centric representation learning model that decomposes scene-level RGB-D or voxel observations into a set of 3D latent particles. Building on the Deep Latent Particles (DLP) framework, each particle encodes disentangled attributes — 3D keypoint position, bounding box dimensions, and appearance features — and represents a distinct entity in the scene. The model learns interpretable per-particle segmentation maps through an end-to-end self-supervised reconstruction objective. On both simulated and real-world datasets, we demonstrate that the learned latent space is interpretable and controllable: by manipulating particle positions and decoding, we can generate novel scene configurations. Leveraging these compact 3D latent particles for downstream robotic manipulation improves performance over baselines that either lack explicit 3D information or rely on memory-intensive dense 3D inputs without object-centric structure.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TODO: Add method figure + description. Drop image at static/images/method.png and uncomment.
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Method</h2>
+      <img src="static/images/method.png" alt="3D-DLP architecture" />
+      <div class="content has-text-justified" style="margin-top: 1rem;">
+        <p>...method description here...</p>
+      </div>
+    </div>
+  </section>
+  -->
+
+  <!-- TODO: Results carousel. Replace carousel images in static/images/ and uncomment.
+  <section class="hero is-small">
+    <div class="hero-body">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered">Results</h2>
+        <div id="results-carousel" class="carousel results-carousel">
+          <div class="item">
+            <img src="static/images/carousel1.jpg" alt="Result 1" loading="lazy"/>
+            <h2 class="subtitle has-text-centered">Per-particle decomposition on simulated scenes.</h2>
+          </div>
+          <div class="item">
+            <img src="static/images/carousel2.jpg" alt="Result 2" loading="lazy"/>
+            <h2 class="subtitle has-text-centered">Controllable scene editing via particle manipulation.</h2>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  -->
+
+  <section class="section" id="BibTeX">
+    <div class="container is-max-desktop content">
+      <h2 class="title">BibTeX</h2>
+      <pre><code>@inproceedings{zhang20263ddlp,
+  title     = {3D-DLP: Self-supervised 3D Object-centric Scene Representation Learning},
+  author    = {Zhang, Ellina and Iyengar, Madhavan and Zadeh, Amir and Li, Chuan and Held, David and Pathak, Deepak and Daniel, Tal},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2026}
+}</code></pre>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container is-max-desktop content">
+      <h2 class="title is-4">Acknowledgements</h2>
+      <p>
+        This work builds on the <a href="https://taldatech.github.io/ddlp-web" target="_blank">Deep Latent Particles</a> (DLPv2 / DDLP) framework by Tal Daniel and Aviv Tamar. We thank the authors for releasing their implementation, from which our 3D extensions are derived.
+      </p>
+    </div>
+  </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="columns is-centered">
+        <div class="column is-8">
+          <div class="content">
+            <p>
+              This page was built using the <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank">Academic Project Page Template</a>, adapted from the <a href="https://nerfies.github.io" target="_blank">Nerfies</a> project page. Licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/" target="_blank">Creative Commons Attribution-ShareAlike 4.0 International License</a>.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
