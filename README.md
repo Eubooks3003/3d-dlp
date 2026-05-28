@@ -72,7 +72,7 @@ docs/           # Project page (GitHub Pages)
 
 ## Acknowledgements
 
-This codebase builds on the [Deep Latent Particles](https://taldatech.github.io/ddlp-web) (DLPv2 / DDLP) framework by Tal Daniel and Aviv Tamar. We thank the authors for releasing their implementation, which the 3D extensions in this repository are derived from.
+This codebase is built on top of [Latent Particle World Models](https://github.com/taldatech/lpwm) (ICLR 2026 Oral) by Tal Daniel et al., which itself extends the [Deep Latent Particles](https://taldatech.github.io/ddlp-web) (DLPv2 / DDLP) framework by Tal Daniel and Aviv Tamar. We thank the authors for releasing their implementations, on which the 3D extensions in this repository are based.
 
 ## License
 
