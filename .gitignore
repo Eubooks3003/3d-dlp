@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.Python
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.conda/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Experiment outputs (do NOT commit run artifacts)
+wandb/
+outputs/
+runs/
+logs/
+checkpoints/
+*.ckpt
+*.pth
+
+# Datasets (keep small samples in /assets if needed)
+data/
+datasets/raw/
+
+# Local config
+.env
+*.local
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
