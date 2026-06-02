@@ -162,25 +162,30 @@
     </div>
   </section>
 
-  <!-- 3D Reconstruction (interactive GT vs Reconstruction sliders) -->
+  <!-- 3D Reconstruction (GT vs Recon sliders + panning views) -->
   <section class="section hero is-light">
     <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered">3D Reconstruction</h2>
-      <p class="has-text-centered" style="margin-bottom:2rem;">Drag the slider to compare ground-truth voxels (left) with our 3D-DLP reconstruction (right).</p>
+
+      <h3 class="title is-5 has-text-centered" style="margin-top:1.5rem;">Ground Truth vs. Reconstruction</h3>
+      <p class="has-text-centered" style="margin-bottom:1.5rem;">Drag each slider to compare ground-truth voxels with our 3D-DLP reconstruction.</p>
       <div class="columns is-centered">
-        <div class="column">
-          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
-            <img src="static/images/recon_1_gt.png" data-label="Ground Truth"/>
-            <img src="static/images/recon_1_rec.png" data-label="Reconstruction"/>
-          </div>
-        </div>
+        <div class="column"><div id="slider-recon-1"></div></div>
       </div>
-      <div class="columns is-centered" style="margin-top:2rem;">
-        <div class="column">
-          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
-            <img src="static/images/recon_2_gt.png" data-label="Ground Truth"/>
-            <img src="static/images/recon_2_rec.png" data-label="Reconstruction"/>
-          </div>
+      <div class="columns is-centered" style="margin-top:1.5rem;">
+        <div class="column"><div id="slider-recon-2"></div></div>
+      </div>
+
+      <h3 class="title is-5 has-text-centered" style="margin-top:3rem;">Panning Views</h3>
+      <p class="has-text-centered" style="margin-bottom:1.5rem;">Rotating views of 3D-DLP reconstructions, including a real-world scene.</p>
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h4 class="title is-6">Real World</h4>
+          <img src="static/images/rollout_real_world.gif" alt="Real-world panning reconstruction" loading="lazy" style="width:100%;"/>
+        </div>
+        <div class="column has-text-centered">
+          <h4 class="title is-6">Kitchen</h4>
+          <img src="static/images/rollout_kitchen.gif" alt="Kitchen panning reconstruction" loading="lazy" style="width:100%;"/>
         </div>
       </div>
     </div>
@@ -194,34 +199,14 @@
 
       <h3 class="title is-5 has-text-centered" style="margin-top:1rem;">Sample 05</h3>
       <div class="columns is-centered">
-        <div class="column">
-          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
-            <img src="static/images/latent_05_original.png" data-label="Original"/>
-            <img src="static/images/latent_05_modified_a.png" data-label="Edited (Translation)"/>
-          </div>
-        </div>
-        <div class="column">
-          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
-            <img src="static/images/latent_05_original.png" data-label="Original"/>
-            <img src="static/images/latent_05_modified_b.png" data-label="Edited (Scaling)"/>
-          </div>
-        </div>
+        <div class="column"><div id="slider-latent-05a"></div></div>
+        <div class="column"><div id="slider-latent-05b"></div></div>
       </div>
 
       <h3 class="title is-5 has-text-centered" style="margin-top:2rem;">Sample 07</h3>
       <div class="columns is-centered">
-        <div class="column">
-          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
-            <img src="static/images/latent_07_original.png" data-label="Original"/>
-            <img src="static/images/latent_07_modified_a.png" data-label="Edited (Translation)"/>
-          </div>
-        </div>
-        <div class="column">
-          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
-            <img src="static/images/latent_07_original.png" data-label="Original"/>
-            <img src="static/images/latent_07_modified_b.png" data-label="Edited (Scaling)"/>
-          </div>
-        </div>
+        <div class="column"><div id="slider-latent-07a"></div></div>
+        <div class="column"><div id="slider-latent-07b"></div></div>
       </div>
     </div>
   </section>
@@ -247,24 +232,6 @@
         <div class="column is-half has-text-centered">
           <h3 class="title is-5">Square</h3>
           <img src="static/images/rollout_square.gif" alt="Square rollout" loading="lazy" style="width:100%;"/>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Real-World & Panning Reconstructions -->
-  <section class="section">
-    <div class="container is-max-desktop">
-      <h2 class="title is-3 has-text-centered">Real-World Results</h2>
-      <p class="has-text-centered" style="margin-bottom:2rem;">Panning views of 3D-DLP reconstructions, including a real-world scene.</p>
-      <div class="columns is-centered">
-        <div class="column has-text-centered">
-          <h3 class="title is-5">Real World</h3>
-          <img src="static/images/rollout_real_world.gif" alt="Real-world panning reconstruction" loading="lazy" style="width:100%;"/>
-        </div>
-        <div class="column has-text-centered">
-          <h3 class="title is-5">Kitchen</h3>
-          <img src="static/images/rollout_kitchen.gif" alt="Kitchen panning reconstruction" loading="lazy" style="width:100%;"/>
         </div>
       </div>
     </div>
@@ -307,14 +274,45 @@
     </div>
   </footer>
 
-  <!-- Load JuxtaposeJS at end of body so the .juxtapose divs exist before scan -->
+  <!-- Load JuxtaposeJS, then explicitly init each slider by ID (auto-scan was unreliable) -->
   <script src="https://cdn.knightlab.com/libs/juxtapose/latest/js/juxtapose.min.js"></script>
   <script>
-    // Belt-and-suspenders: explicitly trigger scan once images load.
     window.addEventListener('load', function() {
-      if (typeof juxtapose !== 'undefined' && juxtapose.scanPage) {
-        juxtapose.scanPage();
+      if (typeof juxtapose === 'undefined') {
+        console.error('JuxtaposeJS failed to load');
+        return;
       }
+      var commonOpts = {
+        animate: true,
+        showLabels: true,
+        showCredits: false,
+        startingPosition: '50%',
+        makeResponsive: true
+      };
+      new juxtapose.JXSlider('#slider-recon-1', [
+        {src: 'static/images/recon_1_gt.png', label: 'Ground Truth'},
+        {src: 'static/images/recon_1_rec.png', label: 'Reconstruction'}
+      ], commonOpts);
+      new juxtapose.JXSlider('#slider-recon-2', [
+        {src: 'static/images/recon_2_gt.png', label: 'Ground Truth'},
+        {src: 'static/images/recon_2_rec.png', label: 'Reconstruction'}
+      ], commonOpts);
+      new juxtapose.JXSlider('#slider-latent-05a', [
+        {src: 'static/images/latent_05_original.png', label: 'Original'},
+        {src: 'static/images/latent_05_modified_a.png', label: 'Edited (Translation)'}
+      ], commonOpts);
+      new juxtapose.JXSlider('#slider-latent-05b', [
+        {src: 'static/images/latent_05_original.png', label: 'Original'},
+        {src: 'static/images/latent_05_modified_b.png', label: 'Edited (Scaling)'}
+      ], commonOpts);
+      new juxtapose.JXSlider('#slider-latent-07a', [
+        {src: 'static/images/latent_07_original.png', label: 'Original'},
+        {src: 'static/images/latent_07_modified_a.png', label: 'Edited (Translation)'}
+      ], commonOpts);
+      new juxtapose.JXSlider('#slider-latent-07b', [
+        {src: 'static/images/latent_07_original.png', label: 'Original'},
+        {src: 'static/images/latent_07_modified_b.png', label: 'Edited (Scaling)'}
+      ], commonOpts);
     });
   </script>
 </body>
