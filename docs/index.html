@@ -58,9 +58,8 @@
 
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
-  <!-- JuxtaposeJS for before/after sliders -->
+  <!-- JuxtaposeJS for before/after sliders (CSS in head, JS at end of body) -->
   <link rel="stylesheet" href="https://cdn.knightlab.com/libs/juxtapose/latest/css/juxtapose.css">
-  <script src="https://cdn.knightlab.com/libs/juxtapose/latest/js/juxtapose.min.js"></script>
 
   <script defer src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
   <script defer src="static/js/fontawesome.all.min.js"></script>
@@ -249,20 +248,25 @@
           <h3 class="title is-5">Square</h3>
           <img src="static/images/rollout_square.gif" alt="Square rollout" loading="lazy" style="width:100%;"/>
         </div>
-        <div class="column is-half has-text-centered">
-          <h3 class="title is-5">Kitchen</h3>
-          <img src="static/images/rollout_kitchen.gif" alt="Kitchen rollout" loading="lazy" style="width:100%;"/>
-        </div>
       </div>
     </div>
   </section>
 
-  <!-- Real-World Results -->
+  <!-- Real-World & Panning Reconstructions -->
   <section class="section">
     <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered">Real-World Results</h2>
-      <p class="has-text-centered" style="margin-bottom:1rem;">3D-DLP applied to real-world scenes.</p>
-      <img src="static/images/rollout_real_world.gif" alt="Real-world rollout" loading="lazy" style="width:100%;"/>
+      <p class="has-text-centered" style="margin-bottom:2rem;">Panning views of 3D-DLP reconstructions, including a real-world scene.</p>
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h3 class="title is-5">Real World</h3>
+          <img src="static/images/rollout_real_world.gif" alt="Real-world panning reconstruction" loading="lazy" style="width:100%;"/>
+        </div>
+        <div class="column has-text-centered">
+          <h3 class="title is-5">Kitchen</h3>
+          <img src="static/images/rollout_kitchen.gif" alt="Kitchen panning reconstruction" loading="lazy" style="width:100%;"/>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -302,5 +306,16 @@
       </div>
     </div>
   </footer>
+
+  <!-- Load JuxtaposeJS at end of body so the .juxtapose divs exist before scan -->
+  <script src="https://cdn.knightlab.com/libs/juxtapose/latest/js/juxtapose.min.js"></script>
+  <script>
+    // Belt-and-suspenders: explicitly trigger scan once images load.
+    window.addEventListener('load', function() {
+      if (typeof juxtapose !== 'undefined' && juxtapose.scanPage) {
+        juxtapose.scanPage();
+      }
+    });
+  </script>
 </body>
 </html>
