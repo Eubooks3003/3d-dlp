@@ -150,37 +150,85 @@
     </div>
   </section>
 
-  <!-- TODO: Add method figure + description. Drop image at static/images/method.png and uncomment.
+  <!-- 3D Reconstruction -->
   <section class="section">
     <div class="container is-max-desktop">
-      <h2 class="title is-3 has-text-centered">Method</h2>
-      <img src="static/images/method.png" alt="3D-DLP architecture" />
-      <div class="content has-text-justified" style="margin-top: 1rem;">
-        <p>...method description here...</p>
-      </div>
-    </div>
-  </section>
-  -->
-
-  <!-- TODO: Results carousel. Replace carousel images in static/images/ and uncomment.
-  <section class="hero is-small">
-    <div class="hero-body">
-      <div class="container">
-        <h2 class="title is-3 has-text-centered">Results</h2>
-        <div id="results-carousel" class="carousel results-carousel">
-          <div class="item">
-            <img src="static/images/carousel1.jpg" alt="Result 1" loading="lazy"/>
-            <h2 class="subtitle has-text-centered">Per-particle decomposition on simulated scenes.</h2>
-          </div>
-          <div class="item">
-            <img src="static/images/carousel2.jpg" alt="Result 2" loading="lazy"/>
-            <h2 class="subtitle has-text-centered">Controllable scene editing via particle manipulation.</h2>
-          </div>
+      <h2 class="title is-3 has-text-centered">3D Reconstruction</h2>
+      <div class="columns is-centered">
+        <div class="column">
+          <img src="static/images/reconstruction_1.gif" alt="3D reconstruction example 1" loading="lazy" style="width:100%;"/>
+        </div>
+        <div class="column">
+          <img src="static/images/reconstruction_2.gif" alt="3D reconstruction example 2" loading="lazy" style="width:100%;"/>
         </div>
       </div>
     </div>
   </section>
-  -->
+
+  <!-- Latent Space Controllability -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Latent Space Controllability</h2>
+      <p class="has-text-centered" style="margin-bottom:2rem;">By manipulating particle attributes, we can directly edit scene configurations.</p>
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h3 class="title is-5">Translation</h3>
+          <img src="static/images/translation.gif" alt="Translation editing" loading="lazy" style="width:100%;"/>
+        </div>
+        <div class="column has-text-centered">
+          <h3 class="title is-5">Scaling</h3>
+          <img src="static/images/scaling.gif" alt="Scaling editing" loading="lazy" style="width:100%;"/>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- EC-Diffuser Policy Rollouts -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">EC-Diffuser with 3D-DLP — Policy Rollouts</h2>
+      <p class="has-text-centered" style="margin-bottom:2rem;">3D-DLP particles serve as compact state for an entity-centric diffusion policy across diverse manipulation tasks.</p>
+      <div class="columns is-multiline is-centered">
+        <div class="column is-half has-text-centered">
+          <h3 class="title is-5">Hammer</h3>
+          <img src="static/images/rollout_hammer.gif" alt="Hammer rollout" loading="lazy" style="width:100%;"/>
+        </div>
+        <div class="column is-half has-text-centered">
+          <h3 class="title is-5">Three Piece Assembly</h3>
+          <img src="static/images/rollout_three_piece_assembly.gif" alt="Three piece assembly rollout" loading="lazy" style="width:100%;"/>
+        </div>
+        <div class="column is-half has-text-centered">
+          <h3 class="title is-5">Mug Cleanup</h3>
+          <img src="static/images/rollout_mug_cleanup.gif" alt="Mug cleanup rollout" loading="lazy" style="width:100%;"/>
+        </div>
+        <div class="column is-half has-text-centered">
+          <h3 class="title is-5">Square</h3>
+          <img src="static/images/rollout_square.gif" alt="Square rollout" loading="lazy" style="width:100%;"/>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RGBD Slot Attention Baselines -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">RGBD Slot Attention Baselines</h2>
+
+      <h3 class="title is-4" style="margin-top:2rem;">SLATE</h3>
+      <div class="columns is-centered">
+        <div class="column"><img src="static/images/baseline_slate_1.gif" alt="SLATE example 1" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_slate_2.gif" alt="SLATE example 2" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_slate_3.gif" alt="SLATE example 3" loading="lazy" style="width:100%;"/></div>
+      </div>
+
+      <h3 class="title is-4" style="margin-top:2rem;">SAVi</h3>
+      <div class="columns is-centered">
+        <div class="column"><img src="static/images/baseline_savi_1.gif" alt="SAVi example 1" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_savi_2.gif" alt="SAVi example 2" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_savi_3.gif" alt="SAVi example 3" loading="lazy" style="width:100%;"/></div>
+      </div>
+    </div>
+  </section>
 
   <section class="section" id="BibTeX">
     <div class="container is-max-desktop content">
