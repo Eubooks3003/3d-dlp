@@ -58,6 +58,10 @@
 
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
+  <!-- JuxtaposeJS for before/after sliders -->
+  <link rel="stylesheet" href="https://cdn.knightlab.com/libs/juxtapose/latest/css/juxtapose.css">
+  <script src="https://cdn.knightlab.com/libs/juxtapose/latest/js/juxtapose.min.js"></script>
+
   <script defer src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
   <script defer src="static/js/fontawesome.all.min.js"></script>
   <script defer src="static/js/bulma-carousel.min.js"></script>
@@ -150,41 +154,81 @@
     </div>
   </section>
 
-  <!-- 3D Reconstruction -->
+  <!-- Architecture -->
   <section class="section">
     <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Architecture</h2>
+      <img src="static/images/architecture.png" alt="3D-DLP architecture" style="width:100%;"/>
+      <p class="has-text-centered" style="margin-top:1rem;"><em>3D-DLP encodes RGB voxel observations into a set of latent particles via a K-means prior, attribute encoder, and 3D decoder with volumetric compositing.</em></p>
+    </div>
+  </section>
+
+  <!-- 3D Reconstruction (interactive GT vs Reconstruction sliders) -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered">3D Reconstruction</h2>
+      <p class="has-text-centered" style="margin-bottom:2rem;">Drag the slider to compare ground-truth voxels (left) with our 3D-DLP reconstruction (right).</p>
       <div class="columns is-centered">
         <div class="column">
-          <img src="static/images/reconstruction_1.gif" alt="3D reconstruction example 1" loading="lazy" style="width:100%;"/>
+          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
+            <img src="static/images/recon_1_gt.png" data-label="Ground Truth"/>
+            <img src="static/images/recon_1_rec.png" data-label="Reconstruction"/>
+          </div>
         </div>
+      </div>
+      <div class="columns is-centered" style="margin-top:2rem;">
         <div class="column">
-          <img src="static/images/reconstruction_2.gif" alt="3D reconstruction example 2" loading="lazy" style="width:100%;"/>
+          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
+            <img src="static/images/recon_2_gt.png" data-label="Ground Truth"/>
+            <img src="static/images/recon_2_rec.png" data-label="Reconstruction"/>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
   <!-- Latent Space Controllability -->
-  <section class="section hero is-light">
+  <section class="section">
     <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered">Latent Space Controllability</h2>
-      <p class="has-text-centered" style="margin-bottom:2rem;">By manipulating particle attributes, we can directly edit scene configurations.</p>
+      <p class="has-text-centered" style="margin-bottom:2rem;">By directly editing particle attributes (position, scale), we can generate novel scene configurations. Drag each slider to see the original scene versus the edited result.</p>
+
+      <h3 class="title is-5 has-text-centered" style="margin-top:1rem;">Sample 05</h3>
       <div class="columns is-centered">
-        <div class="column has-text-centered">
-          <h3 class="title is-5">Translation</h3>
-          <img src="static/images/translation.gif" alt="Translation editing" loading="lazy" style="width:100%;"/>
+        <div class="column">
+          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
+            <img src="static/images/latent_05_original.png" data-label="Original"/>
+            <img src="static/images/latent_05_modified_a.png" data-label="Edited (Translation)"/>
+          </div>
         </div>
-        <div class="column has-text-centered">
-          <h3 class="title is-5">Scaling</h3>
-          <img src="static/images/scaling.gif" alt="Scaling editing" loading="lazy" style="width:100%;"/>
+        <div class="column">
+          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
+            <img src="static/images/latent_05_original.png" data-label="Original"/>
+            <img src="static/images/latent_05_modified_b.png" data-label="Edited (Scaling)"/>
+          </div>
+        </div>
+      </div>
+
+      <h3 class="title is-5 has-text-centered" style="margin-top:2rem;">Sample 07</h3>
+      <div class="columns is-centered">
+        <div class="column">
+          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
+            <img src="static/images/latent_07_original.png" data-label="Original"/>
+            <img src="static/images/latent_07_modified_a.png" data-label="Edited (Translation)"/>
+          </div>
+        </div>
+        <div class="column">
+          <div class="juxtapose" data-startingposition="50%" data-showlabels="true" data-showcredits="false">
+            <img src="static/images/latent_07_original.png" data-label="Original"/>
+            <img src="static/images/latent_07_modified_b.png" data-label="Edited (Scaling)"/>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
   <!-- EC-Diffuser Policy Rollouts -->
-  <section class="section">
+  <section class="section hero is-light">
     <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered">EC-Diffuser with 3D-DLP — Policy Rollouts</h2>
       <p class="has-text-centered" style="margin-bottom:2rem;">3D-DLP particles serve as compact state for an entity-centric diffusion policy across diverse manipulation tasks.</p>
@@ -194,10 +238,6 @@
           <img src="static/images/rollout_hammer.gif" alt="Hammer rollout" loading="lazy" style="width:100%;"/>
         </div>
         <div class="column is-half has-text-centered">
-          <h3 class="title is-5">Three Piece Assembly</h3>
-          <img src="static/images/rollout_three_piece_assembly.gif" alt="Three piece assembly rollout" loading="lazy" style="width:100%;"/>
-        </div>
-        <div class="column is-half has-text-centered">
           <h3 class="title is-5">Mug Cleanup</h3>
           <img src="static/images/rollout_mug_cleanup.gif" alt="Mug cleanup rollout" loading="lazy" style="width:100%;"/>
         </div>
@@ -205,7 +245,20 @@
           <h3 class="title is-5">Square</h3>
           <img src="static/images/rollout_square.gif" alt="Square rollout" loading="lazy" style="width:100%;"/>
         </div>
+        <div class="column is-half has-text-centered">
+          <h3 class="title is-5">Kitchen</h3>
+          <img src="static/images/rollout_kitchen.gif" alt="Kitchen rollout" loading="lazy" style="width:100%;"/>
+        </div>
       </div>
+    </div>
+  </section>
+
+  <!-- Real-World Results -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Real-World Results</h2>
+      <p class="has-text-centered" style="margin-bottom:1rem;">3D-DLP applied to real-world scenes.</p>
+      <img src="static/images/rollout_real_world.gif" alt="Real-world rollout" loading="lazy" style="width:100%;"/>
     </div>
   </section>
 
@@ -213,19 +266,19 @@
   <section class="section hero is-light">
     <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered">RGBD Slot Attention Baselines</h2>
+      <p class="has-text-centered" style="margin-bottom:2rem;">For comparison, we show object-centric decompositions from 2D slot-attention baselines (SLATE and SAVi) operating on RGB-D inputs.</p>
 
       <h3 class="title is-4" style="margin-top:2rem;">SLATE</h3>
       <div class="columns is-centered">
-        <div class="column"><img src="static/images/baseline_slate_1.gif" alt="SLATE example 1" loading="lazy" style="width:100%;"/></div>
-        <div class="column"><img src="static/images/baseline_slate_2.gif" alt="SLATE example 2" loading="lazy" style="width:100%;"/></div>
-        <div class="column"><img src="static/images/baseline_slate_3.gif" alt="SLATE example 3" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_slate_1.png" alt="SLATE example 1" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_slate_2.png" alt="SLATE example 2" loading="lazy" style="width:100%;"/></div>
       </div>
 
       <h3 class="title is-4" style="margin-top:2rem;">SAVi</h3>
       <div class="columns is-centered">
-        <div class="column"><img src="static/images/baseline_savi_1.gif" alt="SAVi example 1" loading="lazy" style="width:100%;"/></div>
-        <div class="column"><img src="static/images/baseline_savi_2.gif" alt="SAVi example 2" loading="lazy" style="width:100%;"/></div>
-        <div class="column"><img src="static/images/baseline_savi_3.gif" alt="SAVi example 3" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_savi_1.png" alt="SAVi example 1" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_savi_2.png" alt="SAVi example 2" loading="lazy" style="width:100%;"/></div>
+        <div class="column"><img src="static/images/baseline_savi_3.png" alt="SAVi example 3" loading="lazy" style="width:100%;"/></div>
       </div>
     </div>
   </section>
