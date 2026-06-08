@@ -288,28 +288,96 @@
       <h2 class="title is-3 has-text-centered">EC-Diffuser with 3D-DLP — Policy Rollouts</h2>
       <p class="has-text-centered" style="margin-bottom:2rem;">3D-DLP particles serve as compact state for an entity-centric diffusion policy across diverse manipulation tasks.</p>
       <div class="columns is-multiline is-centered">
-        <div class="column is-half has-text-centered">
-          <h3 class="title is-5">Hammer</h3>
+        <div class="column is-one-quarter has-text-centered">
+          <h3 class="title is-6">Hammer</h3>
           <img src="static/images/rollout_hammer.gif" alt="Hammer rollout" loading="lazy" style="width:100%;"/>
         </div>
-        <div class="column is-half has-text-centered">
-          <h3 class="title is-5">Three Piece Assembly</h3>
+        <div class="column is-one-quarter has-text-centered">
+          <h3 class="title is-6">Three Piece Assembly</h3>
           <img src="static/images/three_piece_assembly.gif" alt="Three piece assembly rollout" loading="lazy" style="width:100%;"/>
         </div>
-        <div class="column is-half has-text-centered">
-          <h3 class="title is-5">Mug Cleanup</h3>
+        <div class="column is-one-quarter has-text-centered">
+          <h3 class="title is-6">Mug Cleanup</h3>
           <img src="static/images/rollout_mug_cleanup.gif" alt="Mug cleanup rollout" loading="lazy" style="width:100%;"/>
         </div>
-        <div class="column is-half has-text-centered">
-          <h3 class="title is-5">Square</h3>
+        <div class="column is-one-quarter has-text-centered">
+          <h3 class="title is-6">Square</h3>
           <img src="static/images/rollout_square.gif" alt="Square rollout" loading="lazy" style="width:100%;"/>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- Ground Truth vs. Reconstruction (compact) -->
+  <!-- Manipulation Performance (quantitative bar charts) -->
+  <style>
+    .perf-charts { display:flex; flex-wrap:wrap; gap:2.5rem; justify-content:center; }
+    .perf-card { flex:1 1 380px; max-width:480px; }
+    .perf-card .perf-head { text-align:center; margin-bottom:0.25rem; }
+    .perf-gain { display:inline-block; background:#2563eb; color:#fff; font-weight:700;
+                 border-radius:999px; padding:0.15rem 0.85rem; font-size:0.9rem; margin-bottom:1rem; }
+    .perf-row { display:flex; align-items:center; margin:0.5rem 0; }
+    .perf-name { width:42%; text-align:right; padding-right:0.7rem; font-size:0.82rem; line-height:1.1; }
+    .perf-name.ours { font-weight:700; }
+    .perf-track { flex:1; background:#eef0f4; border-radius:5px; height:1.6rem; }
+    .perf-fill { height:100%; border-radius:5px; display:flex; align-items:center; justify-content:flex-end;
+                 color:#fff; font-size:0.78rem; font-weight:600; padding-right:0.5rem; white-space:nowrap; }
+    .perf-fill.ours  { background:#2563eb; }
+    .perf-fill.dlp2d { background:#aab2c0; }
+    .perf-fill.voxel { background:#6b7a99; }
+    .perf-legend { text-align:center; font-size:0.75rem; color:#666; margin-top:1.5rem; }
+    .perf-legend .sw { display:inline-block; width:0.8rem; height:0.8rem; border-radius:3px;
+                       vertical-align:middle; margin:0 0.25rem 0 0.9rem; }
+  </style>
   <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Manipulation Performance</h2>
+      <p class="has-text-centered" style="margin-bottom:2rem;">
+        Plugging 3D-DLP particles into the same entity-centric diffusion policy yields the highest mean success rate on both benchmarks, with the largest gains over matched 2D object-centric baselines where the representation is the only variable.
+      </p>
+
+      <div class="perf-charts">
+        <!-- MimicGen -->
+        <div class="perf-card">
+          <div class="perf-head"><h3 class="title is-5" style="margin-bottom:0.1rem;">MimicGen</h3>
+            <p class="is-size-7" style="color:#777;">12 tasks · mean success rate</p>
+            <span class="perf-gain">+14.0 pts vs. 2D-DLP</span></div>
+          <div class="perf-row"><div class="perf-name ours">3D-DLP (Ours)</div>
+            <div class="perf-track"><div class="perf-fill ours" style="width:48.1%;">48.1%</div></div></div>
+          <div class="perf-row"><div class="perf-name">EquiDiff (dense voxel)*</div>
+            <div class="perf-track"><div class="perf-fill voxel" style="width:47.3%;">47.3%</div></div></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP multi-view</div>
+            <div class="perf-track"><div class="perf-fill dlp2d" style="width:34.1%;">34.1%</div></div></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP single-view</div>
+            <div class="perf-track"><div class="perf-fill dlp2d" style="width:30.8%;">30.8%</div></div></div>
+        </div>
+
+        <!-- RLBench -->
+        <div class="perf-card">
+          <div class="perf-head"><h3 class="title is-5" style="margin-bottom:0.1rem;">RLBench</h3>
+            <p class="is-size-7" style="color:#777;">10 tasks · mean success rate</p>
+            <span class="perf-gain">+7.3 pts vs. 2D-DLP</span></div>
+          <div class="perf-row"><div class="perf-name ours">3D-DLP (Ours)</div>
+            <div class="perf-track"><div class="perf-fill ours" style="width:74.5%;">74.5%</div></div></div>
+          <div class="perf-row"><div class="perf-name">PerAct (dense voxel)*</div>
+            <div class="perf-track"><div class="perf-fill voxel" style="width:68.8%;">68.8%</div></div></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP multi-view</div>
+            <div class="perf-track"><div class="perf-fill dlp2d" style="width:67.2%;">67.2%</div></div></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP single-view</div>
+            <div class="perf-track"><div class="perf-fill dlp2d" style="width:66.7%;">66.7%</div></div></div>
+        </div>
+      </div>
+
+      <div class="perf-legend">
+        <span class="sw" style="background:#2563eb;"></span>3D-DLP (ours)
+        <span class="sw" style="background:#aab2c0;"></span>2D object-centric
+        <span class="sw" style="background:#6b7a99;"></span>dense voxel
+        <br><span style="font-size:0.7rem;">*Dense-voxel references (EquiDiff, PerAct) are not matched-compute; shown for context.</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Ground Truth vs. Reconstruction (compact) -->
+  <section class="section hero is-light">
     <div class="container is-max-desktop">
       <h2 class="title is-4 has-text-centered">Ground Truth vs. Reconstruction</h2>
       <p class="has-text-centered" style="margin-bottom:1.5rem;">Drag each slider to compare ground-truth voxels with our 3D-DLP reconstruction.</p>
