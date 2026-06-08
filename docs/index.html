@@ -153,6 +153,88 @@
     </div>
   </section>
 
+  <!-- Object-Centric 3D Decomposition (focus visualization) -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Object-Centric 3D Decomposition</h2>
+      <p class="has-text-centered" style="margin-bottom:2rem;">
+        3D-DLP decomposes each RLBench scene into a set of interpretable 3D latent particles. The top row shows our reconstructed RGB voxel scene; the bottom row shows the corresponding per-particle foreground/background decomposition that emerges purely from self-supervised training.
+      </p>
+
+      <h3 class="title is-5 has-text-centered" style="margin-top:1.5rem;">RGB Reconstruction</h3>
+      <div class="columns is-multiline is-centered">
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_close_jar_rgb.gif" alt="Close Jar — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Close Jar</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_open_drawer_rgb.gif" alt="Open Drawer — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Open Drawer</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_push_buttons_rgb.gif" alt="Push Buttons — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Push Buttons</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_put_item_in_drawer_rgb.gif" alt="Put Item in Drawer — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Put Item in Drawer</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_reach_and_drag_rgb.gif" alt="Reach and Drag — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Reach and Drag</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_slide_block_rgb.gif" alt="Slide Block to Target — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Slide Block to Target</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_turn_tap_rgb.gif" alt="Turn Tap — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Turn Tap</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_sweep_to_dustpan_rgb.gif" alt="Sweep to Dustpan — RGB reconstruction" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Sweep to Dustpan</p>
+        </div>
+      </div>
+
+      <h3 class="title is-5 has-text-centered" style="margin-top:2.5rem;">Foreground / Background Decomposition</h3>
+      <div class="columns is-multiline is-centered">
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_close_jar_seg.gif" alt="Close Jar — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Close Jar</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_open_drawer_seg.gif" alt="Open Drawer — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Open Drawer</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_push_buttons_seg.gif" alt="Push Buttons — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Push Buttons</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_put_item_in_drawer_seg.gif" alt="Put Item in Drawer — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Put Item in Drawer</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_reach_and_drag_seg.gif" alt="Reach and Drag — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Reach and Drag</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_slide_block_seg.gif" alt="Slide Block to Target — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Slide Block to Target</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_turn_tap_seg.gif" alt="Turn Tap — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Turn Tap</p>
+        </div>
+        <div class="column is-one-quarter has-text-centered">
+          <img src="static/images/rlbench_sweep_to_dustpan_seg.gif" alt="Sweep to Dustpan — particle decomposition" loading="lazy" style="width:100%;border-radius:6px;"/>
+          <p class="is-size-7" style="margin-top:0.4rem;">Sweep to Dustpan</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Architecture -->
   <section class="section">
     <div class="container is-max-desktop">
@@ -162,21 +244,10 @@
     </div>
   </section>
 
-  <!-- 3D Reconstruction (GT vs Recon sliders + panning views) -->
+  <!-- Panning Views -->
   <section class="section hero is-light">
     <div class="container is-max-desktop">
-      <h2 class="title is-3 has-text-centered">3D Reconstruction</h2>
-
-      <h3 class="title is-5 has-text-centered" style="margin-top:1.5rem;">Ground Truth vs. Reconstruction</h3>
-      <p class="has-text-centered" style="margin-bottom:1.5rem;">Drag each slider to compare ground-truth voxels with our 3D-DLP reconstruction.</p>
-      <div class="columns is-centered">
-        <div class="column"><div id="slider-recon-1"></div></div>
-      </div>
-      <div class="columns is-centered" style="margin-top:1.5rem;">
-        <div class="column"><div id="slider-recon-2"></div></div>
-      </div>
-
-      <h3 class="title is-5 has-text-centered" style="margin-top:3rem;">Panning Views</h3>
+      <h2 class="title is-3 has-text-centered">Panning Views</h2>
       <p class="has-text-centered" style="margin-bottom:1.5rem;">Rotating views of 3D-DLP reconstructions, including a real-world scene.</p>
       <div class="columns is-centered">
         <div class="column has-text-centered">
@@ -233,6 +304,18 @@
           <h3 class="title is-5">Square</h3>
           <img src="static/images/rollout_square.gif" alt="Square rollout" loading="lazy" style="width:100%;"/>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Ground Truth vs. Reconstruction (compact) -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-4 has-text-centered">Ground Truth vs. Reconstruction</h2>
+      <p class="has-text-centered" style="margin-bottom:1.5rem;">Drag each slider to compare ground-truth voxels with our 3D-DLP reconstruction.</p>
+      <div class="columns is-centered">
+        <div class="column is-half"><div id="slider-recon-1"></div></div>
+        <div class="column is-half"><div id="slider-recon-2"></div></div>
       </div>
     </div>
   </section>
