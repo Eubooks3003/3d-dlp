@@ -267,24 +267,26 @@
   <!-- Manipulation Performance (quantitative bar charts) -->
   <style>
     .perf-banner { text-align:center; background:#eef2fb; border:1px solid #d6e0f5; border-radius:12px;
-                   padding:1rem 1.3rem; margin:0 auto 2.4rem; max-width:780px; font-size:0.95rem;
+                   padding:1rem 1.3rem; margin:0 auto 2.4rem; max-width:820px; font-size:0.95rem;
                    color:#33415a; line-height:1.45; }
     .perf-banner strong { color:#2563eb; }
     .perf-charts { display:flex; flex-wrap:wrap; gap:2.5rem; justify-content:center; }
     .perf-card { flex:1 1 400px; max-width:500px; }
-    .perf-card .perf-head { text-align:center; margin-bottom:0.75rem; }
+    .perf-card .perf-head { text-align:center; margin-bottom:0.5rem; }
     .perf-claim { color:#2563eb; font-weight:700; font-size:0.86rem; line-height:1.3;
-                  margin:0.35rem auto 0; max-width:360px; }
-    .perf-row { display:flex; align-items:center; margin:0.6rem 0; }
-    .perf-name { width:44%; text-align:right; padding-right:0.7rem; font-size:0.82rem; line-height:1.05; }
+                  margin:0.35rem auto 0; max-width:380px; }
+    .perf-group { font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.03em;
+                  color:#5b6573; text-align:left; margin:0.9rem 0 0.35rem; }
+    .perf-group.ref { color:#8a93a3; margin-top:1.25rem; }
+    .perf-row { display:flex; align-items:center; margin:0.55rem 0; }
+    .perf-name { width:42%; text-align:right; padding-right:0.7rem; font-size:0.82rem; line-height:1.05; }
     .perf-name.ours { font-weight:700; }
-    .perf-name .perf-sub { display:block; font-size:0.66rem; color:#9aa3b2; font-weight:400; margin-top:0.1rem; }
     .perf-track { flex:1; background:#eef0f4; border-radius:5px; height:1.6rem; }
     .perf-fill { height:100%; border-radius:5px; display:flex; align-items:center; justify-content:flex-end;
                  color:#fff; font-size:0.78rem; font-weight:600; padding-right:0.5rem; white-space:nowrap; }
     .perf-fill.ours  { background:#2563eb; }
     .perf-fill.dlp2d { background:#aab2c0; }
-    .perf-fill.voxel { background:#6b7a99; }
+    .perf-fill.ref   { background:#6b7a99; }
     .perf-legend { text-align:center; font-size:0.78rem; color:#666; margin-top:1.75rem; }
     .perf-legend .sw { display:inline-block; width:0.8rem; height:0.8rem; border-radius:3px;
                        vertical-align:middle; margin:0 0.25rem 0 0.9rem; }
@@ -293,11 +295,11 @@
     <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered">Manipulation Performance</h2>
       <p class="has-text-centered" style="margin-bottom:1.5rem;">
-        3D-DLP particles serve as the state for an entity-centric diffusion policy. Across both benchmarks, 3D-DLP achieves the highest mean success rate of any method — matching or beating memory-intensive dense-voxel policies while using a representation orders of magnitude smaller.
+        We isolate the value of 3D structure by swapping <em>only</em> the scene representation — 2D-DLP → 3D-DLP — inside the same entity-centric diffusion policy (EC-Diffuser). EquiDiff and PerAct use entirely different policy backbones and are shown as external references.
       </p>
 
       <div class="perf-banner">
-        <strong>Object-centric efficiency.</strong> 3D-DLP encodes each scene with only <strong>~24 particle tokens</strong>, versus the <strong>64³ = 262,144-voxel</strong> grid that dense policies (EquiDiff, PerAct) operate on — a <strong>~10,000× smaller</strong> representation that nonetheless matches or exceeds their success rates.
+        <strong>Controlled comparison.</strong> 3D-DLP and the 2D-DLP baselines run on the <strong>identical EC-Diffuser policy backbone</strong> — only the representation changes (2D → 3D object-centric particles), so the gain isolates the effect of lifting the representation to 3D. EquiDiff and PerAct are <strong>separate policy architectures</strong>, included only as external references.
       </div>
 
       <div class="perf-charts">
@@ -305,38 +307,42 @@
         <div class="perf-card">
           <div class="perf-head"><h3 class="title is-5" style="margin-bottom:0.1rem;">MimicGen</h3>
             <p class="is-size-7" style="color:#777;">12 tasks · mean success rate</p>
-            <div class="perf-claim">Highest mean of all methods — matches the dense-voxel EquiDiff at ~1/10,000 the representation size</div></div>
-          <div class="perf-row"><div class="perf-name ours">3D-DLP (Ours)<span class="perf-sub">~24 particle tokens</span></div>
+            <div class="perf-claim">Same EC-Diffuser policy, representation swapped 2D → 3D: +14.0 pts</div></div>
+          <div class="perf-group">Same policy (EC-Diffuser) · representation swapped</div>
+          <div class="perf-row"><div class="perf-name ours">3D-DLP (Ours)</div>
             <div class="perf-track"><div class="perf-fill ours" style="width:48.1%;">48.1%</div></div></div>
-          <div class="perf-row"><div class="perf-name">EquiDiff<span class="perf-sub">262K voxels (64³)</span></div>
-            <div class="perf-track"><div class="perf-fill voxel" style="width:47.3%;">47.3%</div></div></div>
-          <div class="perf-row"><div class="perf-name">2D-DLP multi-view<span class="perf-sub">2D particle tokens</span></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP multi-view</div>
             <div class="perf-track"><div class="perf-fill dlp2d" style="width:34.1%;">34.1%</div></div></div>
-          <div class="perf-row"><div class="perf-name">2D-DLP single-view<span class="perf-sub">2D particle tokens</span></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP single-view</div>
             <div class="perf-track"><div class="perf-fill dlp2d" style="width:30.8%;">30.8%</div></div></div>
+          <div class="perf-group ref">Different policy backbone (reference)</div>
+          <div class="perf-row"><div class="perf-name">EquiDiff</div>
+            <div class="perf-track"><div class="perf-fill ref" style="width:47.3%;">47.3%</div></div></div>
         </div>
 
         <!-- RLBench -->
         <div class="perf-card">
           <div class="perf-head"><h3 class="title is-5" style="margin-bottom:0.1rem;">RLBench</h3>
             <p class="is-size-7" style="color:#777;">10 tasks · mean success rate</p>
-            <div class="perf-claim">Beats the dense-voxel PerAct on 7/10 tasks · best on 9/10 vs. matched baselines</div></div>
-          <div class="perf-row"><div class="perf-name ours">3D-DLP (Ours)<span class="perf-sub">~24 particle tokens</span></div>
+            <div class="perf-claim">Same EC-Diffuser policy: 3D-DLP best on 9/10 tasks (+7.3 pts vs. 2D)</div></div>
+          <div class="perf-group">Same policy (EC-Diffuser) · representation swapped</div>
+          <div class="perf-row"><div class="perf-name ours">3D-DLP (Ours)</div>
             <div class="perf-track"><div class="perf-fill ours" style="width:74.5%;">74.5%</div></div></div>
-          <div class="perf-row"><div class="perf-name">PerAct<span class="perf-sub">262K voxels (64³), multi-view</span></div>
-            <div class="perf-track"><div class="perf-fill voxel" style="width:68.8%;">68.8%</div></div></div>
-          <div class="perf-row"><div class="perf-name">2D-DLP multi-view<span class="perf-sub">2D particle tokens</span></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP multi-view</div>
             <div class="perf-track"><div class="perf-fill dlp2d" style="width:67.2%;">67.2%</div></div></div>
-          <div class="perf-row"><div class="perf-name">2D-DLP single-view<span class="perf-sub">2D particle tokens</span></div>
+          <div class="perf-row"><div class="perf-name">2D-DLP single-view</div>
             <div class="perf-track"><div class="perf-fill dlp2d" style="width:66.7%;">66.7%</div></div></div>
+          <div class="perf-group ref">Different policy backbone (reference)</div>
+          <div class="perf-row"><div class="perf-name">PerAct</div>
+            <div class="perf-track"><div class="perf-fill ref" style="width:68.8%;">68.8%</div></div></div>
         </div>
       </div>
 
       <div class="perf-legend">
-        <span class="sw" style="background:#2563eb;"></span>3D-DLP (ours)
-        <span class="sw" style="background:#aab2c0;"></span>2D object-centric
-        <span class="sw" style="background:#6b7a99;"></span>dense voxel (64³)
-        <br><span style="font-size:0.72rem;">Dense-voxel methods use heavier, differently-trained setups; 3D-DLP reaches comparable or higher success from a far more compact, object-centric representation.</span>
+        <span class="sw" style="background:#2563eb;"></span>3D-DLP (ours) — EC-Diffuser
+        <span class="sw" style="background:#aab2c0;"></span>2D-DLP — same EC-Diffuser backbone
+        <span class="sw" style="background:#6b7a99;"></span>different policy backbone
+        <br><span style="font-size:0.72rem;">Only 3D-DLP vs. 2D-DLP is a controlled representation swap (identical policy). EquiDiff and PerAct differ in policy architecture and are external references.</span>
       </div>
     </div>
   </section>
