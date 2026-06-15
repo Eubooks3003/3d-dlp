@@ -3,9 +3,9 @@
 <p align="center">
   <a href="https://eubooks3003.github.io/3d-dlp/">Project Page</a> &nbsp;•&nbsp;
   <a href="#installation">Installation</a> &nbsp;•&nbsp;
+  <a href="#data-preprocessing">Data Preprocessing</a> &nbsp;•&nbsp;
   <a href="#training">Training</a> &nbsp;•&nbsp;
   <a href="#evaluation">Evaluation</a> &nbsp;•&nbsp;
-  <a href="#interactive-gui">GUI</a> &nbsp;•&nbsp;
   <a href="#citation">Citation</a>
 </p>
 
@@ -36,10 +36,10 @@ dense 3D inputs without object-centric structure.
 - [Installation](#installation)
 - [Repository Organization](#repository-organization)
 - [Datasets](#datasets)
+- [Data Preprocessing](#data-preprocessing)
 - [Configuration Files](#configuration-files)
 - [Training](#training)
 - [Evaluation](#evaluation)
-- [Interactive GUI](#interactive-gui)
 - [Documentation](#documentation)
 - [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
@@ -79,8 +79,8 @@ pip install -r requirements.txt
 ```
 
 The environment targets **Python 3.8**, **PyTorch 2.x**, and **CUDA 11.8**. Key dependencies include
-`accelerate` (multi-GPU training), `einops`, `h5py`, `opencv-python`, `scikit-image`, `imageio`,
-`piqa` (LPIPS/SSIM/PSNR metrics), and `ttkthemes`/`ttkwidgets` (interactive GUI).
+`accelerate` (multi-GPU training), `einops`, `h5py`, `open3d` (point-cloud / voxelization),
+`opencv-python`, `scikit-image`, `imageio`, and `piqa` (LPIPS/SSIM/PSNR metrics).
 
 For manual setup notes and CUDA/dependency caveats, see
 [`documentation/installation.md`](documentation/installation.md).
@@ -97,12 +97,11 @@ For manual setup notes and CUDA/dependency caveats, see
 | `configs/` | JSON experiment configs (see [below](#configuration-files)) |
 | `datasets/` | Dataset loaders and preparation scripts |
 | `eval/` | Evaluation scripts and metric backends (LPIPS, FVD) |
-| `gui/` | `tkinter` interactive particle visualization / editing |
-| `scripts/` | Data conversion and utility scripts |
+| `scripts/` | Data conversion / voxelization / K-means precompute scripts |
 | `utils/` | Logging, plotting, loss functions, and helpers |
-| `documentation/` | Installation, hyperparameters, GUI guide, example usage |
+| `documentation/` | Installation, hyperparameters, example usage |
 | `docs/` | Project page (GitHub Pages) |
-| `assets/` | Sample assets for the GUI and figures |
+| `assets/` | Sample assets and figures |
 | `accel_conf.yml` | HuggingFace `accelerate` config for multi-GPU runs |
 | `environment.yml` / `requirements.txt` | conda / pip dependency specs |
 
@@ -120,11 +119,125 @@ paper:
 | `RLBench` | Language-conditioned manipulation | Used in the imitation-learning experiments |
 | `UW RGB-D Scenes v2` | Real-world RGB-D | Tabletop scenes |
 
-Data-preparation and conversion helpers (e.g. voxelization, format conversion) are in
-[`scripts/`](scripts/).
+For the robot-manipulation datasets (**MimicGen**, **RLBench**), the raw demonstrations must be
+converted into cached voxel grids before training — see [Data Preprocessing](#data-preprocessing).
 
 **Custom datasets:** add a `Dataset` class under `datasets/`, register it in the dataset-resolution
 helper, and create a matching JSON config in `configs/`.
+
+## Data Preprocessing
+
+The voxel models (3D-DLP-V / 3D-DLP-VC) train on a per-frame **64³ RGB voxel grid** built from
+multi-view RGB-D. Preprocessing turns raw demonstrations into (1) fused point clouds, (2) cached
+voxel grids, and — optionally — (3) cached K-means keypoint priors. Every script lives in
+[`scripts/`](scripts/) and writes its outputs **back into the dataset tree**, so training just reads
+the caches. Both datasets follow the same three stages:
+
+```
+raw demos ─▶ multi-view RGB-D ─▶ fused point cloud (.ply) ─▶ 64³ RGB voxel cache ─▶ (optional) K-means prior cache
+```
+
+`open3d` is required for the point-cloud / voxelization steps. Pass `--tasks` to restrict to specific
+tasks (omit to process all), and re-runs skip frames that are already cached.
+
+### MimicGen
+
+**Raw input.** Per-task RGB-D HDF5 files (matching `*_rgbd_pcd.hdf5`) containing the `agentview` and
+`sideview` camera RGB + depth, laid out as `<root>/<task>_d0/`. These come from rendering
+MimicGen / robomimic demonstrations with camera **depth** enabled (standard robomimic observation
+extraction).
+
+**1 — Fuse RGB-D → point clouds.** Back-projects each camera, fuses the two views, crops the
+workspace, and writes one `.ply` per frame to `<root>/<task>_d0/core/mimicgen_from_depth_pcd/demo_*/`.
+The depth-buffer → metric-depth convention is auto-detected per task.
+
+```bash
+python scripts/mimicgen_ply_all_tasks.py \
+  --root /path/to/3D-DLP-mimicgen-data \
+  --tasks stack_d1 coffee_d2 kitchen_d1        # --cams defaults to: agentview sideview
+```
+
+**2 — Voxelize point clouds → 64³ RGB grid.** Writes `frame*_voxels.pt` (+ meta) to
+`<root>/<task>_d0/core/voxel_cache/`.
+
+```bash
+python scripts/preprocess_mimicgen_voxels.py \
+  --root /path/to/3D-DLP-mimicgen-data \
+  --tasks stack_d1 coffee_d2 kitchen_d1 \
+  --grid_whd 64 64 64 \
+  --voxel_mode avg_rgb \
+  --use_task_bounds        # per-task workspace bounds (or --fixed_bounds for a shared crop; omit for per-frame)
+```
+
+### RLBench
+
+**Raw input.** RLBench demonstrations under
+`<root>/<split>/<task>/all_variations/episodes/episode<N>/`, with `front` / `overhead` /
+`left_shoulder` / `right_shoulder` RGB + depth PNGs and `low_dim_obs.pkl`. Generate them with
+RLBench's `tools/dataset_generator.py` (e.g. `--episodes_per_task 100 --all_variations True
+--image_size 128`). The ten tasks used in the paper:
+
+```
+close_jar  open_drawer  sweep_to_dustpan_of_size  meat_off_grill  turn_tap
+slide_block_to_color_target  put_item_in_drawer  reach_and_drag  push_buttons  stack_blocks
+```
+
+**1 — Fuse RGB-D → point clouds.** Back-projects + fuses all cameras (depth PNGs are in millimetres,
+hence `--depth-scale 1000`) and writes one `.ply` per frame to `episode<N>/fused_pcd/`.
+
+```bash
+python scripts/rlbench_ply.py \
+  --root /path/to/rlbench \
+  --splits train_data test_data \
+  --tasks close_jar open_drawer turn_tap \
+  --cameras front overhead left_shoulder right_shoulder \
+  --depth-scale 1000.0 \
+  --fov 60.0 \
+  --max-points 200000
+```
+
+**2 — Voxelize point clouds → 64³ RGB grid.** Each frame is normalized to a unit cube; writes
+`voxel_cache/*_voxels.pt` per episode.
+
+```bash
+python scripts/preprocess_rlbench_voxels.py \
+  --root /path/to/rlbench \
+  --splits train_data test_data \
+  --tasks close_jar open_drawer turn_tap \
+  --grid_whd 64 64 64 \
+  --voxel_mode avg_rgb
+```
+
+### (Optional) Precompute the K-means prior
+
+3D-DLP initializes its particles with an **appearance-aware K-means prior** — joint CIELAB-color + XYZ
+clustering that is purely algorithmic, so **no trained checkpoint is required**. It can run on-the-fly
+during training, but precomputing and caching it per frame makes training substantially faster. Point
+the script at the same dataset root plus a config (it reads the particle count from the config):
+
+```bash
+# MimicGen — caches per-frame K-means alongside the voxel cache
+python scripts/precompute_kmeans.py \
+  --data-root /path/to/3D-DLP-mimicgen-data \
+  --dlp-cfg configs/mimicgen_multitask.json \
+  --num-gpus 1 --workers-per-gpu 4 --batch 32 \
+  --tasks stack_d1 coffee_d2 kitchen_d1
+
+# RLBench — writes kmeans_cache/*_kmeans.pt per episode
+python scripts/precompute_kmeans_rlbench.py \
+  --data-root /path/to/rlbench \
+  --dlp-cfg configs/rlbench_multitask.json \
+  --splits train_data test_data \
+  --num-gpus 1 --workers-per-gpu 4 --batch 32
+```
+
+With the caches in place, train as in [Training](#training) using the matching config
+(`configs/mimicgen_multitask.json` or `configs/rlbench_multitask.json`).
+
+> **Batch wrappers.** `scripts/` also ships shell wrappers (`run_all_voxels.sh`, `run_all_kmeans.sh`,
+> `preprocess_rlbench_rgbo_all.sh`, …) that run these stages across every task. They contain absolute
+> paths from the authors' machines — edit the `ROOT` / `LPWM_DIR` variables at the top before use, and
+> treat the per-script commands above as the canonical interface.
 
 ## Configuration Files
 
@@ -178,28 +291,12 @@ Each script reads an experiment config and a checkpoint, for example:
 python eval/eval_vox.py --checkpoint <path/to/ckpt> --config configs/<your_config>.json
 ```
 
-## Interactive GUI
-
-A `tkinter`-based GUI to plot and edit particles and observe the effect on the reconstruction — useful
-for inspecting discovered keypoints and demonstrating latent controllability (position / scale edits).
-
-```bash
-bash gui.bash
-# equivalently:
-PYTHONPATH=. python -m gui.interactive_gui
-```
-
-The 3D viewer and interaction components are in [`gui/`](gui/) (`gui_3d.py`, `gui_select.py`,
-`gui_update.py`, …). Usage walkthrough: [`gui/gui.md`](gui/gui.md). Sample assets are under
-[`assets/`](assets/).
-
 ## Documentation
 
 | File | Content |
 |------|---------|
 | [`documentation/installation.md`](documentation/installation.md) | Manual environment setup |
 | [`documentation/hyperparameters.md`](documentation/hyperparameters.md) | Hyperparameter reference and recommended values |
-| [`documentation/gui.md`](documentation/gui.md) | Interactive GUI guide |
 | [`documentation/example_usage.py`](documentation/example_usage.py) | Minimal forward / loss / sampling example |
 
 ## Citation
