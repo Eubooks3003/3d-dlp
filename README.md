@@ -5,7 +5,6 @@
   <a href="#installation">Installation</a> &nbsp;•&nbsp;
   <a href="#data-preprocessing">Data Preprocessing</a> &nbsp;•&nbsp;
   <a href="#training">Training</a> &nbsp;•&nbsp;
-  <a href="#evaluation">Evaluation</a> &nbsp;•&nbsp;
   <a href="#citation">Citation</a>
 </p>
 
@@ -39,7 +38,6 @@ dense 3D inputs without object-centric structure.
 - [Data Preprocessing](#data-preprocessing)
 - [Configuration Files](#configuration-files)
 - [Training](#training)
-- [Evaluation](#evaluation)
 - [Documentation](#documentation)
 - [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
@@ -80,7 +78,7 @@ pip install -r requirements.txt
 
 The environment targets **Python 3.8**, **PyTorch 2.x**, and **CUDA 11.8**. Key dependencies include
 `accelerate` (multi-GPU training), `einops`, `h5py`, `open3d` (point-cloud / voxelization),
-`opencv-python`, `scikit-image`, `imageio`, and `piqa` (LPIPS/SSIM/PSNR metrics).
+`opencv-python`, `scikit-image`, and `imageio`.
 
 For manual setup notes and CUDA/dependency caveats, see
 [`documentation/installation.md`](documentation/installation.md).
@@ -96,7 +94,6 @@ For manual setup notes and CUDA/dependency caveats, see
 | `modules/` | Network building blocks (2D/3D vision, point-cloud, VAE, diffusion modules) |
 | `configs/` | JSON experiment configs (see [below](#configuration-files)) |
 | `datasets/` | Dataset loaders and preparation scripts |
-| `eval/` | Evaluation scripts and metric backends (LPIPS, FVD) |
 | `scripts/` | Data conversion / voxelization / K-means precompute scripts |
 | `utils/` | Logging, plotting, loss functions, and helpers |
 | `documentation/` | Installation, hyperparameters, example usage |
@@ -140,6 +137,13 @@ raw demos ─▶ multi-view RGB-D ─▶ fused point cloud (.ply) ─▶ 64³ RG
 `open3d` is required for the point-cloud / voxelization steps. Pass `--tasks` to restrict to specific
 tasks (omit to process all), and re-runs skip frames that are already cached.
 
+The fused point cloud is the geometry the voxelizer consumes — it does not have to be persisted. For
+RLBench, [`scripts/rlbench_rgbd_to_voxels.py`](scripts/rlbench_rgbd_to_voxels.py) runs both stages in
+one pass: it fuses the multi-view RGB-D in memory and voxelizes directly into `voxel_cache/`, writing
+**no `.ply`**. The output is identical to running the two stages back to back (same frame order, file
+names, and metadata), so use it when you don't need the `.ply` artifacts — or run the explicit
+two-stage flow below when you do. Both paths are shown for RLBench.
+
 ### MimicGen
 
 **Raw input.** Per-task RGB-D HDF5 files (matching `*_rgbd_pcd.hdf5`) containing the `agentview` and
@@ -181,6 +185,21 @@ RLBench's `tools/dataset_generator.py` (e.g. `--episodes_per_task 100 --all_vari
 close_jar  open_drawer  sweep_to_dustpan_of_size  meat_off_grill  turn_tap
 slide_block_to_color_target  put_item_in_drawer  reach_and_drag  push_buttons  stack_blocks
 ```
+
+**One-shot (no `.ply`).** Fuse and voxelize in a single pass straight into `voxel_cache/`:
+
+```bash
+python scripts/rlbench_rgbd_to_voxels.py \
+  --root /path/to/rlbench \
+  --splits train_data test_data \
+  --tasks close_jar open_drawer turn_tap \
+  --cameras front overhead left_shoulder right_shoulder \
+  --depth-scale 1000.0 \
+  --grid_whd 64 64 64 \
+  --voxel_mode avg_rgb
+```
+
+Or run the two explicit stages below if you also want the intermediate `.ply` files on disk.
 
 **1 — Fuse RGB-D → point clouds.** Back-projects + fuses all cameras (depth PNGs are in millimetres,
 hence `--depth-scale 1000`) and writes one `.ply` per frame to `episode<N>/fused_pcd/`.
@@ -273,23 +292,6 @@ accelerate launch --config_file ./accel_conf.yml train_dlp_voxel_accelerate.py -
 ```
 
 For concurrent multi-GPU runs, copy `accel_conf.yml` and give each a distinct `main_process_port`.
-
-## Evaluation
-
-Reconstruction quality is measured with **LPIPS / SSIM / PSNR** (via `piqa`). Scripts live in
-[`eval/`](eval/):
-
-| Script | Purpose |
-|--------|---------|
-| `eval/eval_vox.py` | Voxel 3D-DLP reconstruction / decomposition metrics |
-| `eval/eval_pc.py` | Point-cloud reconstruction metrics |
-| `eval/eval_model.py` | ELBO and model-level evaluation utilities |
-
-Each script reads an experiment config and a checkpoint, for example:
-
-```bash
-python eval/eval_vox.py --checkpoint <path/to/ckpt> --config configs/<your_config>.json
-```
 
 ## Documentation
 
