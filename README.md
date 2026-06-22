@@ -42,6 +42,8 @@ dense 3D inputs without object-centric structure.
 - [Data Preprocessing](#data-preprocessing)
 - [Configuration Files](#configuration-files)
 - [Training](#training)
+- [From 3D-DLP to Particle Tokens](#from-3d-dlp-to-particle-tokens)
+- [Downstream Policy Training (EC-Diffuser)](#downstream-policy-training-ec-diffuser)
 - [Documentation](#documentation)
 - [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
@@ -98,7 +100,8 @@ For manual setup notes and CUDA/dependency caveats, see
 | `modules/` | Network building blocks (2D/3D vision, point-cloud, VAE, diffusion modules) |
 | `configs/` | JSON experiment configs (see [below](#configuration-files)) |
 | `datasets/` | Dataset loaders and preparation scripts |
-| `scripts/` | Data conversion / voxelization / K-means precompute scripts |
+| `scripts/` | Data conversion / voxelization / K-means precompute / particle-token export scripts |
+| `ec_diffuser/` | Downstream entity-centric diffusion policy (MimicGen + RLBench); consumes particle tokens |
 | `utils/` | Logging, plotting, loss functions, and helpers |
 | `documentation/` | Installation, hyperparameters, example usage |
 | `docs/` | Project page (GitHub Pages) |
@@ -296,6 +299,111 @@ accelerate launch --config_file ./accel_conf.yml train_dlp_voxel_accelerate.py -
 ```
 
 For concurrent multi-GPU runs, copy `accel_conf.yml` and give each a distinct `main_process_port`.
+
+A finished run writes its checkpoint and config under `./logs/<run_name>/`:
+
+| Artifact | Path | Used later as |
+|----------|------|---------------|
+| Best checkpoint | `logs/<run_name>/saves/best.pt` | `--dlp-ckpt` |
+| Last checkpoint | `logs/<run_name>/saves/last.pt` | `--dlp-ckpt` |
+| Model config | `logs/<run_name>/hparams.json` | `--dlp-cfg` |
+
+These two files are the bridge to the downstream policy: the next stage loads the trained
+3D-DLP and runs its encoder over the voxel cache to export per-frame particle tokens.
+
+## From 3D-DLP to Particle Tokens
+
+Downstream policy learning does **not** consume voxels directly — it consumes the compact
+**particle tokens** produced by a trained 3D-DLP encoder. This stage loads a checkpoint from the
+previous step, runs the encoder over the voxel cache built during [Data
+Preprocessing](#data-preprocessing), and writes one EC-Diffuser-compatible `.pkl` per task
+(particle attributes + gripper / background state + actions, and — for RLBench — language and
+keypose fields). Run all scripts from the repository root with `PYTHONPATH=.` so `voxel_models`
+and the encoder utilities resolve.
+
+```
+voxel cache (.pt)  +  trained 3D-DLP (best.pt + hparams.json)  ─▶  particle-token pickle (.pkl)
+```
+
+### MimicGen
+
+[`scripts/ec_diffuser_voxel_preprocess.py`](scripts/ec_diffuser_voxel_preprocess.py) reads the voxel
+cache (and the source `.hdf5` for actions) and emits the token pickle:
+
+```bash
+PYTHONPATH=. python scripts/ec_diffuser_voxel_preprocess.py \
+  --h5             /path/to/data/<task>_d0/core/<task>_d0.hdf5 \
+  --voxel-cache-dir /path/to/data/<task>_d0/core/voxel_cache \
+  --dlp-cfg        logs/<run_name>/hparams.json \
+  --dlp-ckpt       logs/<run_name>/saves/best.pt \
+  --out-pkl        /path/to/preprocessed/<task>/<task>.pkl \
+  --action-mode    relative \
+  --batch          8
+```
+
+For all tasks at once (optionally sharded across GPUs), use
+[`scripts/run_preprocess_all_tasks.sh`](scripts/run_preprocess_all_tasks.sh). Multi-GPU runs write
+one `_rank{N}.pkl` shard per GPU; merge them with
+[`scripts/merge_preprocess_shards.py`](scripts/merge_preprocess_shards.py).
+
+### RLBench
+
+[`scripts/ec_diffuser_voxel_preprocess_rlbench.py`](scripts/ec_diffuser_voxel_preprocess_rlbench.py)
+reads the per-episode voxel cache plus the RLBench language descriptions and keyposes:
+
+```bash
+PYTHONPATH=. python scripts/ec_diffuser_voxel_preprocess_rlbench.py \
+  --root     /path/to/rlbench \
+  --split    train_data \
+  --task     close_jar \
+  --dlp-cfg  logs/<run_name>/hparams.json \
+  --dlp-ckpt logs/<run_name>/saves/best.pt \
+  --out-pkl  /path/to/preprocessed/rlbench_close_jar/close_jar.pkl \
+  --batch    8
+```
+
+For all tasks, use
+[`scripts/run_preprocess_rlbench_voxel_all_tasks.sh`](scripts/run_preprocess_rlbench_voxel_all_tasks.sh).
+
+## Downstream Policy Training (EC-Diffuser)
+
+The entity-centric diffusion policy lives in [`ec_diffuser/`](ec_diffuser/) and trains on the
+particle-token pickles from the previous stage. It still needs the trained 3D-DLP checkpoint at
+train time (for decoding / rendering rollouts), so keep `voxel_models` importable by adding the
+repository root to `PYTHONPATH`.
+
+**1 — Point the task config at your artifacts.** Each task has a config in
+[`ec_diffuser/diffuser/config/`](ec_diffuser/diffuser/config/) (`mimicgen_<task>_dlp.py`,
+`rlbench_<task>_dlp.py`, `rlbench_<task>_keypose_dlp.py`). Inside its `mode_to_args` entry, set the
+dataset / checkpoint fields to the outputs above:
+
+| Config field | Set to |
+|--------------|--------|
+| `dataset` / `override_dataset_path` | the Stage-2 `.pkl` for the task |
+| `dlp_ckpt` | `logs/<run_name>/saves/best.pt` |
+| `dlp_cfg`  | `logs/<run_name>/hparams.json` |
+
+**2 — Train.** Run from `ec_diffuser/diffuser/`. The mode key is `"{num_entity}C_{input_type}"`, so
+`--num_entity 16 --input_type dlp` selects the `16C_dlp` entry in the config.
+
+```bash
+cd ec_diffuser/diffuser
+export PYTHONPATH=/path/to/3d-dlp:$PYTHONPATH   # so voxel_models (the trained 3D-DLP) is importable
+
+# MimicGen
+python scripts/train.py --config config.mimicgen_stack_dlp --num_entity 16 --input_type dlp
+
+# RLBench (language + keypose conditioning)
+python scripts/train.py --config config.rlbench_close_jar_keypose_dlp --num_entity 16 --input_type dlp
+```
+
+The same `ec_diffuser/diffuser/config/` directory holds all 14 MimicGen and the RLBench tasks
+(plain `_dlp` and language/keypose `_keypose_dlp` variants), so switching task or benchmark is just
+a change of `--config`.
+
+> **Note:** the shipped configs still contain absolute paths from the original development machine
+> (`/home/ellina/...`). Until these are routed through a shared data root, edit the three fields in
+> the table above for each task you run.
 
 ## Documentation
 
