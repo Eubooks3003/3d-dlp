@@ -13,7 +13,9 @@
   Carnegie Mellon University &nbsp;•&nbsp; Lambda AI &nbsp;•&nbsp; ICML 2026
 </p>
 
-https://github.com/Eubooks3003/3d-dlp/raw/main/docs/static/videos/3DDLP_teaser.mp4
+<p align="center">
+  <img src="docs/static/images/3DDLP_teaser.gif" width="100%" alt="3D-DLP teaser — per-frame 3D latent particles and bounding boxes across RLBench tasks">
+</p>
 
 ---
 
