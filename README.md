@@ -13,6 +13,8 @@
   Carnegie Mellon University &nbsp;•&nbsp; Lambda AI &nbsp;•&nbsp; ICML 2026
 </p>
 
+https://github.com/Eubooks3003/3d-dlp/raw/main/docs/static/videos/3DDLP_teaser.mp4
+
 ---
 
 ## Abstract
