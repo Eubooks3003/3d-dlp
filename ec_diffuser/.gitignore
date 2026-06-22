@@ -1,0 +1,12 @@
+isaacgym/
+__pycache__/
+wandb/
+*.pth
+*.ckpt
+*.png
+logs
+model_chkpts
+data
+data_model_chkpts
+ecdiffuser-data
+d4rl
