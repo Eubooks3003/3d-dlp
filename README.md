@@ -2,6 +2,7 @@
 
 <p align="center">
   <a href="https://eubooks3003.github.io/3d-dlp/">Project Page</a> &nbsp;•&nbsp;
+  <a href="https://arxiv.org/abs/2606.19451">arXiv</a> &nbsp;•&nbsp;
   <a href="#installation">Installation</a> &nbsp;•&nbsp;
   <a href="#data-preprocessing">Data Preprocessing</a> &nbsp;•&nbsp;
   <a href="#training">Training</a> &nbsp;•&nbsp;
@@ -420,7 +421,9 @@ a change of `--config`.
   title     = {3D-DLP: Self-supervised 3D Object-centric Scene Representation Learning},
   author    = {Zhang, Ellina and Iyengar, Madhavan and Zadeh, Amir and Li, Chuan and Held, David and Pathak, Deepak and Daniel, Tal},
   booktitle = {International Conference on Machine Learning (ICML)},
-  year      = {2026}
+  year      = {2026},
+  eprint    = {2606.19451},
+  archivePrefix = {arXiv}
 }
 ```
 
